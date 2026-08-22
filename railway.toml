@@ -1,0 +1,10 @@
+# Always-on worker (not a website, not a cron).
+# Set secrets in the Railway dashboard — never in this file.
+
+[build]
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "PMF_PROFILE=cloud python profit-meta-follower/run.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

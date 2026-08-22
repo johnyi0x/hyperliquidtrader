@@ -1,0 +1,12 @@
+.env
+data/
+data-local/
+data-cloud/
+logs/
+__pycache__/
+*.pyc
+.venv/
+venv/
+profit-meta-follower/New folder/
+profit-meta-follower/New folder (2)/
+profit-meta-follower/New folder (3)/
