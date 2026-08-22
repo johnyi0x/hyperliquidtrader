@@ -4,38 +4,37 @@ Per-instance overrides for running two bots (local PC vs cloud) on separate wall
 Set PMF_PROFILE=local or PMF_PROFILE=cloud (default: local).
 Each profile uses its own data folder via run.py (data-local / data-cloud).
 
-Local  = holder-filtered basket (you can watch it; fewer tape wallets).
-Cloud  = raw top-50 ROI board (run-and-forget; EMA averages scalpers).
+Cloud = previous local trial (raw top-50, sticky slots, stickier holds, 7d ROI).
+Local = same as cloud except 24h ROI rank instead of 7d.
 Enter % / size / leverage stay in config.py — not profile-specific.
 """
 
 from __future__ import annotations
 
+# Shared "improved cloud" knobs. Rank window is the only local vs cloud split.
+_STICKY: dict = {
+    "BASKET_FILTER_MODE": "off",
+    "MAX_BOOK_CHANGES_PER_HOUR": 0,
+    "FLOW_EMA_ALPHA": 0.20,
+    "OPEN_CONFIRM_S": 180.0,
+    "EXIT_RAW_FLOW": -0.024,
+    "EXIT_AGREEMENT_GIVEBACK": 0.32,
+    "REBALANCE_COOLDOWN_S": 240.0,
+    "STICKY_BOOK_SLOTS": True,
+}
+
 LOCAL: dict = {
     "INSTANCE_NAME": "local",
-    # Sitters / slow traders only. Fill scan at basket build, not the live loop.
-    "BASKET_FILTER_MODE": "holder",
-    # Mute a listed wallet that starts flipping after the list was built.
-    "MAX_BOOK_CHANGES_PER_HOUR": 6,
-    # PC: a bit more responsive so you can see crowd shifts.
-    "FLOW_EMA_ALPHA": 0.26,
-    "OPEN_CONFIRM_S": 120.0,
-    "EXIT_RAW_FLOW": -0.018,
-    "EXIT_AGREEMENT_GIVEBACK": 0.22,
-    "REBALANCE_COOLDOWN_S": 120.0,
+    **_STICKY,
+    # Hyperliquid leaderboard 24h ROI column.
+    "RANK_WINDOW": "day",
 }
 
 CLOUD: dict = {
     "INSTANCE_NAME": "cloud",
-    # Full 7d ROI board. Scalpers stay in; we trade the average, not their flips.
-    "BASKET_FILTER_MODE": "off",
-    "MAX_BOOK_CHANGES_PER_HOUR": 0,
-    # Railway: stickier holds, longer confirm before a new name, slower re-opens.
-    "FLOW_EMA_ALPHA": 0.22,
-    "OPEN_CONFIRM_S": 150.0,
-    "EXIT_RAW_FLOW": -0.022,
-    "EXIT_AGREEMENT_GIVEBACK": 0.28,
-    "REBALANCE_COOLDOWN_S": 180.0,
+    **_STICKY,
+    # Hyperliquid leaderboard 7d ROI column.
+    "RANK_WINDOW": "week",
 }
 
 PROFILES: dict[str, dict] = {

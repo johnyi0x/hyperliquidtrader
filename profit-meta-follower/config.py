@@ -43,6 +43,7 @@ LEADERBOARD_CACHE_HOURS = 6.0
 
 # Rank like the HL Leaderboard tab ROI column.
 # "day" = 24h ROI, "week" = 7d ROI. (month is ignored for ranking.)
+# Profiles override: local = day (24h), cloud = week (7d).
 RANK_WINDOW = "week"
 # Optional second window that must not be a large loss ("" = off).
 CONFIRM_WINDOW = ""
@@ -52,7 +53,7 @@ CONFIRM_WINDOW = ""
 # "holder" = walk the ROI board, fetch recent fills ONCE per wallet at list
 #            build (not the live loop). Keep sitters / slow traders, skip tape.
 #            $0 week volume with no fills = holder. List can be shorter than 50.
-# Profiles override this: local = holder, cloud = off.
+# Profiles override this: local and cloud both "off".
 BASKET_FILTER_MODE = "off"
 MIN_ACCOUNT_VALUE = 0.0
 MIN_WINDOW_PNL = 0.0
@@ -127,6 +128,9 @@ MIN_SIDE_AGREEMENT = 0.10
 EXIT_SIDE_AGREEMENT = 0.05
 MIN_AVG_CONVICTION = 0.022  # applied to the SMOOTHED basket, not one noisy snapshot
 MAX_COINS_IN_BOOK = 3
+# If True, a held coin keeps its slot until a real exit; a 4th name cannot kick it.
+# Profiles turn this on for both local and cloud.
+STICKY_BOOK_SLOTS = False
 
 # Smooth the basket so individual scalp noise cancels.
 # Mid setting: old was 0.30 (jumpy), smoothened was 0.18 (very sticky). Target ~30m–3h holds.
