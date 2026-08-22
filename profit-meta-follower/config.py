@@ -43,8 +43,8 @@ LEADERBOARD_CACHE_HOURS = 6.0
 
 # Rank like the HL Leaderboard tab ROI column.
 # "day" = 24h ROI, "week" = 7d ROI. (month is ignored for ranking.)
-# Profiles override: local = day (24h), cloud = week (7d).
-RANK_WINDOW = "week"
+# Profiles override: local and cloud both use 24h ROI.
+RANK_WINDOW = "day"
 # Optional second window that must not be a large loss ("" = off).
 CONFIRM_WINDOW = ""
 

@@ -4,14 +4,13 @@ Per-instance overrides for running two bots (local PC vs cloud) on separate wall
 Set PMF_PROFILE=local or PMF_PROFILE=cloud (default: local).
 Each profile uses its own data folder via run.py (data-local / data-cloud).
 
-Cloud = previous local trial (raw top-50, sticky slots, stickier holds, 7d ROI).
-Local = same as cloud except 24h ROI rank instead of 7d.
+Cloud and local share sticky holds / raw top-50; both rank the Hyperliquid 24h ROI board.
 Enter % / size / leverage stay in config.py — not profile-specific.
 """
 
 from __future__ import annotations
 
-# Shared "improved cloud" knobs. Rank window is the only local vs cloud split.
+# Shared knobs. Local and cloud only differ by INSTANCE_NAME (data/logs/wallet).
 _STICKY: dict = {
     "BASKET_FILTER_MODE": "off",
     "MAX_BOOK_CHANGES_PER_HOUR": 0,
@@ -33,8 +32,8 @@ LOCAL: dict = {
 CLOUD: dict = {
     "INSTANCE_NAME": "cloud",
     **_STICKY,
-    # Hyperliquid leaderboard 7d ROI column.
-    "RANK_WINDOW": "week",
+    # Hyperliquid leaderboard 24h ROI column (same as local).
+    "RANK_WINDOW": "day",
 }
 
 PROFILES: dict[str, dict] = {
