@@ -73,6 +73,8 @@ def shortlist(rows: list[LeaderboardRow], cfg: Any) -> list[QualifiedWallet]:
         scan = int(getattr(cfg, "HOLDER_SCAN_POOL", 0) or 0)
         if scan > 0:
             pool_n = max(pool_n, scan)
+    if bool(getattr(cfg, "RESEARCH_DATA_ENABLED", False)):
+        pool_n = max(pool_n, int(getattr(cfg, "RESEARCH_POOL_SIZE", 0) or 0))
     scored: list[QualifiedWallet] = []
     for row in rows:
         w = _window(row, rank_n)
@@ -273,6 +275,80 @@ class Qualifier:
             )
         self.log.info("Holder basket %s wallets (scanned %s, skipped %s)", len(keep), scanned, skipped)
         return keep
+
+    def pick_holders_and_research(
+        self, pool: list[QualifiedWallet]
+    ) -> tuple[list[QualifiedWallet], list[dict[str, Any]]]:
+        """
+        One fill-pass: label top RESEARCH_POOL_SIZE for offline filter on/off,
+        and keep BASKET_SIZE holders for live trading.
+        """
+        want = int(self.cfg.BASKET_SIZE)
+        research_n = max(want, int(getattr(self.cfg, "RESEARCH_POOL_SIZE", 0) or 0))
+        lookback_d = float(getattr(self.cfg, "HOLD_LOOKBACK_DAYS", 7.0) or 7.0)
+        start_ms = int((time.time() - lookback_d * 86400) * 1000)
+        now_ms = int(time.time() * 1000)
+        keep: list[QualifiedWallet] = []
+        research: list[dict[str, Any]] = []
+        self.log.info(
+            "Research+holder scan: label top %s ROI wallets, keep %s holders for trade",
+            min(research_n, len(pool)),
+            want,
+        )
+        for i, w in enumerate(pool):
+            need_label = i < research_n
+            need_more_holders = len(keep) < want
+            if not need_label and not need_more_holders:
+                break
+            fills = self._recent_fills(w.address, start_ms)
+            if fills is None:
+                if need_label:
+                    research.append(
+                        {
+                            "address": w.address,
+                            "account_value": w.account_value,
+                            "rank_pnl": w.rank_pnl,
+                            "rank_roi": w.rank_roi,
+                            "rank_volume": w.rank_volume,
+                            "score": w.score,
+                            "holder": None,
+                            "why": "fills_failed",
+                        }
+                    )
+                continue
+            ok, why = is_holder_tape(fills, now_ms, self.cfg)
+            if need_label:
+                research.append(
+                    {
+                        "address": w.address,
+                        "account_value": round(w.account_value, 2),
+                        "rank_pnl": round(w.rank_pnl, 2),
+                        "rank_roi": round(w.rank_roi, 6),
+                        "rank_volume": round(w.rank_volume, 2),
+                        "score": round(w.score, 6),
+                        "holder": bool(ok),
+                        "why": why,
+                    }
+                )
+            if ok and need_more_holders:
+                w.reasons = [why]
+                keep.append(w)
+                self.log.info(
+                    "Keep holder %s/%s %s roi=%.1f%% %s",
+                    len(keep),
+                    want,
+                    w.address[:10],
+                    w.rank_roi * 100.0,
+                    why,
+                )
+            elif need_label and not ok:
+                self.log.info("Research scalper %s roi=%.1f%% %s", w.address[:10], w.rank_roi * 100.0, why)
+        self.log.info(
+            "Research pool labeled %s | trade holders %s",
+            len(research),
+            len(keep),
+        )
+        return keep, research
 
     def deep_audit(self, pool: list[QualifiedWallet]) -> list[QualifiedWallet]:
         if holder_filter_on(self.cfg):

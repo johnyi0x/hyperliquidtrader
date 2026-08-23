@@ -105,6 +105,7 @@ class MarketCtx:
     funding: float
     open_interest: float
     basis: float  # (mark - oracle) / oracle
+    mark: float = 0.0
 
 
 

@@ -15,8 +15,9 @@ from hyperliquid.utils import constants
 from .consensus import BookEngine, build_votes, crashed_wallets, min_live_voters, min_wallets_on_coin, votes_to_targets
 from .leaderboard import load_leaderboard
 from .markets import MarketCache
-from .qualify import Qualifier, shortlist
+from .qualify import Qualifier, holder_filter_on, shortlist
 from .rebalancer import PaperBook, Rebalancer
+from .research import ResearchWriter
 from .snapshots import SnapshotClient, list_dex_query_names
 from .store import StateStore, atomic_write_json, read_json
 from .telemetry import TelemetryWriter, compact_votes
@@ -130,6 +131,22 @@ class ProfitMetaRunner:
             enabled=bool(getattr(cfg, "TELEMETRY_ENABLED", True)),
             instance=inst,
         )
+        research_on = bool(getattr(cfg, "RESEARCH_DATA_ENABLED", False))
+        self.research = ResearchWriter(data_dir, enabled=research_on, instance=inst)
+        self.research_tracker: BasketTracker | None = None
+        if research_on:
+            research_cfg = type("ResearchCfg", (), {})()
+            research_cfg.WALLETS_PER_TICK = int(getattr(cfg, "RESEARCH_WALLETS_PER_TICK", 3) or 3)
+            research_cfg.SNAPSHOT_INTERVAL_S = float(
+                getattr(cfg, "RESEARCH_SNAPSHOT_INTERVAL_S", 45.0) or 45.0
+            )
+            research_cfg.STALE_SNAPSHOT_S = float(getattr(cfg, "STALE_SNAPSHOT_S", 480.0) or 480.0)
+            research_cfg.MAX_BOOK_CHANGES_PER_HOUR = 0
+            research_cfg.BASKET_FILTER_MODE = "off"
+            self.research_tracker = BasketTracker(self.snapper, research_cfg, logger)
+        self._research_addrs: list[str] = [
+            str(a).lower() for a in (self.store.data.get("research_addrs") or []) if str(a).startswith("0x")
+        ]
         self._last_equity: float | None = None
 
     def _save_paper(self) -> None:
@@ -170,6 +187,16 @@ class ProfitMetaRunner:
                 self._basket_age_h(),
             )
             self.tracker.set_basket(existing)
+            self._research_addrs = [str(a).lower() for a in (self.store.data.get("research_addrs") or [])]
+            if self.research_tracker is not None and self._research_addrs:
+                trade_set = {w.address.lower() for w in existing}
+                research_only = [a for a in self._research_addrs if a not in trade_set]
+                self.research_tracker.set_basket(
+                    [
+                        QualifiedWallet(a, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                        for a in research_only
+                    ]
+                )
             return
 
         self.log.info("Refreshing wallet basket from leaderboard")
@@ -189,7 +216,28 @@ class ProfitMetaRunner:
             "pool": _basket_to_state(pool),
         }
         self.store.save()
-        audited = qualifier.deep_audit(pool)
+        research_rows: list[dict[str, Any]] = []
+        research_on = bool(getattr(self.cfg, "RESEARCH_DATA_ENABLED", False))
+        if research_on and holder_filter_on(self.cfg):
+            audited, research_rows = qualifier.pick_holders_and_research(pool)
+        else:
+            audited = qualifier.deep_audit(pool)
+            if research_on:
+                # Filter off: research pool = same top-N as trade list (labels = all tradeable).
+                research_n = int(getattr(self.cfg, "RESEARCH_POOL_SIZE", 0) or 0) or len(audited)
+                research_rows = [
+                    {
+                        "address": w.address,
+                        "account_value": round(w.account_value, 2),
+                        "rank_pnl": round(w.rank_pnl, 2),
+                        "rank_roi": round(w.rank_roi, 6),
+                        "rank_volume": round(w.rank_volume, 2),
+                        "score": round(w.score, 6),
+                        "holder": None,
+                        "why": "filter_off",
+                    }
+                    for w in pool[:research_n]
+                ]
         if len(audited) < max(5, min_live_voters(self.cfg, len(audited))):
             raise RuntimeError(
                 f"Only {len(audited)} wallets survived deep audit — loosen filters"
@@ -199,13 +247,35 @@ class ProfitMetaRunner:
         self.store.data["basket_rank"] = _basket_sig(self.cfg)
         self.store.data["refresh"] = {}
         self.store.data["hyper_wallets"] = []
+        self._research_addrs = [str(r["address"]).lower() for r in research_rows if r.get("address")]
+        self.store.data["research_addrs"] = self._research_addrs
         self.store.save()
         self.tracker.set_basket(audited)
+        if self.research_tracker is not None and self._research_addrs:
+            trade_set = {w.address.lower() for w in audited}
+            research_only = [a for a in self._research_addrs if a not in trade_set]
+            self.research_tracker.set_basket(
+                [
+                    QualifiedWallet(a, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    for a in research_only
+                ]
+            )
+            self.log.info(
+                "Research track %s wallets (%s also in trade basket — reuse those snaps)",
+                len(self._research_addrs),
+                len(self._research_addrs) - len(research_only),
+            )
+        if research_rows:
+            self.research.save_pool(ts=time.time(), wallets=research_rows)
         self.telemetry.save_basket_snapshot(ts=time.time(), wallets=_basket_to_state(audited))
         self.telemetry.record_event(
             ts=time.time(),
             kind="basket_refresh",
-            payload={"count": len(audited), "filter": str(getattr(self.cfg, "BASKET_FILTER_MODE", "off"))},
+            payload={
+                "count": len(audited),
+                "filter": str(getattr(self.cfg, "BASKET_FILTER_MODE", "off")),
+                "research": len(research_rows),
+            },
         )
         self.log.info(
             "Basket ready: %s wallets ranked by %s ROI | #1 %s roi=%.1f%% pnl=$%.0f",
@@ -224,6 +294,9 @@ class ProfitMetaRunner:
         now = time.time()
         equity_baseline = dict(self.tracker.last_equity)
         n = self.tracker.poll_some(now)
+        if self.research_tracker is not None:
+            # Slower extra snapshots for research-only wallets (not already in trade basket).
+            self.research_tracker.poll_some(now)
         snaps = self.tracker.live_snapshots()
         crashed = crashed_wallets(snaps, equity_baseline, self.cfg)
         if crashed:
@@ -233,11 +306,13 @@ class ProfitMetaRunner:
             self.log.info("Muted %s wallet(s) for book churn (scalper tape)", len(churned))
         skip = set(crashed) | set(churned)
         voters = self.tracker.voter_count(now, skip)
+        research_snaps = (
+            self.research_tracker.live_snapshots() if self.research_tracker is not None else []
+        )
+        coin_hint = [p.coin for s in snaps for p in s.positions]
+        coin_hint.extend(p.coin for s in research_snaps for p in s.positions)
         try:
-            self.markets.refresh_if_needed(
-                now,
-                [p.coin for s in snaps for p in s.positions],
-            )
+            self.markets.refresh_if_needed(now, coin_hint)
         except Exception as exc:
             self.log.debug("Market cache: %s", exc)
         raw = build_votes(
@@ -276,6 +351,26 @@ class ProfitMetaRunner:
             managed=sorted(managed),
             equity=self._last_equity,
         )
+        if self.research.enabled and self._research_addrs:
+            by_addr = {s.address: s for s in snaps}
+            for s in research_snaps:
+                # Prefer fresher trade snapshot when wallet is in both lists.
+                prev = by_addr.get(s.address)
+                if prev is None or s.fetched_at >= prev.fetched_at:
+                    by_addr[s.address] = s
+            wrote = self.research.maybe_record_books(
+                ts=now,
+                interval_s=float(getattr(self.cfg, "RESEARCH_RECORD_INTERVAL_S", 60.0) or 60.0),
+                snaps_by_addr=by_addr,
+                research_addrs=self._research_addrs,
+                markets=self.markets.ctxs,
+            )
+            if wrote:
+                self.log.info(
+                    "Research sample wallets=%s/%s",
+                    sum(1 for a in self._research_addrs if a in by_addr),
+                    len(self._research_addrs),
+                )
         self.log.info(
             "Tick snapshots=%s voters=%s/%s crash=%s raw=%s trade=%s",
             n,
@@ -351,12 +446,13 @@ class ProfitMetaRunner:
     def run_forever(self) -> None:
         self.refresh_basket_if_needed()
         self.log.info(
-            "Profit-meta follower running | profile=%s paper=%s trade=%s size=%s filter=%s scope=%s basket=%s interval=%ss need_voters=%s enter=%.0f%% exit=%.0f%% raw_exit=%s agr_gb=%.0f%%",
+            "Profit-meta follower running | profile=%s paper=%s trade=%s size=%s filter=%s research=%s scope=%s basket=%s interval=%ss need_voters=%s enter=%.0f%% exit=%.0f%% raw_exit=%s agr_gb=%.0f%%",
             getattr(self.cfg, "PMF_PROFILE", "local"),
             bool(self.cfg.PAPER_TRADING),
             str(getattr(self.cfg, "TRADE_MODE", "follow") or "follow"),
             str(getattr(self.cfg, "SIZE_MODE", "fixed") or "fixed"),
             str(getattr(self.cfg, "BASKET_FILTER_MODE", "off") or "off"),
+            bool(getattr(self.cfg, "RESEARCH_DATA_ENABLED", False)),
             self.cfg.DEX_SCOPE,
             len(self.tracker.addrs),
             self.cfg.SNAPSHOT_INTERVAL_S,

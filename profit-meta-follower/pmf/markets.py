@@ -62,6 +62,7 @@ class MarketCache:
                     funding=fnum(ctx.get("funding")),
                     open_interest=fnum(ctx.get("openInterest")),
                     basis=basis,
+                    mark=mark,
                 )
         if out:
             self.ctxs = out

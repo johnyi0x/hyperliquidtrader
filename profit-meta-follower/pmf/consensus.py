@@ -431,7 +431,10 @@ class BookEngine:
         self.ema = next_ema
         self.prev_raw = next_raw
         kept.sort(key=lambda x: x.score, reverse=True)
-        return kept[: int(cfg.MAX_COINS_IN_BOOK)]
+        max_n = int(cfg.MAX_COINS_IN_BOOK)
+        if bool(getattr(cfg, "STICKY_BOOK_SLOTS", False)):
+            return _sticky_book(kept, managed, max_n)
+        return kept[:max_n]
 
     def _clear_coin_state(self, coin: str) -> None:
         """Drop hold state. Also reset persist so a fade cannot reopen in seconds."""
@@ -441,6 +444,18 @@ class BookEngine:
         for key in list(self.ok_since):
             if key.startswith(prefix):
                 self.ok_since.pop(key, None)
+
+
+def _sticky_book(kept: list[CoinVote], managed: set[str], max_n: int) -> list[CoinVote]:
+    """Keep valid holds in the 3 slots. A 4th name waits until a hold actually exits."""
+    if max_n <= 0:
+        return []
+    held = [v for v in kept if v.coin in managed]
+    fresh = [v for v in kept if v.coin not in managed]
+    out = held[:max_n]
+    if len(out) < max_n:
+        out.extend(fresh[: max_n - len(out)])
+    return out
 
 
 def _clamp_leverage(cfg: Any, raw: float) -> int:

@@ -471,6 +471,24 @@ class GateTests(unittest.TestCase):
         out = eng.refine([v], markets=mk, managed={"BTC"}, cfg=cfg, now=2000.0)
         self.assertEqual(out, [])
 
+    def test_sticky_slots_keep_holds_over_new_name(self) -> None:
+        cfg = _Cfg()
+        cfg.MAX_COINS_IN_BOOK = 3
+        cfg.STICKY_BOOK_SLOTS = True
+        cfg.OPEN_CONFIRM_S = 0.0
+        eng = BookEngine()
+        coins = ("BTC", "ETH", "ZEC", "HYPE")
+        mk = {c: MarketCtx(c, 5_000_000, 0.00001, 1.0, 0.0) for c in coins}
+
+        def vote(coin: str, score: float) -> CoinVote:
+            return CoinVote(coin, "long", 8, 1, 10, 0.8, 0.20, 5, score)
+
+        raw = [vote("HYPE", 9.0), vote("BTC", 3.0), vote("ETH", 2.0), vote("ZEC", 1.0)]
+        held = eng.refine(raw, markets=mk, managed={"BTC", "ETH", "ZEC"}, cfg=cfg, now=5000.0)
+        self.assertEqual({v.coin for v in held}, {"BTC", "ETH", "ZEC"})
+        fill = eng.refine(raw, markets=mk, managed={"BTC", "ETH"}, cfg=cfg, now=5000.0)
+        self.assertEqual({v.coin for v in fill}, {"BTC", "ETH", "HYPE"})
+
     def test_close_bypasses_rebalance_cooldown(self) -> None:
         import logging
         import time as _time
@@ -485,6 +503,18 @@ class GateTests(unittest.TestCase):
         managed, attempted = reb.run([], {"BTC"}, now - 10, now)
         self.assertNotIn("BTC", managed)
         self.assertTrue(attempted)
+
+    def test_research_compact_book(self) -> None:
+        from pmf.research import compact_book
+
+        snap = _snap("0x1", 10_000, {"BTC": 0.4, "ETH": -0.2}, 1000.0, leverage=8)
+        rows = compact_book(snap)
+        self.assertEqual(len(rows), 2)
+        by_coin = {r[0]: r for r in rows}
+        self.assertEqual(by_coin["BTC"][1], 1)
+        self.assertEqual(by_coin["ETH"][1], -1)
+        self.assertAlmostEqual(by_coin["BTC"][2], 0.4)
+        self.assertEqual(by_coin["BTC"][3], 8)
 
     def test_hostile_funding_blocks_long(self) -> None:
         cfg = _Cfg()

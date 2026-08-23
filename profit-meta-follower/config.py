@@ -212,6 +212,16 @@ MANAGED_ONLY = True
 # =============================================================================
 # Daily JSONL under data/telemetry/YYYY-MM-DD/ for offline param tuning.
 TELEMETRY_ENABLED = True
+# Local-only heavy log: raw top-ROI wallet books + marks so filter on/off
+# can be simulated later. Off = trade only (cloud). Does not change entries.
+RESEARCH_DATA_ENABLED = False
+# How many top-ROI wallets to label + track for research (pre-filter).
+RESEARCH_POOL_SIZE = 200
+# Extra clearinghouse snapshots per tick for research-only wallets (weight 2 each).
+RESEARCH_WALLETS_PER_TICK = 3
+RESEARCH_SNAPSHOT_INTERVAL_S = 45.0
+# Write one compact research row at most this often (disk + churn).
+RESEARCH_RECORD_INTERVAL_S = 60.0
 # Set by config_profiles (local | cloud). Override with PMF_PROFILE env.
 INSTANCE_NAME = "local"
 
