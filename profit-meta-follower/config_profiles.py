@@ -12,14 +12,14 @@ research = gather-only (data-research/).
 from __future__ import annotations
 
 # Live trading — cloud only. Leave alone while Railway is live.
-# Cloud _TRADE last tuned: 2026-08-24 13:15 UTC strategy=cloud_holders score=-4.621352780160247 ret=18.949535173358%
+# Cloud _TRADE last tuned: 2026-08-24 22:25 UTC strategy=cloud_holders score=-31.149453867224153 ret=7.744617276119525%
 _TRADE: dict = {
-    "BASKET_FILTER_MODE": "holder",
+    "BASKET_FILTER_MODE": 'holder',
     "MAX_BOOK_CHANGES_PER_HOUR": 6,
     "FLOW_EMA_ALPHA": 0.24,
     "OPEN_CONFIRM_S": 210.0,
     "EXIT_RAW_FLOW": -0.02,
-    "EXIT_AGREEMENT_GIVEBACK": 0.32,
+    "EXIT_AGREEMENT_GIVEBACK": 0.28,
     "REBALANCE_COOLDOWN_S": 300.0,
     "STICKY_BOOK_SLOTS": True,
     "RANK_WINDOW": "week",
@@ -27,6 +27,15 @@ _TRADE: dict = {
     "CANDIDATE_POOL": 100,
     "RESEARCH_DATA_ENABLED": False,
     "RESEARCH_ONLY": False,
+    "BACKTEST_LIVE_STRATEGY": 'cloud_holders',
+    "CONV_GIVEBACK": 0.26,
+    "EXIT_AVG_CONVICTION": 0.016,
+    "EXIT_FLOW": -0.015,
+    "EXIT_SIDE_AGREEMENT": 0.04,
+    "LIVE_CANDLE_SEED": False,
+    "MIN_AVG_CONVICTION": 0.018,
+    "MIN_ENTRY_FLOW": 0.0,
+    "MIN_SIDE_AGREEMENT": 0.12,
 }
 
 # Gather-only: crowd books first (live-parity cadence), then marks, then candles.

@@ -1,41 +1,52 @@
 {
-  "saved_at": 1787577205.421932,
+  "saved_at": 1787608246.1337585,
   "fee_pct_per_side": 0.0005,
   "strategy": "cloud_holders",
   "params": {
     "FLOW_EMA_ALPHA": 0.24,
-    "EXIT_FLOW": -0.011,
+    "EXIT_FLOW": -0.015,
     "EXIT_RAW_FLOW": -0.02,
-    "EXIT_AGREEMENT_GIVEBACK": 0.32,
+    "EXIT_AGREEMENT_GIVEBACK": 0.28,
     "CONV_GIVEBACK": 0.26,
     "OPEN_CONFIRM_S": 210.0,
-    "MIN_SIDE_AGREEMENT": 0.08,
+    "MIN_SIDE_AGREEMENT": 0.12,
     "EXIT_SIDE_AGREEMENT": 0.04,
     "MIN_AVG_CONVICTION": 0.018,
     "EXIT_AVG_CONVICTION": 0.016,
     "MIN_ENTRY_FLOW": 0.0,
-    "REBALANCE_COOLDOWN_S": 300.0
+    "REBALANCE_COOLDOWN_S": 300.0,
+    "BASKET_FILTER_MODE": "holder",
+    "BACKTEST_LIVE_STRATEGY": "cloud_holders",
+    "LIVE_CANDLE_SEED": false
   },
   "metrics": {
-    "return_pct": 18.949535173358,
-    "max_dd_pct": 11.309844923552511,
-    "round_trips": 5,
-    "win_rate_pct": 80.0,
-    "score": -4.621352780160247,
-    "trades_per_day": 11.291470404995124,
+    "return_pct": 7.744617276119525,
+    "max_dd_pct": 9.808098693097888,
+    "round_trips": 12,
+    "win_rate_pct": 41.66666666666667,
+    "score": -31.149453867224153,
+    "trades_per_day": 16.474285446459664,
     "active_day_ratio": 1.0,
     "cluster_share": 1.0,
-    "open_legs": 3
+    "open_legs": 2
   },
   "dataset": {
-    "ticks": 260,
-    "coins": 83,
-    "span_days": 0.4428121246093953,
+    "ticks": 416,
+    "coins": 89,
+    "span_days": 0.7284079202706063,
     "days": [
       "2026-08-24"
     ],
-    "source": "books"
+    "source": "books",
+    "live_holders": 37,
+    "live_listed": 37,
+    "live_basket_target": 100,
+    "holders_labeled": 37
   },
-  "applied_at": 1787577311.8899555,
+  "sim": {
+    "margin_frac": 0.29997,
+    "leverage": 10.0
+  },
+  "applied_at": 1787610336.3743348,
   "applied_to": "cloud"
 }
