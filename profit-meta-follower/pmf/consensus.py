@@ -16,6 +16,15 @@ def basket_size(cfg: Any, listed: int | None = None) -> int:
     return max(1, int(getattr(cfg, "BASKET_SIZE", 0) or 0) or int(getattr(cfg, "MIN_LIVE_VOTERS", 1) or 1))
 
 
+def cloud_crowd_listed(cfg: Any, *, tracker_n: int | None = None, dataset_target: int | None = None) -> int:
+    """Denominator for agreement / min-voters — must match live len(tracker.addrs)."""
+    if tracker_n and tracker_n > 0:
+        return int(tracker_n)
+    if dataset_target and dataset_target > 0:
+        return int(dataset_target)
+    return basket_size(cfg)
+
+
 def min_live_voters(cfg: Any, listed: int | None = None) -> int:
     pct = float(getattr(cfg, "MIN_LIVE_VOTERS_PCT", 0) or 0)
     if pct > 0:

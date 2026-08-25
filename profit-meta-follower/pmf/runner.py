@@ -350,7 +350,7 @@ class ProfitMetaRunner:
             swing_trader=self.swing_trader,
         )
 
-    def _maybe_seed_live_candles(self, now: float, coins: list[str]) -> None:
+    def _maybe_seed_live_candles(self, now: float, coins: list[str], *, raw_coins: list[str] | None = None) -> None:
         spec = self._strategy
         if not spec.needs_candles:
             return
@@ -358,7 +358,8 @@ class ProfitMetaRunner:
             return
         want = []
         seen: set[str] = set()
-        for c in ["BTC", *coins]:
+        # BTC anchor + crowd raw names first (swing/MTF need 1h on alts even with no position).
+        for c in ["BTC", *(raw_coins or []), *coins]:
             if not c or c in seen:
                 continue
             seen.add(c)
@@ -734,7 +735,6 @@ class ProfitMetaRunner:
                 *managed,
             }
         )
-        self._maybe_seed_live_candles(now, seed_coins)
         raw = build_votes(
             snaps,
             churned,
@@ -743,6 +743,7 @@ class ProfitMetaRunner:
             baseline_equity=equity_baseline,
             listed=len(self.tracker.addrs),
         )
+        self._maybe_seed_live_candles(now, seed_coins, raw_coins=[v.coin for v in raw])
         votes = self._live_trade_votes(raw, managed, now)
         targets = votes_to_targets(votes, self.cfg)
         trade_keys = [f"{v.side}:{v.coin}" for v in votes]

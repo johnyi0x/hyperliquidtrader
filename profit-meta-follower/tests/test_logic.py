@@ -699,6 +699,29 @@ class BacktestTests(unittest.TestCase):
             self.assertIn("BTC", ds.coin_index)
             self.assertEqual(ds.live_basket_target, 100)
 
+    def test_crowd_all_uses_basket_not_pool(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.bt_replay import _crowd, _filter_snaps
+
+        ds = SimpleNamespace(
+            live_basket_target=100,
+            pool_size=200,
+            live_holder_addrs=set(),
+            holder_addrs=set(),
+            cloud_basket_addrs=frozenset({f"0x{i:040x}" for i in range(100)}),
+        )
+        holders, listed = _crowd(ds, "all")
+        self.assertEqual(listed, 100)
+        self.assertEqual(holders, set())
+
+        snaps = [_snap(f"0x{i:040x}", 1000.0, {}, 1000.0) for i in range(150)]
+        limited = _filter_snaps(snaps, set(), "all", basket_limit=100)
+        self.assertEqual(len(limited), 100)
+        in_basket = _filter_snaps(snaps, set(), "all", basket_addrs=ds.cloud_basket_addrs, basket_limit=100)
+        self.assertEqual(len(in_basket), 100)
+        self.assertTrue(all(s.address in ds.cloud_basket_addrs for s in in_basket))
+
     def test_live_holders_are_first_n_in_roi_order(self) -> None:
         from pmf.research_load import holders_from_ranked_pool
 

@@ -98,6 +98,7 @@ class ResearchDataset:
     live_holder_addrs: set[str]
     live_listed: int
     live_basket_target: int
+    cloud_basket_addrs: frozenset[str]
     pool_size: int
     span_days: float
     source: str
@@ -201,6 +202,56 @@ def holders_from_ranked_pool(
         ordered.append(addr)
     want = max(1, int(basket_size or 0))
     return seen, set(ordered[:want])
+
+
+def load_cloud_basket_addrs(
+    research_dir: Path,
+    *,
+    basket_size: int,
+    state_path: Path | None = None,
+) -> frozenset[str]:
+    """Cloud trade-basket addresses (top-N ROI wallets live polls).
+
+    Prefer pmf_state.json basket (exact live list). Else ranked pool order.
+    """
+    want = max(1, int(basket_size or 0))
+    candidates: list[Path] = []
+    if state_path is not None:
+        candidates.append(state_path)
+    base = research_dir.parent
+    for name in ("pmf_state.json",):
+        candidates.append(base / name)
+        candidates.append(base.parent / "data-cloud" / name)
+        candidates.append(base.parent / "data-local" / name)
+    seen_paths: set[Path] = set()
+    for sp in candidates:
+        if sp in seen_paths or not sp.exists():
+            continue
+        seen_paths.add(sp)
+        try:
+            raw = json.loads(sp.read_text(encoding="utf-8"))
+            basket = raw.get("basket") or []
+            addrs: list[str] = []
+            for row in basket:
+                if isinstance(row, dict):
+                    a = str(row.get("address") or "").lower()
+                else:
+                    a = str(row).lower()
+                if a.startswith("0x"):
+                    addrs.append(a)
+            if addrs:
+                return frozenset(addrs[:want])
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+    rows = load_ranked_pool_rows(research_dir, state_path=state_path)
+    addrs = []
+    for row in rows:
+        a = _addr(row)
+        if a:
+            addrs.append(a)
+        if len(addrs) >= want:
+            break
+    return frozenset(addrs[:want])
 
 
 def load_holder_labels(research_dir: Path, state_path: Path | None = None) -> set[str]:
@@ -497,6 +548,11 @@ def build_dataset(
         holders = load_holder_labels(research_dir, state_path=state_path)
         live_holders = set(holders)
     live_listed = len(live_holders)
+    cloud_basket = load_cloud_basket_addrs(
+        research_dir,
+        basket_size=live_target,
+        state_path=state_path,
+    )
     pool_n = 0
     for br in book_rows:
         if br is not None:
@@ -539,7 +595,7 @@ def build_dataset(
 
     log.info(
         "Research dataset: ticks=%s coins=%s days=%.2f holders=%s live=%s/%s listed=%s "
-        "source=%s candle_coins=%s mark_aux_coins=%s",
+        "cloud_basket=%s pool=%s source=%s candle_coins=%s mark_aux_coins=%s",
         len(ts),
         len(coin_index),
         span_days,
@@ -547,6 +603,8 @@ def build_dataset(
         len(live_holders),
         live_target,
         live_listed,
+        len(cloud_basket),
+        pool_n,
         source,
         n_candle_coins,
         n_aux,
@@ -571,6 +629,7 @@ def build_dataset(
         live_holder_addrs=live_holders,
         live_listed=live_listed,
         live_basket_target=live_target,
+        cloud_basket_addrs=cloud_basket,
         pool_size=max(pool_n, 50),
         span_days=span_days,
         source=source,
