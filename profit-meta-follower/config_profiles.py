@@ -12,7 +12,7 @@ research = gather-only (data-research/).
 from __future__ import annotations
 
 # Live trading — cloud only. Leave alone while Railway is live.
-# Cloud _TRADE last tuned: 2026-08-25 22:25 UTC strategy=swing_meta_all score=85.45402122368 ret=94.69345397390954%
+# Cloud _TRADE last tuned: 2026-08-25 23:12 UTC strategy=swing_meta_all score=85.45402122368 ret=94.69345397390954%
 _TRADE: dict = {
     "BASKET_FILTER_MODE": 'off',
     "MAX_BOOK_CHANGES_PER_HOUR": 6,
@@ -23,8 +23,8 @@ _TRADE: dict = {
     "REBALANCE_COOLDOWN_S": 300.0,
     "STICKY_BOOK_SLOTS": True,
     "RANK_WINDOW": "week",
-    "BASKET_SIZE": 100,
-    "CANDIDATE_POOL": 100,
+    "BASKET_SIZE": 200,
+    "CANDIDATE_POOL": 200,
     "RESEARCH_DATA_ENABLED": False,
     "RESEARCH_ONLY": False,
     "BACKTEST_LIVE_STRATEGY": 'swing_meta_all',
