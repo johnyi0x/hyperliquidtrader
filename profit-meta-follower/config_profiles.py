@@ -12,14 +12,14 @@ research = gather-only (data-research/).
 from __future__ import annotations
 
 # Live trading — cloud only. Leave alone while Railway is live.
-# Cloud _TRADE last tuned: 2026-08-24 22:25 UTC strategy=cloud_holders score=-31.149453867224153 ret=7.744617276119525%
+# Cloud _TRADE last tuned: 2026-08-25 18:50 UTC strategy=swing_meta_all score=58.87490083936898 ret=68.17781770753466%
 _TRADE: dict = {
-    "BASKET_FILTER_MODE": 'holder',
+    "BASKET_FILTER_MODE": 'off',
     "MAX_BOOK_CHANGES_PER_HOUR": 6,
-    "FLOW_EMA_ALPHA": 0.24,
+    "FLOW_EMA_ALPHA": 0.2,
     "OPEN_CONFIRM_S": 210.0,
     "EXIT_RAW_FLOW": -0.02,
-    "EXIT_AGREEMENT_GIVEBACK": 0.28,
+    "EXIT_AGREEMENT_GIVEBACK": 0.34,
     "REBALANCE_COOLDOWN_S": 300.0,
     "STICKY_BOOK_SLOTS": True,
     "RANK_WINDOW": "week",
@@ -27,15 +27,33 @@ _TRADE: dict = {
     "CANDIDATE_POOL": 100,
     "RESEARCH_DATA_ENABLED": False,
     "RESEARCH_ONLY": False,
-    "BACKTEST_LIVE_STRATEGY": 'cloud_holders',
-    "CONV_GIVEBACK": 0.26,
+    "BACKTEST_LIVE_STRATEGY": 'swing_meta_all',
+    "CONV_GIVEBACK": 0.34,
     "EXIT_AVG_CONVICTION": 0.016,
-    "EXIT_FLOW": -0.015,
-    "EXIT_SIDE_AGREEMENT": 0.04,
-    "LIVE_CANDLE_SEED": False,
+    "EXIT_FLOW": -0.011,
+    "EXIT_SIDE_AGREEMENT": 0.06,
+    "LIVE_CANDLE_SEED": True,
     "MIN_AVG_CONVICTION": 0.018,
     "MIN_ENTRY_FLOW": 0.0,
-    "MIN_SIDE_AGREEMENT": 0.12,
+    "MIN_SIDE_AGREEMENT": 0.08,
+    "LIVE_CANDLES_PER_TICK": 2,
+    "LIVE_CANDLE_BARS_15M": 64,
+    "LIVE_CANDLE_BARS_1H": 48,
+    "LIVE_CANDLE_BARS_1M": 160,
+    "LIVE_CANDLE_COOLDOWN_S": 8.0,
+    "SWING_BAND_PCT": 0.02,
+    "SWING_BREAK_PCT": 0.012,
+    "SWING_ENTRY": 'ema_pullback',
+    "SWING_EXIT_RSI": 0.0,
+    "SWING_LOOKBACK_S": 600.0,
+    "SWING_MAX_HOLD_S": 86400.0,
+    "SWING_META_MODE": 'reverse',
+    "SWING_REENTRY_S": 3600.0,
+    "SWING_RSI_BUY": 40.0,
+    "SWING_RSI_SELL": 70.0,
+    "SWING_SL_PCT": 5.0,
+    "SWING_TF": '1h',
+    "SWING_TP_PCT": 5.0,
 }
 
 # Gather-only: crowd books first (live-parity cadence), then marks, then candles.
