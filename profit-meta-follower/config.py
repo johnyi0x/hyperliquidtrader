@@ -1,11 +1,9 @@
 """
 Profit-meta follower — follow a basket of high-PnL Hyperliquid wallets.
 
-This bot does not use candles. It treats top-PnL wallets as one liquid basket:
-  snapshot everyone's current book (scalpers included),
-  average it, smooth it, hold the crowded side,
-  exit when that net flow fades — not when one wallet flips.
-
+Crowd book is the core signal. Price-gated strategies also use marks + 1m/15m/1h
+candles (same PriceEngine math in backtest and live). Local/research gathers
+books, marks, and candles; cloud trades.
 
 Edit this file. Run:  python profit-meta-follower/run.py
 """
@@ -208,21 +206,78 @@ FLATTEN_WHEN_DROPPED = True
 MANAGED_ONLY = True
 
 # =============================================================================
+# LIVE STRATEGY (from backtest apply → cloud_tuned / _TRADE)
+# =============================================================================
+# Set by apply_cloud_tune from the winning backtest strategy name.
+BACKTEST_LIVE_STRATEGY = "cloud_holders"
+# Price-gate knobs (used when strategy is crowd_dump_* / trend / vol / btcdump).
+DUMP_RET_PCT = -0.02
+DUMP_LOOKBACK_S = 1800.0
+DUMP_RANGE_PCT = -0.025
+TREND_BIAS_MIN = 0.0
+MAX_ATR_PCT = 0.04
+RSI_MAX = 72.0
+RSI_MIN = 28.0
+# Holder-meta + original multi-candle (no DCA). Used when BACKTEST_LIVE_STRATEGY=mtf_meta_holders.
+MTF_PRESET = "rsi_long_30"
+MTF_EMA = 50
+MTF_MIN_AGREE = 2
+MTF_MIN_SCORE = 0.30
+MTF_WEIGHT_POWER = 0.5
+MTF_EXIT = "rsi_55"
+MTF_META_MODE = "follow"  # follow = trade with crowd side; reverse = fade it
+MTF_MAX_HOLD_S = 14400.0
+MTF_EXEC_IV = "1m"
+# Holder-meta + indicator swing timing. Used when BACKTEST_LIVE_STRATEGY=swing_meta_holders.
+SWING_META_MODE = "follow"  # follow = trade with crowd side; reverse = fade it
+SWING_ENTRY = "rsi_dip"  # rsi_dip | ema_pullback | breakout | range_dip
+SWING_TF = "15m"  # timeframe for RSI / EMA bias signals (1m | 15m | 1h)
+SWING_RSI_BUY = 35.0
+SWING_RSI_SELL = 65.0
+SWING_BAND_PCT = 0.008
+SWING_BREAK_PCT = 0.010
+SWING_LOOKBACK_S = 1800.0
+SWING_TP_PCT = 1.2
+SWING_SL_PCT = 1.8
+SWING_MAX_HOLD_S = 14400.0
+SWING_EXIT_RSI = 0.0  # 0 = off; else exit long at RSI ≥ value (short at 100−value)
+SWING_REENTRY_S = 900.0  # cooldown after an exit before the same coin can re-open
+# Seed 1m/15m/1h candles only for price-gated strategies, while history is cold.
+# Pure crowd strategies never hit the candle API on the live trade path.
+LIVE_CANDLE_SEED = True
+LIVE_CANDLES_PER_TICK = 1
+LIVE_CANDLE_COOLDOWN_S = 8.0
+LIVE_CANDLE_BARS_1M = 120
+LIVE_CANDLE_BARS_15M = 64
+LIVE_CANDLE_BARS_1H = 48
+
+# =============================================================================
 # TELEMETRY / BACKTEST
 # =============================================================================
 # Daily JSONL under data/telemetry/YYYY-MM-DD/ for offline param tuning.
 TELEMETRY_ENABLED = True
-# Local-only heavy log: raw top-ROI wallet books + marks so filter on/off
-# can be simulated later. Off = trade only (cloud). Does not change entries.
+# Gather crowd books + marks + candles (research/local). Never feeds live cloud.
 RESEARCH_DATA_ENABLED = False
+# If True: no live orders — only leaderboard pool + books/marks/candles.
+RESEARCH_ONLY = False
 # How many top-ROI wallets to label + track for research (pre-filter).
 RESEARCH_POOL_SIZE = 200
-# Extra clearinghouse snapshots per tick for research-only wallets (weight 2 each).
-RESEARCH_WALLETS_PER_TICK = 3
-RESEARCH_SNAPSHOT_INTERVAL_S = 45.0
-# Write one compact research row at most this often (disk + churn).
+# Clearinghouse snapshots per tick for research wallets (match live cadence when gather-only).
+RESEARCH_WALLETS_PER_TICK = 25
+RESEARCH_SNAPSHOT_INTERVAL_S = 8.0
+# Wallet-book rows (crowd base) — written before any candle fetch.
 RESEARCH_RECORD_INTERVAL_S = 60.0
-# Set by config_profiles (local | cloud). Override with PMF_PROFILE env.
+# Denser mark/funding/OI series for coins seen in those books.
+RESEARCH_MARKS_INTERVAL_S = 30.0
+# Skip books/ticks until at least this many wallets have a snapshot (not a % gate).
+RESEARCH_MIN_FRESH_WALLETS = 20
+RESEARCH_MIN_COVERAGE = 0.0
+# Closed candles for coins that appear in crowd books (fetched AFTER books/marks).
+RESEARCH_CANDLE_INTERVALS: tuple[str, ...] = ("1m", "15m", "1h")
+RESEARCH_CANDLE_BARS = 300
+RESEARCH_CANDLES_PER_TICK = 1
+RESEARCH_CANDLE_COOLDOWN_S = 2.0
+# Set by config_profiles (local | cloud | research). Override with PMF_PROFILE env.
 INSTANCE_NAME = "local"
 
 # After a reconnect of hours: we do NOT replay missed fills. We snapshot wallets

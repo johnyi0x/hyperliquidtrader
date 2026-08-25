@@ -276,6 +276,62 @@ class Qualifier:
         self.log.info("Holder basket %s wallets (scanned %s, skipped %s)", len(keep), scanned, skipped)
         return keep
 
+    def label_research_pool(self, pool: list[QualifiedWallet]) -> list[dict[str, Any]]:
+        """Label top RESEARCH_POOL_SIZE wallets holder yes/no (no trade basket)."""
+        research_n = int(getattr(self.cfg, "RESEARCH_POOL_SIZE", 0) or 0) or len(pool)
+        lookback_d = float(getattr(self.cfg, "HOLD_LOOKBACK_DAYS", 7.0) or 7.0)
+        start_ms = int((time.time() - lookback_d * 86400) * 1000)
+        now_ms = int(time.time() * 1000)
+        research: list[dict[str, Any]] = []
+        self.log.info(
+            "Research label: fill-tape on top %s ROI wallets (holders + scalpers kept for offline)",
+            min(research_n, len(pool)),
+        )
+        for i, w in enumerate(pool):
+            if i >= research_n:
+                break
+            fills = self._recent_fills(w.address, start_ms)
+            if fills is None:
+                research.append(
+                    {
+                        "address": w.address,
+                        "account_value": round(w.account_value, 2),
+                        "rank_pnl": round(w.rank_pnl, 2),
+                        "rank_roi": round(w.rank_roi, 6),
+                        "rank_volume": round(w.rank_volume, 2),
+                        "score": round(w.score, 6),
+                        "holder": None,
+                        "why": "fills_failed",
+                    }
+                )
+                continue
+            ok, why = is_holder_tape(fills, now_ms, self.cfg)
+            research.append(
+                {
+                    "address": w.address,
+                    "account_value": round(w.account_value, 2),
+                    "rank_pnl": round(w.rank_pnl, 2),
+                    "rank_roi": round(w.rank_roi, 6),
+                    "rank_volume": round(w.rank_volume, 2),
+                    "score": round(w.score, 6),
+                    "holder": bool(ok),
+                    "why": why,
+                }
+            )
+            tag = "holder" if ok else "scalper"
+            self.log.info(
+                "Research %s %s/%s %s roi=%.1f%% %s",
+                tag,
+                len(research),
+                research_n,
+                w.address[:10],
+                w.rank_roi * 100.0,
+                why,
+            )
+        holders = sum(1 for r in research if r.get("holder") is True)
+        self.log.info("Research pool labeled %s (holders=%s)", len(research), holders)
+        return research
+
     def pick_holders_and_research(
         self, pool: list[QualifiedWallet]
     ) -> tuple[list[QualifiedWallet], list[dict[str, Any]]]:

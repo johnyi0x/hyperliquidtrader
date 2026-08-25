@@ -224,12 +224,17 @@ def combined_entry_mask(
 def mtf_entry_signal_now(
     setup: Any,
     candles_by_interval: dict[str, list[dict[str, Any]]],
+    *,
+    biases: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> int:
     """
     Live/paper last-bar signal for an MTF setup.
     Returns backtest side +1 / −1 / 0 (same mask as tune).
 
     REVERSE_STRATEGY must NOT be applied here — flip only at order time.
+
+    Pass precomputed `biases` from prepare_interval_biases to skip rebuilding
+    multi-TF EMA bias maps when only the LTF trigger preset changes.
     """
     exec_iv = str(getattr(setup, "interval", "1m"))
     exec_candles = candles_by_interval.get(exec_iv) or []
@@ -247,6 +252,7 @@ def mtf_entry_signal_now(
         min_agree=int(getattr(setup, "mtf_min_agree", 3) or 3),
         min_score=float(getattr(setup, "mtf_min_score", 0.35) or 0.35),
         weight_power=float(getattr(setup, "mtf_weight_power", 0.5) or 0.5),
+        biases=biases,
     )
     if result is None:
         return 0

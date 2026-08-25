@@ -2,11 +2,14 @@
 data/
 data-local/
 data-cloud/
+data-research/
 logs/
 __pycache__/
 *.pyc
 .venv/
 venv/
+# Old gather dumps (Windows default "New folder", "New folder (2)", …)
+New folder/
+New folder (*)
 profit-meta-follower/New folder/
-profit-meta-follower/New folder (2)/
-profit-meta-follower/New folder (3)/
+profit-meta-follower/New folder (*)

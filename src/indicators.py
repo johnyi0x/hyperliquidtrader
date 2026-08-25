@@ -47,12 +47,27 @@ def sma(closes: np.ndarray, period: int) -> np.ndarray:
 
 
 def rolling_std(closes: np.ndarray, period: int) -> np.ndarray:
+    """Population std (ddof=0) over each window — same as np.std(window) per bar."""
     n = len(closes)
     out = np.full(n, np.nan, dtype=np.float64)
     if period < 2 or n < period:
         return out
-    for i in range(period - 1, n):
-        out[i] = np.std(closes[i - period + 1 : i + 1])
+    c = np.asarray(closes, dtype=np.float64)
+    csum = np.cumsum(c)
+    csum2 = np.cumsum(c * c)
+    # window sums for indices period-1 .. n-1
+    s = np.empty(n - period + 1, dtype=np.float64)
+    s2 = np.empty(n - period + 1, dtype=np.float64)
+    s[0] = csum[period - 1]
+    s2[0] = csum2[period - 1]
+    if n > period:
+        s[1:] = csum[period:] - csum[:-period]
+        s2[1:] = csum2[period:] - csum2[:-period]
+    mean = s / period
+    var = s2 / period - mean * mean
+    # tiny negatives from fp noise
+    np.maximum(var, 0.0, out=var)
+    out[period - 1 :] = np.sqrt(var)
     return out
 
 
