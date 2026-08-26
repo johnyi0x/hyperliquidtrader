@@ -186,6 +186,9 @@ META_TIMING_STRATEGIES = (
     "swing_meta_all",
 )
 
+# Crowd / refine / price-gate only — no MTF or swing timing. Used by --crowd-only.
+CROWD_STRATEGIES = tuple(s for s in LIVE_STRATEGIES if s not in META_TIMING_STRATEGIES)
+
 TUNABLE_KEYS = (
     "FLOW_EMA_ALPHA",
     "EXIT_FLOW",

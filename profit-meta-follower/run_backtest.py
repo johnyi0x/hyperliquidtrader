@@ -14,6 +14,7 @@ strategies, then a dense search around the winner of the best --top-k strategies
   python profit-meta-follower/run_backtest.py
   python profit-meta-follower/run_backtest.py --days 7 --max-combos 500 --all-strategies
   python profit-meta-follower/run_backtest.py --meta-timing --days 7 --max-combos 300
+  python profit-meta-follower/run_backtest.py --crowd-only --days 7 --max-combos 500
   python profit-meta-follower/run_backtest.py --single-stage      # old behaviour
   python profit-meta-follower/apply_cloud_tune.py
 """
@@ -150,7 +151,17 @@ def main() -> None:
             "Deep-search only the 4 meta-timing strategies: "
             "mtf_meta_holders, mtf_meta_all, swing_meta_holders, swing_meta_all "
             "(multi-candle / indicator entry-exit; holder filter on and off). "
-            "Ignores all other strategies. Off by default. Overrides --all-strategies."
+            "Ignores all other strategies. Off by default. Overrides --all-strategies / --crowd-only."
+        ),
+    )
+    ap.add_argument(
+        "--crowd-only",
+        action="store_true",
+        help=(
+            "Search crowd / refine / price-gate strategies only — excludes the 4 "
+            "multi-candle meta-timing strategies (mtf_meta_* and swing_meta_*). "
+            "With --all-strategies, searches every non-meta replayer. "
+            "Overrides default LIVE_STRATEGIES. Off by default."
         ),
     )
     args = ap.parse_args()
@@ -163,14 +174,27 @@ def main() -> None:
         sys.exit(1)
 
     from pmf.bt_replay import STRATEGY_REPLAYERS
-    from pmf.bt_tune import LIVE_STRATEGIES, META_TIMING_STRATEGIES, sim_size_from_cfg
+    from pmf.bt_tune import (
+        CROWD_STRATEGIES,
+        LIVE_STRATEGIES,
+        META_TIMING_STRATEGIES,
+        sim_size_from_cfg,
+    )
 
     margin_frac, lev = sim_size_from_cfg(cfg)
+    meta_set = set(META_TIMING_STRATEGIES)
     if args.meta_timing:
         strats = [s for s in META_TIMING_STRATEGIES if s in STRATEGY_REPLAYERS]
         # All meta-timing strategies get the full --max-combos budget.
         two_stage = False
         top_k = len(strats) or 1
+    elif args.crowd_only:
+        if args.all_strategies:
+            strats = [s for s in STRATEGY_REPLAYERS if s not in meta_set]
+        else:
+            strats = [s for s in CROWD_STRATEGIES if s in STRATEGY_REPLAYERS]
+        two_stage = not args.single_stage
+        top_k = max(1, args.top_k)
     else:
         strats = list(STRATEGY_REPLAYERS.keys()) if args.all_strategies else list(LIVE_STRATEGIES)
         two_stage = not args.single_stage
@@ -185,6 +209,12 @@ def main() -> None:
             f"Search plan: meta-timing ONLY — deep search "
             f"{max(8, args.max_combos)} combos × {len(strats)} strategies "
             f"(mtf/swing × holders/all); other strategies ignored"
+        )
+    elif args.crowd_only:
+        print(
+            f"Search plan: crowd-only — {len(strats)} strategies "
+            f"(no mtf_meta_* / swing_meta_*); "
+            + ("two-stage" if two_stage else "single-stage")
         )
     elif two_stage and len(strats) > top_k:
         stage1 = coarse or max(8, round(max(8, args.max_combos) * 0.25))
