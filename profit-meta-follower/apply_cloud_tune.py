@@ -8,12 +8,19 @@ Usage (after a successful backtest):
 
   python profit-meta-follower/run_backtest.py --days 7 --max-combos 500
   python profit-meta-follower/apply_cloud_tune.py
+  python profit-meta-follower/apply_cloud_tune.py --reverse   # invert winner (fade ↔ follow)
 
 Winner strategy sets:
   BACKTEST_LIVE_STRATEGY = strategy name (live runner executes identical pick_trade_votes)
   BASKET_FILTER_MODE = holder | off from *_holders vs *_all
   TUNABLE_KEYS + INDICATOR_KEYS + MTF_KEYS + SWING_KEYS
   LIVE_CANDLE_SEED = True only when strategy needs 1m/15m/1h candles
+
+--reverse flips the winner's direction:
+  TRADE_MODE follow↔reverse (crowd refine / dump / vol / …)
+  SWING_META_MODE follow↔reverse (swing_meta_*)
+  MTF_META_MODE follow↔reverse (mtf_meta_*)
+  MTF_PRESET long↔short pairs when a known opposite exists
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ APPLY_KEYS = (
     | {
         "BASKET_FILTER_MODE",
         "BACKTEST_LIVE_STRATEGY",
+        "TRADE_MODE",
         "STICKY_BOOK_SLOTS",
         "LIVE_CANDLE_SEED",
         "LIVE_CANDLES_PER_TICK",
@@ -57,9 +65,59 @@ APPLY_KEYS = (
     }
 )
 
+# Known MTF preset long↔short mirrors (only pairs that exist in MTF_PRESETS).
+_MTF_PRESET_FLIP: dict[str, str] = {
+    "rsi_long_30": "rsi_short_70",
+    "rsi_long_35": "rsi_short_70",
+    "rsi_short_70": "rsi_long_30",
+    "ema_x_long": "ema_x_short",
+    "ema_x_short": "ema_x_long",
+    "dump_bounce": "pump_fade",
+    "pump_fade": "dump_bounce",
+}
+
 
 def filter_mode_for_strategy(strategy: str) -> str:
     return parse_strategy(strategy).filter_mode
+
+
+def _flip_follow_reverse(value: Any, *, default: str = "follow") -> str:
+    cur = str(value if value is not None else default).strip().lower()
+    if cur in ("reverse", "invert", "fade"):
+        return "follow"
+    return "reverse"
+
+
+def reverse_winner_params(params: dict[str, Any], *, strategy: str) -> dict[str, Any]:
+    """Exact direction invert of a backtest winner for live apply."""
+    out = dict(params)
+    spec = parse_strategy(strategy)
+    flips: list[str] = []
+
+    # Crowd refine / price-gate styles use TRADE_MODE for side invert.
+    if spec.style in ("refine", "direct", "flow", "logged") or spec.gate:
+        before = out.get("TRADE_MODE", "follow")
+        out["TRADE_MODE"] = _flip_follow_reverse(before)
+        flips.append(f"TRADE_MODE {before}->{out['TRADE_MODE']}")
+
+    if spec.style == "swing_meta" or "SWING_META_MODE" in out:
+        before = out.get("SWING_META_MODE", "follow")
+        out["SWING_META_MODE"] = _flip_follow_reverse(before)
+        flips.append(f"SWING_META_MODE {before}->{out['SWING_META_MODE']}")
+
+    if spec.style == "mtf_meta" or "MTF_META_MODE" in out:
+        before = out.get("MTF_META_MODE", "follow")
+        out["MTF_META_MODE"] = _flip_follow_reverse(before)
+        flips.append(f"MTF_META_MODE {before}->{out['MTF_META_MODE']}")
+        preset = str(out.get("MTF_PRESET") or "").strip()
+        if preset in _MTF_PRESET_FLIP:
+            flipped = _MTF_PRESET_FLIP[preset]
+            flips.append(f"MTF_PRESET {preset}->{flipped}")
+            out["MTF_PRESET"] = flipped
+
+    out["_REVERSE_APPLIED"] = True
+    out["_REVERSE_FLIPS"] = flips
+    return out
 
 
 def _fmt_value(v: Any) -> str:
@@ -117,10 +175,17 @@ def _patch_trade_block(text: str, params: dict[str, Any]) -> str:
     return "".join(out)
 
 
-def _ensure_strategy_comment(text: str, strategy: str, metrics: dict[str, Any]) -> str:
+def _ensure_strategy_comment(
+    text: str,
+    strategy: str,
+    metrics: dict[str, Any],
+    *,
+    reversed_apply: bool = False,
+) -> str:
+    tag = " REVERSED" if reversed_apply else ""
     banner = (
         f"# Cloud _TRADE last tuned: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} "
-        f"strategy={strategy} score={metrics.get('score', '?')} ret={metrics.get('return_pct', '?')}%"
+        f"strategy={strategy}{tag} score={metrics.get('score', '?')} ret={metrics.get('return_pct', '?')}%"
     )
     if "Cloud _TRADE last tuned:" in text:
         text = re.sub(r"# Cloud _TRADE last tuned:.*\n", banner + "\n", text, count=1)
@@ -133,7 +198,12 @@ def _ensure_strategy_comment(text: str, strategy: str, metrics: dict[str, Any]) 
     return text
 
 
-def apply_from_payload(payload: dict[str, Any], *, write_profiles: bool = True) -> None:
+def apply_from_payload(
+    payload: dict[str, Any],
+    *,
+    write_profiles: bool = True,
+    reverse: bool = False,
+) -> None:
     params = payload.get("params")
     if not isinstance(params, dict) or not params:
         raise SystemExit("backtest file has no params — run backtest first")
@@ -141,6 +211,16 @@ def apply_from_payload(payload: dict[str, Any], *, write_profiles: bool = True) 
     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
     spec = parse_strategy(strategy)
     params = dict(params)
+    if reverse:
+        params = reverse_winner_params(params, strategy=strategy)
+        flips = params.pop("_REVERSE_FLIPS", [])
+        params.pop("_REVERSE_APPLIED", None)
+        print("Reverse apply — flipped:")
+        for line in flips:
+            print(f"  {line}")
+        if not flips:
+            print("  (no mode keys found; set TRADE_MODE=reverse as fallback)")
+            params["TRADE_MODE"] = "reverse"
     params["BASKET_FILTER_MODE"] = spec.filter_mode
     params["BACKTEST_LIVE_STRATEGY"] = spec.name
     # Candle seed only for price-gated strategies (1m+15m+1h, rate-limited).
@@ -189,13 +269,14 @@ def apply_from_payload(payload: dict[str, Any], *, write_profiles: bool = True) 
     out["strategy"] = spec.name
     out["applied_at"] = time.time()
     out["applied_to"] = "cloud"
+    out["reversed"] = bool(reverse)
     CLOUD_TUNED_PATH.write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"Wrote {CLOUD_TUNED_PATH}")
 
     if write_profiles and PROFILES_PATH.exists():
         text = PROFILES_PATH.read_text(encoding="utf-8")
         text = _patch_trade_block(text, params)
-        text = _ensure_strategy_comment(text, strategy, metrics)
+        text = _ensure_strategy_comment(text, strategy, metrics, reversed_apply=reverse)
         PROFILES_PATH.write_text(text, encoding="utf-8")
         print(f"Updated {PROFILES_PATH} (_TRADE params)")
         updated = ", ".join(f"{k}={params[k]}" for k in sorted(params) if k in APPLY_KEYS)
@@ -203,6 +284,7 @@ def apply_from_payload(payload: dict[str, Any], *, write_profiles: bool = True) 
     print(
         f"  strategy={spec.name} style={spec.style} gate={spec.gate or '-'} "
         f"BASKET_FILTER_MODE={params['BASKET_FILTER_MODE']} candles={'on' if spec.needs_candles else 'off'}"
+        f"{' REVERSED' if reverse else ''}"
     )
 
 
@@ -215,6 +297,15 @@ def main() -> None:
         help="backtest_latest.json from run_backtest.py (default: data-local/backtest_latest.json)",
     )
     ap.add_argument("--no-profiles", action="store_true", help="Only write cloud_tuned.json")
+    ap.add_argument(
+        "--reverse",
+        action="store_true",
+        help=(
+            "Apply the exact reverse of the backtest winner: flip TRADE_MODE / "
+            "SWING_META_MODE / MTF_META_MODE (follow↔reverse), and flip known "
+            "MTF_PRESET long↔short pairs. Same strategy name + other knobs."
+        ),
+    )
     args = ap.parse_args()
 
     src = Path(args.source)
@@ -226,7 +317,7 @@ def main() -> None:
         print("Run:  python profit-meta-follower/run_backtest.py --days 7 --max-combos 120")
         sys.exit(1)
 
-    apply_from_payload(payload, write_profiles=not args.no_profiles)
+    apply_from_payload(payload, write_profiles=not args.no_profiles, reverse=args.reverse)
     print("\nNext: git add/commit/push, then redeploy Railway (PMF_PROFILE=cloud).")
 
 

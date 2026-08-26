@@ -1168,6 +1168,26 @@ class BacktestTests(unittest.TestCase):
         for key in ("SWING_TP_PCT", "SWING_SL_PCT", "SWING_MAX_HOLD_S", "SWING_META_MODE"):
             self.assertIn(key, out)
 
+    def test_apply_reverse_flips_modes(self) -> None:
+        from apply_cloud_tune import reverse_winner_params
+
+        swing = reverse_winner_params(
+            {"SWING_META_MODE": "reverse", "SWING_ENTRY": "ema_pullback"},
+            strategy="swing_meta_all",
+        )
+        self.assertEqual(swing["SWING_META_MODE"], "follow")
+        self.assertEqual(swing["SWING_ENTRY"], "ema_pullback")
+
+        crowd = reverse_winner_params({"MIN_SIDE_AGREEMENT": 0.1}, strategy="crowd_vol_all")
+        self.assertEqual(crowd["TRADE_MODE"], "reverse")
+
+        mtf = reverse_winner_params(
+            {"MTF_META_MODE": "follow", "MTF_PRESET": "ema_x_long"},
+            strategy="mtf_meta_holders",
+        )
+        self.assertEqual(mtf["MTF_META_MODE"], "reverse")
+        self.assertEqual(mtf["MTF_PRESET"], "ema_x_short")
+
     def test_coarse_grid_is_wide_and_deep_grid_focuses(self) -> None:
         from pmf.bt_tune import (
             DEFAULT_GRID,
