@@ -20,7 +20,8 @@ RESEARCH_GATHER_SIZE = 200
 TRADE_BASKET_SIZE = 50
 
 # Copy-mode knobs (RUN_MODE=copy | copy_reverse). Crowd mode ignores these.
-# Full watchlist before trade. No max ROI / max-fills caps — only minimums + anti-minute-scalp.
+# Pick highest RANK_WINDOW (week=7d) ROI wallets that pass minimum fill/gap/WR floors.
+# No max ROI / max-fills caps. Full watchlist (COPY_TOP_N) required before trading.
 COPY_TOP_N = 2
 COPY_REQUIRE_FULL_WATCHLIST = True
 COPY_CANDIDATE_SCAN = 2000

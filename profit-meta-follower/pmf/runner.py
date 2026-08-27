@@ -25,7 +25,7 @@ from .copy_score import (
 from .leaderboard import load_leaderboard
 from .markets import MarketCache
 from .price_engine import PriceEngine
-from .qualify import Qualifier, holder_filter_on, shortlist, shortlist_copy_profit
+from .qualify import Qualifier, holder_filter_on, shortlist, shortlist_copy_roi
 from .rebalancer import PaperBook, Rebalancer
 from .research import ResearchWriter, compact_research_votes
 from .snapshots import SnapshotClient, list_dex_query_names
@@ -81,7 +81,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v7",
+            "copy-v8",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_REQUIRE_FULL_WATCHLIST", "")),
             str(getattr(cfg, "COPY_MAX_ROI", "")),
@@ -279,10 +279,16 @@ class ProfitMetaRunner:
         )
         scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 2000) or 2000)
         min_eq = float(getattr(self.cfg, "COPY_MIN_EQUITY", 1000.0) or 0.0)
-        pool = shortlist_copy_profit(
+        pool = shortlist_copy_roi(
             rows, self.cfg, scan_n=scan_n, min_equity=min_eq
         )
-        self.log.info("Copy shortlist %s/%s by window PnL (min_eq=$%.0f)", len(pool), len(rows), min_eq)
+        self.log.info(
+            "Copy shortlist %s/%s by %s ROI (min_eq=$%.0f) — matches HL leaderboard order",
+            len(pool),
+            len(rows),
+            getattr(self.cfg, "RANK_WINDOW", "week"),
+            min_eq,
+        )
         if not pool:
             self.log.error("No wallets on copy shortlist")
             self.store.data["copy_scan_failed_at"] = time.time()
@@ -343,7 +349,11 @@ class ProfitMetaRunner:
         leaders = self._copy_leaders()
         want = max(1, int(getattr(self.cfg, "COPY_TOP_N", 5) or 5))
         if not leaders:
-            self.log.warning("Copy mode — no leaders loaded yet")
+            last_wait = float(self.store.data.get("copy_empty_log_at") or 0)
+            if time.time() - last_wait >= 120.0:
+                self.log.warning("Copy mode — no leaders loaded yet")
+                self.store.data["copy_empty_log_at"] = time.time()
+                self.store.save()
             return
         if not self._copy_watchlist_full(leaders):
             last_wait = float(self.store.data.get("copy_wait_log_at") or 0)

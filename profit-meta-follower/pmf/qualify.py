@@ -116,14 +116,14 @@ def shortlist(rows: list[LeaderboardRow], cfg: Any) -> list[QualifiedWallet]:
     return scored[:pool_n]
 
 
-def shortlist_copy_profit(
+def shortlist_copy_roi(
     rows: list[LeaderboardRow],
     cfg: Any,
     *,
     scan_n: int,
     min_equity: float = 0.0,
 ) -> list[QualifiedWallet]:
-    """Top wallets by window dollar PnL (copy mode — not lottery ROI %)."""
+    """Top wallets by RANK_WINDOW ROI (same ordering as HL 7d leaderboard UI)."""
     rank_n = str(getattr(cfg, "RANK_WINDOW", "week") or "week")
     out: list[QualifiedWallet] = []
     for row in rows:
@@ -132,7 +132,7 @@ def shortlist_copy_profit(
             continue
         if min_equity > 0 and row.account_value < min_equity:
             continue
-        if w.pnl <= 0:
+        if w.roi <= 0:
             continue
         out.append(
             QualifiedWallet(
@@ -142,11 +142,22 @@ def shortlist_copy_profit(
                 rank_roi=w.roi,
                 rank_volume=w.volume,
                 confirm_pnl=0.0,
-                score=w.pnl,
+                score=w.roi,
             )
         )
-    out.sort(key=lambda x: x.rank_pnl, reverse=True)
+    out.sort(key=lambda x: x.rank_roi, reverse=True)
     return out[: max(1, int(scan_n))]
+
+
+def shortlist_copy_profit(
+    rows: list[LeaderboardRow],
+    cfg: Any,
+    *,
+    scan_n: int,
+    min_equity: float = 0.0,
+) -> list[QualifiedWallet]:
+    """Deprecated alias — copy mode ranks by ROI like the HL UI."""
+    return shortlist_copy_roi(rows, cfg, scan_n=scan_n, min_equity=min_equity)
 
 
 def _ledger_net_deposit(entries: list[Any], start_ms: int) -> float:

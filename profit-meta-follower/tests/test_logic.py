@@ -1550,7 +1550,7 @@ class CopyModeTests(unittest.TestCase):
         self.assertEqual(follow[0].coin, reverse[0].coin)
 
     def test_copy_scan_cfg_shortlist(self) -> None:
-        from pmf.qualify import shortlist, shortlist_copy_profit
+        from pmf.qualify import shortlist, shortlist_copy_roi
         from pmf.types import LeaderboardRow, WindowPerf
 
         base = _Cfg()
@@ -1579,9 +1579,11 @@ class CopyModeTests(unittest.TestCase):
         out = shortlist(rows, _ScanCfg())
         self.assertEqual(len(out), scan_n)
 
-        by_pnl = shortlist_copy_profit(rows, base, scan_n=5, min_equity=1000.0)
-        self.assertEqual(len(by_pnl), 5)
-        self.assertGreaterEqual(by_pnl[0].rank_pnl, by_pnl[-1].rank_pnl)
+        by_roi = shortlist_copy_roi(rows, base, scan_n=5, min_equity=1000.0)
+        self.assertEqual(len(by_roi), 5)
+        self.assertGreaterEqual(by_roi[0].rank_roi, by_roi[-1].rank_roi)
+        # Highest ROI in fixture is i=29
+        self.assertEqual(by_roi[0].address, f"0x{29:040x}")
 
         from types import SimpleNamespace
 
