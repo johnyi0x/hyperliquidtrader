@@ -172,30 +172,31 @@ def analyze_fills(
 
 
 def passes_copy_filters(recent: FillStats, history: FillStats, cfg: Any) -> tuple[bool, str]:
-    min_f = int(getattr(cfg, "COPY_MIN_FILLS", 6) or 6)
-    max_f = int(getattr(cfg, "COPY_MAX_FILLS", 120) or 120)
-    min_gap = float(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", 300.0) or 300.0)
-    max_gap = float(getattr(cfg, "COPY_MAX_MEDIAN_GAP_S", 43200.0) or 43200.0)
-    min_fpd = float(getattr(cfg, "COPY_MIN_FILLS_PER_DAY", 1.5) or 1.5)
-    max_fpd = float(getattr(cfg, "COPY_MAX_FILLS_PER_DAY", 18.0) or 18.0)
-    min_wr = float(getattr(cfg, "COPY_MIN_WIN_RATE", 0.52) or 0.52)
-    min_hist_wr = float(getattr(cfg, "COPY_MIN_HIST_WIN_RATE", 0.48) or 0.48)
-    min_pnl = float(getattr(cfg, "COPY_MIN_RECENT_PNL", 100.0) or 100.0)
-    min_hist_pnl = float(getattr(cfg, "COPY_MIN_HIST_PNL", 200.0) or 200.0)
-    min_pf = float(getattr(cfg, "COPY_MIN_PROFIT_FACTOR", 1.25) or 1.25)
-    max_flip = float(getattr(cfg, "COPY_MAX_FAST_FLIP_RATIO", 0.35) or 0.35)
+    """Minimum floors only for fills/PnL; max_* of 0 means unlimited."""
+    min_f = int(getattr(cfg, "COPY_MIN_FILLS", 10) or 10)
+    max_f = int(getattr(cfg, "COPY_MAX_FILLS", 0) or 0)
+    min_gap = float(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", 90.0) or 90.0)
+    max_gap = float(getattr(cfg, "COPY_MAX_MEDIAN_GAP_S", 0.0) or 0.0)
+    min_fpd = float(getattr(cfg, "COPY_MIN_FILLS_PER_DAY", 8.0) or 8.0)
+    max_fpd = float(getattr(cfg, "COPY_MAX_FILLS_PER_DAY", 0.0) or 0.0)
+    min_wr = float(getattr(cfg, "COPY_MIN_WIN_RATE", 0.40) or 0.40)
+    min_hist_wr = float(getattr(cfg, "COPY_MIN_HIST_WIN_RATE", 0.38) or 0.38)
+    min_pnl = float(getattr(cfg, "COPY_MIN_RECENT_PNL", 0.0) or 0.0)
+    min_hist_pnl = float(getattr(cfg, "COPY_MIN_HIST_PNL", 0.0) or 0.0)
+    min_pf = float(getattr(cfg, "COPY_MIN_PROFIT_FACTOR", 1.0) or 1.0)
+    max_flip = float(getattr(cfg, "COPY_MAX_FAST_FLIP_RATIO", 0.0) or 0.0)
 
     if recent.n_fills < min_f:
         return False, f"too_few_fills={recent.n_fills}"
-    if recent.n_fills > max_f:
+    if max_f > 0 and recent.n_fills > max_f:
         return False, f"too_many_fills={recent.n_fills}"
     if recent.median_gap_s < min_gap:
         return False, f"scalpy gap={recent.median_gap_s:.0f}s"
-    if recent.median_gap_s > max_gap:
+    if max_gap > 0 and recent.median_gap_s > max_gap:
         return False, f"dormant gap={recent.median_gap_s:.0f}s"
     if recent.fills_per_day < min_fpd:
         return False, f"slow {recent.fills_per_day:.1f}/d"
-    if recent.fills_per_day > max_fpd:
+    if max_fpd > 0 and recent.fills_per_day > max_fpd:
         return False, f"hyper {recent.fills_per_day:.1f}/d"
     if recent.wins + recent.losses < 3:
         return False, f"few_closed={recent.wins + recent.losses}"
@@ -207,9 +208,9 @@ def passes_copy_filters(recent: FillStats, history: FillStats, cfg: Any) -> tupl
         return False, f"recent_pnl=${recent.closed_pnl:.0f}"
     if history.closed_pnl < min_hist_pnl:
         return False, f"hist_pnl=${history.closed_pnl:.0f}"
-    if recent.profit_factor < min_pf and recent.losses >= 2:
+    if min_pf > 0 and recent.profit_factor < min_pf and recent.losses >= 2:
         return False, f"pf={recent.profit_factor:.2f}"
-    if recent.round_trips >= 4 and recent.fast_flip_ratio > max_flip:
+    if max_flip > 0 and recent.round_trips >= 4 and recent.fast_flip_ratio > max_flip:
         return False, f"bait_flips={recent.fast_flip_ratio:.0%}"
     return True, "ok"
 
@@ -248,14 +249,17 @@ def score_copy_wallet(
     tpd_pen = abs(math.log(max(trips_per_day, 0.1) / ideal_tpd))
     activity += max(0.0, 18.0 - tpd_pen * 8.0)
     fpd = recent.fills_per_day
-    if 20.0 <= fpd <= 120.0:
-        activity += 8.0
-    elif 12.0 <= fpd < 20.0 or 120.0 < fpd <= 160.0:
-        activity += 2.0
+    if 15.0 <= fpd <= 200.0:
+        activity += 10.0
+    elif 8.0 <= fpd < 15.0 or 200.0 < fpd <= 400.0:
+        activity += 4.0
     else:
-        activity -= 8.0
+        activity -= 6.0
 
-    bait_pen = recent.fast_flip_ratio * 40.0
+    bait_pen = 0.0
+    max_flip = float(getattr(cfg, "COPY_MAX_FAST_FLIP_RATIO", 0.0) or 0.0)
+    if max_flip > 0:
+        bait_pen = recent.fast_flip_ratio * 40.0
 
     freshness = 0.0
     if recent.last_fill_ms > 0:
@@ -297,18 +301,18 @@ def _relaxed_copy_cfg(cfg: Any) -> Any:
     vals = {k: getattr(cfg, k) for k in keys if hasattr(cfg, k)}
     vals.update(
         {
-            "COPY_MIN_FILLS": 4,
-            "COPY_MAX_FILLS": 2000,
-            "COPY_MIN_MEDIAN_GAP_S": 30.0,
-            "COPY_MAX_MEDIAN_GAP_S": 43200.0,
+            "COPY_MIN_FILLS": 6,
+            "COPY_MAX_FILLS": 0,
+            "COPY_MIN_MEDIAN_GAP_S": 60.0,
+            "COPY_MAX_MEDIAN_GAP_S": 0.0,
             "COPY_MIN_FILLS_PER_DAY": 4.0,
-            "COPY_MAX_FILLS_PER_DAY": 250.0,
-            "COPY_MIN_WIN_RATE": 0.40,
-            "COPY_MIN_HIST_WIN_RATE": 0.38,
+            "COPY_MAX_FILLS_PER_DAY": 0.0,
+            "COPY_MIN_WIN_RATE": 0.35,
+            "COPY_MIN_HIST_WIN_RATE": 0.35,
             "COPY_MIN_RECENT_PNL": 0.0,
             "COPY_MIN_HIST_PNL": 0.0,
-            "COPY_MIN_PROFIT_FACTOR": 0.95,
-            "COPY_MAX_FAST_FLIP_RATIO": 0.65,
+            "COPY_MIN_PROFIT_FACTOR": 0.0,
+            "COPY_MAX_FAST_FLIP_RATIO": 0.0,
         }
     )
     return SimpleNamespace(**vals)

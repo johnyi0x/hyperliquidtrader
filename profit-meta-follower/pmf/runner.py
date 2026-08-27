@@ -81,13 +81,13 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v5",
+            "copy-v6",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_REQUIRE_FULL_WATCHLIST", "")),
-            str(getattr(cfg, "COPY_CANDIDATE_SCAN", "")),
             str(getattr(cfg, "COPY_MAX_ROI", "")),
             str(getattr(cfg, "COPY_MAX_FILLS", "")),
-            str(getattr(cfg, "COPY_IDEAL_TRADES_PER_HOUR", "")),
+            str(getattr(cfg, "COPY_MIN_FILLS_PER_DAY", "")),
+            str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
             str(getattr(cfg, "RUN_MODE", "copy")),
         ]
     )
@@ -252,12 +252,16 @@ class ProfitMetaRunner:
         failed_at = float(self.store.data.get("copy_scan_failed_at") or 0)
         backoff_s = retry_min * 60.0 if not full else 1800.0
         if failed_at > 0 and (time.time() - failed_at) < backoff_s and not full:
-            self.log.warning(
-                "Copy scan backoff — last incomplete/fail %.0f min ago (have %s/%s)",
-                (time.time() - failed_at) / 60.0,
-                len(existing),
-                want,
-            )
+            last_log = float(self.store.data.get("copy_backoff_log_at") or 0)
+            if time.time() - last_log >= 120.0:
+                self.log.warning(
+                    "Copy scan backoff — last incomplete/fail %.0f min ago (have %s/%s)",
+                    (time.time() - failed_at) / 60.0,
+                    len(existing),
+                    want,
+                )
+                self.store.data["copy_backoff_log_at"] = time.time()
+                self.store.save()
             if existing:
                 self.tracker.set_basket(leaders_to_basket(existing))
             return
