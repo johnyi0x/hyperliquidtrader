@@ -81,16 +81,14 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v3",
+            "copy-v4",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_CANDIDATE_SCAN", "")),
+            str(getattr(cfg, "COPY_MAX_ROI", "")),
             str(getattr(cfg, "RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
-            str(getattr(cfg, "COPY_MAX_MEDIAN_GAP_S", "")),
+            str(getattr(cfg, "COPY_MAX_FILLS", "")),
             str(getattr(cfg, "COPY_MIN_WIN_RATE", "")),
-            str(getattr(cfg, "COPY_MIN_FILLS_PER_DAY", "")),
-            str(getattr(cfg, "COPY_MIN_PROFIT_FACTOR", "")),
-            str(getattr(cfg, "COPY_MAX_FAST_FLIP_RATIO", "")),
             str(getattr(cfg, "RUN_MODE", "copy")),
         ]
     )
@@ -236,13 +234,21 @@ class ProfitMetaRunner:
             self.tracker.set_basket(leaders_to_basket(existing))
             return
 
+        failed_at = float(self.store.data.get("copy_scan_failed_at") or 0)
+        if not existing and failed_at > 0 and (time.time() - failed_at) < 1800.0:
+            self.log.warning(
+                "Copy scan backoff — last fail %.0f min ago; retry later",
+                (time.time() - failed_at) / 60.0,
+            )
+            return
+
         self.log.info("Refreshing copy-trade leaders from leaderboard")
         rows = load_leaderboard(
             self.data_dir / "leaderboard_cache.json",
             float(self.cfg.LEADERBOARD_CACHE_HOURS),
             self.log,
         )
-        scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 120) or 120)
+        scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 1200) or 1200)
         base_cfg = self.cfg
 
         class _ScanCfg:
@@ -256,16 +262,30 @@ class ProfitMetaRunner:
         pool = shortlist(rows, _ScanCfg())
         self.log.info("Copy shortlist %s/%s leaderboard rows", len(pool), len(rows))
         if not pool:
-            raise RuntimeError("No wallets on copy shortlist — loosen COPY_* filters")
+            self.log.error("No wallets on copy shortlist")
+            self.store.data["copy_scan_failed_at"] = time.time()
+            self.store.save()
+            return
         qualifier = Qualifier(self.client.info, self.log, self.cfg)
         leaders = pick_copy_leaders(pool, qualifier, self.cfg, logger=self.log)
         if not leaders:
-            raise RuntimeError(
-                "No wallets passed copy filters — loosen COPY_MIN_* / gap band or widen COPY_CANDIDATE_SCAN"
+            if existing:
+                self.log.warning(
+                    "Copy scan found 0 leaders — keeping previous %s leaders",
+                    len(existing),
+                )
+                self.tracker.set_basket(leaders_to_basket(existing))
+                return
+            self.log.error(
+                "Copy scan found 0 leaders — backoff 30m then retry"
             )
+            self.store.data["copy_scan_failed_at"] = time.time()
+            self.store.save()
+            return
         self.store.data["copy_leaders"] = leaders_to_state(leaders)
         self.store.data["copy_built_at"] = time.time()
         self.store.data["copy_rank"] = _copy_sig(self.cfg)
+        self.store.data["copy_scan_failed_at"] = 0
         self.store.save()
         self.tracker.set_basket(leaders_to_basket(leaders))
         self.telemetry.record_event(

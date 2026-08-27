@@ -266,6 +266,46 @@ def score_copy_wallet(
     return wr + pf + recent_pnl + hist_pnl + roi + activity + freshness - bait_pen
 
 
+def _relaxed_copy_cfg(cfg: Any) -> Any:
+    """Softer second-pass thresholds when strict scan finds too few leaders."""
+    from types import SimpleNamespace
+
+    keys = [
+        "COPY_MIN_FILLS",
+        "COPY_MAX_FILLS",
+        "COPY_MIN_MEDIAN_GAP_S",
+        "COPY_MAX_MEDIAN_GAP_S",
+        "COPY_MIN_FILLS_PER_DAY",
+        "COPY_MAX_FILLS_PER_DAY",
+        "COPY_MIN_WIN_RATE",
+        "COPY_MIN_HIST_WIN_RATE",
+        "COPY_MIN_RECENT_PNL",
+        "COPY_MIN_HIST_PNL",
+        "COPY_MIN_PROFIT_FACTOR",
+        "COPY_MAX_FAST_FLIP_RATIO",
+        "COPY_MIN_HOLD_S",
+        "COPY_IDEAL_GAP_S",
+    ]
+    vals = {k: getattr(cfg, k) for k in keys if hasattr(cfg, k)}
+    vals.update(
+        {
+            "COPY_MIN_FILLS": 3,
+            "COPY_MAX_FILLS": 500,
+            "COPY_MIN_MEDIAN_GAP_S": 45.0,
+            "COPY_MAX_MEDIAN_GAP_S": 86400.0,
+            "COPY_MIN_FILLS_PER_DAY": 0.4,
+            "COPY_MAX_FILLS_PER_DAY": 40.0,
+            "COPY_MIN_WIN_RATE": 0.40,
+            "COPY_MIN_HIST_WIN_RATE": 0.38,
+            "COPY_MIN_RECENT_PNL": -200.0,
+            "COPY_MIN_HIST_PNL": -500.0,
+            "COPY_MIN_PROFIT_FACTOR": 0.95,
+            "COPY_MAX_FAST_FLIP_RATIO": 0.60,
+        }
+    )
+    return SimpleNamespace(**vals)
+
+
 def pick_copy_leaders(
     pool: list[QualifiedWallet],
     qualifier: Qualifier,
@@ -273,60 +313,131 @@ def pick_copy_leaders(
     *,
     logger: logging.Logger | None = None,
 ) -> list[CopyLeader]:
-    """Scan shortlist, fetch fills once per wallet, return top COPY_TOP_N."""
+    """Walk ROI board (skip lottery), fetch fills slowly, return top COPY_TOP_N."""
     log = logger or qualifier.log
     want = max(1, int(getattr(cfg, "COPY_TOP_N", 5) or 5))
-    scan = max(want, int(getattr(cfg, "COPY_CANDIDATE_SCAN", 200) or 200))
+    board_n = max(want, int(getattr(cfg, "COPY_CANDIDATE_SCAN", 1200) or 1200))
+    fetch_max = max(want, int(getattr(cfg, "COPY_FILL_FETCH_MAX", 100) or 100))
+    max_roi = float(getattr(cfg, "COPY_MAX_ROI", 1.50) or 1.50)
+    min_eq = float(getattr(cfg, "COPY_MIN_EQUITY", 3000.0) or 3000.0)
+    sleep_s = float(getattr(cfg, "COPY_FILL_SLEEP_S", 0.9) or 0.9)
     recent_d = float(getattr(cfg, "COPY_LOOKBACK_DAYS", 7.0) or 7.0)
     hist_d = float(getattr(cfg, "COPY_HISTORY_DAYS", 30.0) or 30.0)
-    min_hold = float(getattr(cfg, "COPY_MIN_HOLD_S", 300.0) or 300.0)
+    min_hold = float(getattr(cfg, "COPY_MIN_HOLD_S", 180.0) or 180.0)
     now_ms = int(time.time() * 1000)
     start_hist = now_ms - int(hist_d * 86400_000)
 
-    ranked: list[CopyLeader] = []
-    rejected = 0
-    for i, w in enumerate(pool[:scan]):
+    skipped_roi = 0
+    skipped_eq = 0
+    for w in pool[:board_n]:
+        if max_roi > 0 and w.rank_roi > max_roi:
+            skipped_roi += 1
+        elif min_eq > 0 and w.account_value < min_eq:
+            skipped_eq += 1
+
+    log.info(
+        "Copy scan start: board=%s fetch_cap=%s skip_lottery_roi=%s skip_low_eq=%s "
+        "max_roi=%.0f%% min_eq=$%.0f",
+        min(board_n, len(pool)),
+        fetch_max,
+        skipped_roi,
+        skipped_eq,
+        max_roi * 100.0,
+        min_eq,
+    )
+
+    analyzed: list[tuple[QualifiedWallet, FillStats, FillStats]] = []
+    fetch_fail = 0
+    fetched = 0
+    for w in pool[:board_n]:
+        if fetched >= fetch_max:
+            break
+        if max_roi > 0 and w.rank_roi > max_roi:
+            continue
+        if min_eq > 0 and w.account_value < min_eq:
+            continue
         fills = qualifier._recent_fills(w.address, start_hist)
+        fetched += 1
+        if fetched > 1:
+            time.sleep(sleep_s)
         if fills is None:
-            rejected += 1
+            fetch_fail += 1
             continue
-        if i > 0 and i % 5 == 0:
-            time.sleep(0.2)
-        recent = analyze_fills(fills, now_ms=now_ms, lookback_days=recent_d, min_hold_s=min_hold)
-        history = analyze_fills(fills, now_ms=now_ms, lookback_days=hist_d, min_hold_s=min_hold)
-        ok, why = passes_copy_filters(recent, history, cfg)
-        if not ok:
-            rejected += 1
-            if i < 20:
-                log.info("Copy skip %s roi=%.1f%% — %s", w.address[:10], w.rank_roi * 100, why)
-            continue
-        sc = score_copy_wallet(w, recent, history, cfg)
-        ranked.append(
-            CopyLeader(
-                address=w.address.lower(),
-                score=sc,
-                rank_roi=w.rank_roi,
-                rank_pnl=w.rank_pnl,
-                account_value=w.account_value,
-                recent=recent,
-                history=history,
-                reasons=[
-                    why,
-                    (
-                        f"fills={recent.n_fills} {recent.fills_per_day:.1f}/d "
-                        f"gap={recent.median_gap_s:.0f}s wr={recent.win_rate:.0%} "
-                        f"pf={recent.profit_factor:.2f} pnl=${recent.closed_pnl:.0f} "
-                        f"flip={recent.fast_flip_ratio:.0%}"
-                    ),
-                ],
-            )
+        recent = analyze_fills(
+            fills, now_ms=now_ms, lookback_days=recent_d, min_hold_s=min_hold
         )
-    ranked.sort(key=lambda x: x.score, reverse=True)
+        history = analyze_fills(
+            fills, now_ms=now_ms, lookback_days=hist_d, min_hold_s=min_hold
+        )
+        analyzed.append((w, recent, history))
+
+    def _rank(filter_cfg: Any, label: str) -> list[CopyLeader]:
+        out: list[CopyLeader] = []
+        skip_logs = 0
+        rejected = 0
+        for w, recent, history in analyzed:
+            ok, why = passes_copy_filters(recent, history, filter_cfg)
+            if not ok:
+                rejected += 1
+                if skip_logs < 20:
+                    log.info(
+                        "Copy skip [%s] %s roi=%.1f%% — %s",
+                        label,
+                        w.address[:10],
+                        w.rank_roi * 100,
+                        why,
+                    )
+                    skip_logs += 1
+                continue
+            sc = score_copy_wallet(w, recent, history, cfg)
+            out.append(
+                CopyLeader(
+                    address=w.address.lower(),
+                    score=sc,
+                    rank_roi=w.rank_roi,
+                    rank_pnl=w.rank_pnl,
+                    account_value=w.account_value,
+                    recent=recent,
+                    history=history,
+                    reasons=[
+                        f"{label}:{why}",
+                        (
+                            f"fills={recent.n_fills} {recent.fills_per_day:.1f}/d "
+                            f"gap={recent.median_gap_s:.0f}s wr={recent.win_rate:.0%} "
+                            f"pf={recent.profit_factor:.2f} pnl=${recent.closed_pnl:.0f} "
+                            f"flip={recent.fast_flip_ratio:.0%}"
+                        ),
+                    ],
+                )
+            )
+        out.sort(key=lambda x: x.score, reverse=True)
+        log.info(
+            "Copy %s filter: analyzed=%s rejected=%s passed=%s",
+            label,
+            len(analyzed),
+            rejected,
+            len(out),
+        )
+        return out
+
+    ranked = _rank(cfg, "strict")
+    label = "strict"
+    if len(ranked) < want:
+        log.warning(
+            "Copy strict pass only %s/%s — applying relaxed filters on same fills",
+            len(ranked),
+            want,
+        )
+        ranked = _rank(_relaxed_copy_cfg(cfg), "relaxed")
+        label = "relaxed"
+
     leaders = ranked[:want]
     log.info(
-        "Copy scan: %s candidates, %s rejected, picked %s leaders",
-        min(scan, len(pool)),
-        rejected,
+        "Copy scan done [%s]: fetched=%s fetch_fail=%s analyzed=%s picked=%s",
+        label,
+        fetched,
+        fetch_fail,
+        len(analyzed),
         len(leaders),
     )
     for j, ld in enumerate(leaders, 1):
