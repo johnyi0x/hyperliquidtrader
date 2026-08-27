@@ -1391,6 +1391,14 @@ class PlanTests(unittest.TestCase):
 
 
 class CopyModeTests(unittest.TestCase):
+    def test_copy_max_roi_zero_means_unlimited(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_score import _cfg_float
+
+        cfg = SimpleNamespace(COPY_MAX_ROI=0.0)
+        self.assertEqual(_cfg_float(cfg, "COPY_MAX_ROI", 1.50), 0.0)
+
     def test_copy_filter_rejects_scalper(self) -> None:
         from types import SimpleNamespace
 
@@ -1542,7 +1550,7 @@ class CopyModeTests(unittest.TestCase):
         self.assertEqual(follow[0].coin, reverse[0].coin)
 
     def test_copy_scan_cfg_shortlist(self) -> None:
-        from pmf.qualify import shortlist
+        from pmf.qualify import shortlist, shortlist_copy_profit
         from pmf.types import LeaderboardRow, WindowPerf
 
         base = _Cfg()
@@ -1564,12 +1572,16 @@ class CopyModeTests(unittest.TestCase):
                 f"0x{i:040x}",
                 10_000.0,
                 None,
-                {"week": WindowPerf(1000, 0.1 + i * 0.01, 50_000)},
+                {"week": WindowPerf(1000 + i * 100, 0.1 + i * 0.01, 50_000)},
             )
             for i in range(30)
         ]
         out = shortlist(rows, _ScanCfg())
         self.assertEqual(len(out), scan_n)
+
+        by_pnl = shortlist_copy_profit(rows, base, scan_n=5, min_equity=1000.0)
+        self.assertEqual(len(by_pnl), 5)
+        self.assertGreaterEqual(by_pnl[0].rank_pnl, by_pnl[-1].rank_pnl)
 
         from types import SimpleNamespace
 

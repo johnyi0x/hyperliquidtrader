@@ -171,20 +171,34 @@ def analyze_fills(
     )
 
 
+def _cfg_float(cfg: Any, name: str, default: float) -> float:
+    raw = getattr(cfg, name, default)
+    if raw is None:
+        return float(default)
+    return float(raw)
+
+
+def _cfg_int(cfg: Any, name: str, default: int) -> int:
+    raw = getattr(cfg, name, default)
+    if raw is None:
+        return int(default)
+    return int(raw)
+
+
 def passes_copy_filters(recent: FillStats, history: FillStats, cfg: Any) -> tuple[bool, str]:
     """Minimum floors only for fills/PnL; max_* of 0 means unlimited."""
-    min_f = int(getattr(cfg, "COPY_MIN_FILLS", 10) or 10)
-    max_f = int(getattr(cfg, "COPY_MAX_FILLS", 0) or 0)
-    min_gap = float(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", 90.0) or 90.0)
-    max_gap = float(getattr(cfg, "COPY_MAX_MEDIAN_GAP_S", 0.0) or 0.0)
-    min_fpd = float(getattr(cfg, "COPY_MIN_FILLS_PER_DAY", 8.0) or 8.0)
-    max_fpd = float(getattr(cfg, "COPY_MAX_FILLS_PER_DAY", 0.0) or 0.0)
-    min_wr = float(getattr(cfg, "COPY_MIN_WIN_RATE", 0.40) or 0.40)
-    min_hist_wr = float(getattr(cfg, "COPY_MIN_HIST_WIN_RATE", 0.38) or 0.38)
-    min_pnl = float(getattr(cfg, "COPY_MIN_RECENT_PNL", 0.0) or 0.0)
-    min_hist_pnl = float(getattr(cfg, "COPY_MIN_HIST_PNL", 0.0) or 0.0)
-    min_pf = float(getattr(cfg, "COPY_MIN_PROFIT_FACTOR", 1.0) or 1.0)
-    max_flip = float(getattr(cfg, "COPY_MAX_FAST_FLIP_RATIO", 0.0) or 0.0)
+    min_f = _cfg_int(cfg, "COPY_MIN_FILLS", 10)
+    max_f = _cfg_int(cfg, "COPY_MAX_FILLS", 0)
+    min_gap = _cfg_float(cfg, "COPY_MIN_MEDIAN_GAP_S", 90.0)
+    max_gap = _cfg_float(cfg, "COPY_MAX_MEDIAN_GAP_S", 0.0)
+    min_fpd = _cfg_float(cfg, "COPY_MIN_FILLS_PER_DAY", 6.0)
+    max_fpd = _cfg_float(cfg, "COPY_MAX_FILLS_PER_DAY", 0.0)
+    min_wr = _cfg_float(cfg, "COPY_MIN_WIN_RATE", 0.40)
+    min_hist_wr = _cfg_float(cfg, "COPY_MIN_HIST_WIN_RATE", 0.38)
+    min_pnl = _cfg_float(cfg, "COPY_MIN_RECENT_PNL", 0.0)
+    min_hist_pnl = _cfg_float(cfg, "COPY_MIN_HIST_PNL", 0.0)
+    min_pf = _cfg_float(cfg, "COPY_MIN_PROFIT_FACTOR", 1.0)
+    max_flip = _cfg_float(cfg, "COPY_MAX_FAST_FLIP_RATIO", 0.0)
 
     if recent.n_fills < min_f:
         return False, f"too_few_fills={recent.n_fills}"
@@ -228,19 +242,22 @@ def score_copy_wallet(
     trips_per_day = recent.round_trips / lookback_d if recent.round_trips > 0 else recent.fills_per_day / 2.0
     ideal_tpd = max(1.0, ideal_tph * 24.0)
 
-    # Realized profit is the main signal (not board lottery ROI).
-    recent_pnl = math.log10(max(recent.closed_pnl, 1.0) + 10.0) * 22.0
-    hist_pnl = math.log10(max(history.closed_pnl, 1.0) + 10.0) * 14.0
+    # Realized + board dollar PnL are the main signal (not lottery ROI %).
+    recent_pnl = math.log10(max(recent.closed_pnl, 1.0) + 10.0) * 28.0
+    hist_pnl = math.log10(max(history.closed_pnl, 1.0) + 10.0) * 18.0
+    board_pnl = math.log10(max(wallet.rank_pnl, 1.0) + 10.0) * 16.0
     if recent.closed_pnl < 0:
         recent_pnl -= 40.0
     if history.closed_pnl < 0:
         hist_pnl -= 30.0
+    if wallet.rank_pnl < 0:
+        board_pnl -= 25.0
 
-    wr = recent.win_rate * 45.0 + history.win_rate * 25.0
-    pf = min(recent.profit_factor, 4.0) * 12.0 + min(history.profit_factor, 4.0) * 6.0
+    wr = recent.win_rate * 35.0 + history.win_rate * 20.0
+    pf = min(recent.profit_factor, 4.0) * 10.0 + min(history.profit_factor, 4.0) * 5.0
 
-    # Soft ROI tilt only.
-    roi = max(min(wallet.rank_roi, 3.0), -0.2) * 100.0 * 0.08
+    # Soft ROI tilt only (never a hard gate when COPY_MAX_ROI=0).
+    roi = max(min(wallet.rank_roi, 3.0), -0.2) * 100.0 * 0.04
 
     # Activity: prefer ~3 complete trades/hour (gap ~10m fills / ~20m RTs).
     ideal_gap = float(getattr(cfg, "COPY_IDEAL_GAP_S", 600.0) or 600.0)
@@ -273,7 +290,7 @@ def score_copy_wallet(
         else:
             freshness = -10.0
 
-    return wr + pf + recent_pnl + hist_pnl + roi + activity + freshness - bait_pen
+    return wr + pf + recent_pnl + hist_pnl + board_pnl + roi + activity + freshness - bait_pen
 
 
 def _relaxed_copy_cfg(cfg: Any) -> Any:
@@ -325,49 +342,56 @@ def pick_copy_leaders(
     *,
     logger: logging.Logger | None = None,
 ) -> list[CopyLeader]:
-    """Walk ROI board (skip lottery), fetch fills slowly, return top COPY_TOP_N."""
+    """Fetch highest board-PnL wallets first; apply min filters; return top COPY_TOP_N.
+
+    COPY_MAX_ROI / COPY_MAX_* of 0 means unlimited (do not use `or default` — 0 is valid).
+    """
     log = logger or qualifier.log
-    want = max(1, int(getattr(cfg, "COPY_TOP_N", 5) or 5))
-    board_n = max(want, int(getattr(cfg, "COPY_CANDIDATE_SCAN", 1200) or 1200))
-    fetch_max = max(want, int(getattr(cfg, "COPY_FILL_FETCH_MAX", 100) or 100))
-    max_roi = float(getattr(cfg, "COPY_MAX_ROI", 1.50) or 1.50)
-    min_eq = float(getattr(cfg, "COPY_MIN_EQUITY", 3000.0) or 3000.0)
-    sleep_s = float(getattr(cfg, "COPY_FILL_SLEEP_S", 0.9) or 0.9)
-    recent_d = float(getattr(cfg, "COPY_LOOKBACK_DAYS", 7.0) or 7.0)
-    hist_d = float(getattr(cfg, "COPY_HISTORY_DAYS", 30.0) or 30.0)
-    min_hold = float(getattr(cfg, "COPY_MIN_HOLD_S", 180.0) or 180.0)
+    want = max(1, _cfg_int(cfg, "COPY_TOP_N", 2))
+    board_n = max(want, _cfg_int(cfg, "COPY_CANDIDATE_SCAN", 1200))
+    fetch_max = max(want, _cfg_int(cfg, "COPY_FILL_FETCH_MAX", 100))
+    max_roi = _cfg_float(cfg, "COPY_MAX_ROI", 0.0)
+    min_eq = _cfg_float(cfg, "COPY_MIN_EQUITY", 1000.0)
+    sleep_s = _cfg_float(cfg, "COPY_FILL_SLEEP_S", 0.7)
+    recent_d = _cfg_float(cfg, "COPY_LOOKBACK_DAYS", 7.0)
+    hist_d = _cfg_float(cfg, "COPY_HISTORY_DAYS", 30.0)
+    min_hold = _cfg_float(cfg, "COPY_MIN_HOLD_S", 90.0)
     now_ms = int(time.time() * 1000)
     start_hist = now_ms - int(hist_d * 86400_000)
 
+    # Prefer absolute window PnL (most profit), not lottery ROI %.
+    board = list(pool[:board_n])
     skipped_roi = 0
     skipped_eq = 0
-    for w in pool[:board_n]:
+    eligible: list[QualifiedWallet] = []
+    for w in board:
         if max_roi > 0 and w.rank_roi > max_roi:
             skipped_roi += 1
-        elif min_eq > 0 and w.account_value < min_eq:
+            continue
+        if min_eq > 0 and w.account_value < min_eq:
             skipped_eq += 1
+            continue
+        eligible.append(w)
+    eligible.sort(key=lambda w: w.rank_pnl, reverse=True)
 
     log.info(
-        "Copy scan start: board=%s fetch_cap=%s skip_lottery_roi=%s skip_low_eq=%s "
-        "max_roi=%.0f%% min_eq=$%.0f",
+        "Copy scan start: board=%s eligible=%s fetch_cap=%s skip_roi_cap=%s skip_low_eq=%s "
+        "max_roi=%s min_eq=$%.0f order=pnl",
         min(board_n, len(pool)),
+        len(eligible),
         fetch_max,
         skipped_roi,
         skipped_eq,
-        max_roi * 100.0,
+        "off" if max_roi <= 0 else f"{max_roi * 100.0:.0f}%",
         min_eq,
     )
 
     analyzed: list[tuple[QualifiedWallet, FillStats, FillStats]] = []
     fetch_fail = 0
     fetched = 0
-    for w in pool[:board_n]:
+    for w in eligible:
         if fetched >= fetch_max:
             break
-        if max_roi > 0 and w.rank_roi > max_roi:
-            continue
-        if min_eq > 0 and w.account_value < min_eq:
-            continue
         fills = qualifier._recent_fills(w.address, start_hist)
         fetched += 1
         if fetched > 1:

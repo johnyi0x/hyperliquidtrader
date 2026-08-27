@@ -25,7 +25,7 @@ from .copy_score import (
 from .leaderboard import load_leaderboard
 from .markets import MarketCache
 from .price_engine import PriceEngine
-from .qualify import Qualifier, holder_filter_on, shortlist
+from .qualify import Qualifier, holder_filter_on, shortlist, shortlist_copy_profit
 from .rebalancer import PaperBook, Rebalancer
 from .research import ResearchWriter, compact_research_votes
 from .snapshots import SnapshotClient, list_dex_query_names
@@ -81,7 +81,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v6",
+            "copy-v7",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_REQUIRE_FULL_WATCHLIST", "")),
             str(getattr(cfg, "COPY_MAX_ROI", "")),
@@ -278,18 +278,11 @@ class ProfitMetaRunner:
             self.log,
         )
         scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 2000) or 2000)
-        base_cfg = self.cfg
-
-        class _ScanCfg:
-            def __getattr__(self, name: str) -> Any:
-                if name == "CANDIDATE_POOL":
-                    return scan_n
-                if name == "RESEARCH_DATA_ENABLED":
-                    return False
-                return getattr(base_cfg, name)
-
-        pool = shortlist(rows, _ScanCfg())
-        self.log.info("Copy shortlist %s/%s leaderboard rows", len(pool), len(rows))
+        min_eq = float(getattr(self.cfg, "COPY_MIN_EQUITY", 1000.0) or 0.0)
+        pool = shortlist_copy_profit(
+            rows, self.cfg, scan_n=scan_n, min_equity=min_eq
+        )
+        self.log.info("Copy shortlist %s/%s by window PnL (min_eq=$%.0f)", len(pool), len(rows), min_eq)
         if not pool:
             self.log.error("No wallets on copy shortlist")
             self.store.data["copy_scan_failed_at"] = time.time()
@@ -353,11 +346,15 @@ class ProfitMetaRunner:
             self.log.warning("Copy mode — no leaders loaded yet")
             return
         if not self._copy_watchlist_full(leaders):
-            self.log.info(
-                "Copy waiting for full watchlist %s/%s — no trades yet",
-                len(leaders),
-                want,
-            )
+            last_wait = float(self.store.data.get("copy_wait_log_at") or 0)
+            if time.time() - last_wait >= 120.0:
+                self.log.info(
+                    "Copy waiting for full watchlist %s/%s — no trades yet",
+                    len(leaders),
+                    want,
+                )
+                self.store.data["copy_wait_log_at"] = time.time()
+                self.store.save()
             self.store.heartbeat(
                 {"mode": "copy", "ready": False, "leaders": len(leaders), "want": want}
             )
@@ -1157,12 +1154,12 @@ class ProfitMetaRunner:
                     "reverse" if self._copy_reverse() else "follow",
                     getattr(self.cfg, "PMF_PROFILE", "local"),
                     bool(self.cfg.PAPER_TRADING),
-                    int(getattr(self.cfg, "COPY_TOP_N", 5) or 5),
+                    int(getattr(self.cfg, "COPY_TOP_N", 2) or 2),
                     int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 200) or 200),
-                    float(getattr(self.cfg, "COPY_MIN_MEDIAN_GAP_S", 300)),
-                    float(getattr(self.cfg, "COPY_MAX_MEDIAN_GAP_S", 43200)),
-                    float(getattr(self.cfg, "COPY_MIN_WIN_RATE", 0.52)) * 100,
-                    float(getattr(self.cfg, "COPY_REFRESH_HOURS", 4)),
+                    float(getattr(self.cfg, "COPY_MIN_MEDIAN_GAP_S", 90) or 0),
+                    float(getattr(self.cfg, "COPY_MAX_MEDIAN_GAP_S", 0) or 0),
+                    float(getattr(self.cfg, "COPY_MIN_WIN_RATE", 0.40) or 0) * 100,
+                    float(getattr(self.cfg, "COPY_REFRESH_HOURS", 4) or 4),
                     self.cfg.DEX_SCOPE,
                 )
             else:
