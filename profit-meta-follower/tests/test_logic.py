@@ -1412,7 +1412,36 @@ class CopyModeTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("scalpy", why)
 
-    def test_copy_targets_from_leaders(self) -> None:
+    def test_copy_scan_cfg_shortlist(self) -> None:
+        from pmf.qualify import shortlist
+        from pmf.types import LeaderboardRow, WindowPerf
+
+        base = _Cfg()
+        base.CANDIDATE_POOL = 10
+        base.RANK_WINDOW = "week"
+        base.BASKET_FILTER_MODE = "off"
+        scan_n = 25
+
+        class _ScanCfg:
+            def __getattr__(self, name: str):
+                if name == "CANDIDATE_POOL":
+                    return scan_n
+                if name == "RESEARCH_DATA_ENABLED":
+                    return False
+                return getattr(base, name)
+
+        rows = [
+            LeaderboardRow(
+                f"0x{i:040x}",
+                10_000.0,
+                None,
+                {"week": WindowPerf(1000, 0.1 + i * 0.01, 50_000)},
+            )
+            for i in range(30)
+        ]
+        out = shortlist(rows, _ScanCfg())
+        self.assertEqual(len(out), scan_n)
+
         from types import SimpleNamespace
 
         from pmf.copy_exec import copy_targets_from_leaders

@@ -235,6 +235,7 @@ class ProfitMetaRunner:
             self.log,
         )
         scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 120) or 120)
+        base_cfg = self.cfg
 
         class _ScanCfg:
             def __getattr__(self, name: str) -> Any:
@@ -242,7 +243,7 @@ class ProfitMetaRunner:
                     return scan_n
                 if name == "RESEARCH_DATA_ENABLED":
                     return False
-                return getattr(self.cfg, name)
+                return getattr(base_cfg, name)
 
         pool = shortlist(rows, _ScanCfg())
         self.log.info("Copy shortlist %s/%s leaderboard rows", len(pool), len(rows))
