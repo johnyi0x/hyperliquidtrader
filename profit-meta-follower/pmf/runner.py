@@ -81,13 +81,15 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v1",
+            "copy-v2",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_CANDIDATE_SCAN", "")),
             str(getattr(cfg, "RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
             str(getattr(cfg, "COPY_MAX_MEDIAN_GAP_S", "")),
             str(getattr(cfg, "COPY_MIN_WIN_RATE", "")),
+            str(getattr(cfg, "COPY_MIN_FILLS_PER_DAY", "")),
+            str(getattr(cfg, "COPY_MIN_PROFIT_FACTOR", "")),
         ]
     )
 
@@ -328,8 +330,15 @@ class ProfitMetaRunner:
             self._persist_tracker()
             return
 
-        last_reb = float(self.store.data.get("last_rebalance_at") or 0)
-        result = self.rebalancer.run(targets, managed, last_reb, now)
+        # Copy mode uses its own short cooldown (crowd cloud_tuned cooldown is unrelated).
+        saved_cd = getattr(self.cfg, "REBALANCE_COOLDOWN_S", 180.0)
+        copy_cd = float(getattr(self.cfg, "COPY_REBALANCE_COOLDOWN_S", 45.0) or 45.0)
+        try:
+            setattr(self.cfg, "REBALANCE_COOLDOWN_S", copy_cd)
+            last_reb = float(self.store.data.get("last_rebalance_at") or 0)
+            result = self.rebalancer.run(targets, managed, last_reb, now)
+        finally:
+            setattr(self.cfg, "REBALANCE_COOLDOWN_S", saved_cd)
         if not isinstance(result, tuple) or len(result) != 2:
             self.log.error("rebalancer.run returned %r — skipping this tick", result)
             new_managed, attempted = managed, False

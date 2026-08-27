@@ -1397,20 +1397,70 @@ class CopyModeTests(unittest.TestCase):
         from pmf.copy_score import FillStats, passes_copy_filters
 
         cfg = SimpleNamespace(
-            COPY_MIN_FILLS=4,
-            COPY_MAX_FILLS=35,
-            COPY_MIN_MEDIAN_GAP_S=900.0,
-            COPY_MAX_MEDIAN_GAP_S=28800.0,
-            COPY_MIN_WIN_RATE=0.48,
-            COPY_MIN_HIST_WIN_RATE=0.42,
-            COPY_MIN_RECENT_PNL=0.0,
-            COPY_MIN_HIST_PNL=-50.0,
+            COPY_MIN_FILLS=6,
+            COPY_MAX_FILLS=180,
+            COPY_MIN_MEDIAN_GAP_S=120.0,
+            COPY_MAX_MEDIAN_GAP_S=43200.0,
+            COPY_MIN_FILLS_PER_DAY=1.5,
+            COPY_MAX_FILLS_PER_DAY=40.0,
+            COPY_MIN_WIN_RATE=0.52,
+            COPY_MIN_HIST_WIN_RATE=0.48,
+            COPY_MIN_RECENT_PNL=50.0,
+            COPY_MIN_HIST_PNL=100.0,
+            COPY_MIN_PROFIT_FACTOR=1.15,
         )
-        recent = FillStats(n_fills=20, median_gap_s=120.0, win_rate=0.6, closed_pnl=100.0)
-        hist = FillStats(n_fills=40, median_gap_s=300.0, win_rate=0.55, closed_pnl=200.0)
+        recent = FillStats(n_fills=20, median_gap_s=30.0, fills_per_day=10.0, win_rate=0.6, closed_pnl=100.0)
+        hist = FillStats(n_fills=40, median_gap_s=60.0, fills_per_day=8.0, win_rate=0.55, closed_pnl=200.0)
         ok, why = passes_copy_filters(recent, hist, cfg)
         self.assertFalse(ok)
         self.assertIn("scalpy", why)
+
+    def test_copy_filter_accepts_active_consistent(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_score import FillStats, passes_copy_filters, score_copy_wallet
+        from pmf.types import QualifiedWallet
+
+        cfg = SimpleNamespace(
+            COPY_MIN_FILLS=6,
+            COPY_MAX_FILLS=180,
+            COPY_MIN_MEDIAN_GAP_S=120.0,
+            COPY_MAX_MEDIAN_GAP_S=43200.0,
+            COPY_MIN_FILLS_PER_DAY=1.5,
+            COPY_MAX_FILLS_PER_DAY=40.0,
+            COPY_MIN_WIN_RATE=0.52,
+            COPY_MIN_HIST_WIN_RATE=0.48,
+            COPY_MIN_RECENT_PNL=50.0,
+            COPY_MIN_HIST_PNL=100.0,
+            COPY_MIN_PROFIT_FACTOR=1.15,
+            COPY_IDEAL_GAP_S=1800.0,
+        )
+        recent = FillStats(
+            n_fills=40,
+            median_gap_s=1500.0,
+            fills_per_day=6.0,
+            win_rate=0.60,
+            closed_pnl=800.0,
+            wins=18,
+            losses=12,
+            gross_win=2000.0,
+            gross_loss=1200.0,
+        )
+        hist = FillStats(
+            n_fills=100,
+            median_gap_s=1600.0,
+            fills_per_day=4.0,
+            win_rate=0.55,
+            closed_pnl=2500.0,
+            wins=40,
+            losses=30,
+            gross_win=5000.0,
+            gross_loss=2500.0,
+        )
+        ok, why = passes_copy_filters(recent, hist, cfg)
+        self.assertTrue(ok, why)
+        w = QualifiedWallet("0xabc", 10_000, 1000, 0.2, 0, 0, 0)
+        self.assertGreater(score_copy_wallet(w, recent, hist, cfg), 50.0)
 
     def test_copy_scan_cfg_shortlist(self) -> None:
         from pmf.qualify import shortlist
