@@ -81,14 +81,13 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v4",
+            "copy-v5",
             str(getattr(cfg, "COPY_TOP_N", "")),
+            str(getattr(cfg, "COPY_REQUIRE_FULL_WATCHLIST", "")),
             str(getattr(cfg, "COPY_CANDIDATE_SCAN", "")),
             str(getattr(cfg, "COPY_MAX_ROI", "")),
-            str(getattr(cfg, "RANK_WINDOW", "")),
-            str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
             str(getattr(cfg, "COPY_MAX_FILLS", "")),
-            str(getattr(cfg, "COPY_MIN_WIN_RATE", "")),
+            str(getattr(cfg, "COPY_IDEAL_TRADES_PER_HOUR", "")),
             str(getattr(cfg, "RUN_MODE", "copy")),
         ]
     )
@@ -222,33 +221,59 @@ class ProfitMetaRunner:
     def _copy_leaders(self) -> list:
         return leaders_from_state(self.store.data.get("copy_leaders") or [])
 
+    def _copy_watchlist_full(self, leaders: list | None = None) -> bool:
+        want = max(1, int(getattr(self.cfg, "COPY_TOP_N", 5) or 5))
+        cur = leaders if leaders is not None else self._copy_leaders()
+        if not bool(getattr(self.cfg, "COPY_REQUIRE_FULL_WATCHLIST", True)):
+            return len(cur) >= 1
+        ready_flag = self.store.data.get("copy_ready")
+        if ready_flag is False:
+            return False
+        return len(cur) >= want
+
     def refresh_copy_leaders_if_needed(self) -> None:
         existing = self._copy_leaders()
+        want = max(1, int(getattr(self.cfg, "COPY_TOP_N", 5) or 5))
+        require_full = bool(getattr(self.cfg, "COPY_REQUIRE_FULL_WATCHLIST", True))
         refresh_h = float(getattr(self.cfg, "COPY_REFRESH_HOURS", 12.0) or 12.0)
-        if existing and self._copy_age_h() < refresh_h:
+        retry_min = float(getattr(self.cfg, "COPY_INCOMPLETE_RETRY_MIN", 10.0) or 10.0)
+        full = self._copy_watchlist_full(existing)
+
+        if existing and full and self._copy_age_h() < refresh_h:
             self.log.info(
-                "Using saved copy leaders (%s wallets, %.1fh old)",
+                "Using saved copy leaders (%s/%s wallets, %.1fh old)",
                 len(existing),
+                want,
                 self._copy_age_h(),
             )
             self.tracker.set_basket(leaders_to_basket(existing))
             return
 
         failed_at = float(self.store.data.get("copy_scan_failed_at") or 0)
-        if not existing and failed_at > 0 and (time.time() - failed_at) < 1800.0:
+        backoff_s = retry_min * 60.0 if not full else 1800.0
+        if failed_at > 0 and (time.time() - failed_at) < backoff_s and not full:
             self.log.warning(
-                "Copy scan backoff — last fail %.0f min ago; retry later",
+                "Copy scan backoff — last incomplete/fail %.0f min ago (have %s/%s)",
                 (time.time() - failed_at) / 60.0,
+                len(existing),
+                want,
             )
+            if existing:
+                self.tracker.set_basket(leaders_to_basket(existing))
             return
 
-        self.log.info("Refreshing copy-trade leaders from leaderboard")
+        self.log.info(
+            "Refreshing copy-trade leaders (need full=%s want=%s have=%s)",
+            require_full,
+            want,
+            len(existing),
+        )
         rows = load_leaderboard(
             self.data_dir / "leaderboard_cache.json",
             float(self.cfg.LEADERBOARD_CACHE_HOURS),
             self.log,
         )
-        scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 1200) or 1200)
+        scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 2000) or 2000)
         base_cfg = self.cfg
 
         class _ScanCfg:
@@ -264,28 +289,42 @@ class ProfitMetaRunner:
         if not pool:
             self.log.error("No wallets on copy shortlist")
             self.store.data["copy_scan_failed_at"] = time.time()
+            self.store.data["copy_ready"] = False
             self.store.save()
             return
         qualifier = Qualifier(self.client.info, self.log, self.cfg)
         leaders = pick_copy_leaders(pool, qualifier, self.cfg, logger=self.log)
         if not leaders:
-            if existing:
+            if existing and full:
                 self.log.warning(
-                    "Copy scan found 0 leaders — keeping previous %s leaders",
+                    "Copy scan found 0 — keeping previous full list (%s)",
                     len(existing),
                 )
                 self.tracker.set_basket(leaders_to_basket(existing))
                 return
-            self.log.error(
-                "Copy scan found 0 leaders — backoff 30m then retry"
-            )
+            self.log.error("Copy scan found 0 leaders — backoff then retry")
             self.store.data["copy_scan_failed_at"] = time.time()
+            self.store.data["copy_ready"] = False
             self.store.save()
             return
+
+        ready = (not require_full) or (len(leaders) >= want)
         self.store.data["copy_leaders"] = leaders_to_state(leaders)
-        self.store.data["copy_built_at"] = time.time()
         self.store.data["copy_rank"] = _copy_sig(self.cfg)
-        self.store.data["copy_scan_failed_at"] = 0
+        self.store.data["copy_ready"] = ready
+        if ready:
+            self.store.data["copy_built_at"] = time.time()
+            self.store.data["copy_scan_failed_at"] = 0
+            self.log.info("Copy watchlist READY %s/%s — trading enabled", len(leaders), want)
+        else:
+            self.store.data["copy_built_at"] = 0
+            self.store.data["copy_scan_failed_at"] = time.time()
+            self.log.warning(
+                "Copy watchlist INCOMPLETE %s/%s — NOT trading until full; retry in %.0fm",
+                len(leaders),
+                want,
+                retry_min,
+            )
         self.store.save()
         self.tracker.set_basket(leaders_to_basket(leaders))
         self.telemetry.record_event(
@@ -293,6 +332,8 @@ class ProfitMetaRunner:
             kind="copy_leaders_refresh",
             payload={
                 "count": len(leaders),
+                "want": want,
+                "ready": ready,
                 "leaders": [ld.address[:10] for ld in leaders],
             },
         )
@@ -303,8 +344,20 @@ class ProfitMetaRunner:
         n = self.tracker.poll_some(now)
         snaps = self.tracker.live_snapshots()
         leaders = self._copy_leaders()
+        want = max(1, int(getattr(self.cfg, "COPY_TOP_N", 5) or 5))
         if not leaders:
             self.log.warning("Copy mode — no leaders loaded yet")
+            return
+        if not self._copy_watchlist_full(leaders):
+            self.log.info(
+                "Copy waiting for full watchlist %s/%s — no trades yet",
+                len(leaders),
+                want,
+            )
+            self.store.heartbeat(
+                {"mode": "copy", "ready": False, "leaders": len(leaders), "want": want}
+            )
+            self._persist_tracker()
             return
 
         try:

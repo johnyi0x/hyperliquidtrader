@@ -220,48 +220,54 @@ def score_copy_wallet(
     history: FillStats,
     cfg: Any,
 ) -> float:
-    """Higher = better copy candidate. Biased to consistent profit, not bait flips."""
-    # Consistency: win rates + profit factor (primary).
-    wr = recent.win_rate * 60.0 + history.win_rate * 35.0
-    pf = min(recent.profit_factor, 4.0) * 14.0 + min(history.profit_factor, 4.0) * 8.0
+    """Higher = better. Prioritize realized profit + ~3 trades/hour activity."""
+    lookback_d = max(0.25, float(getattr(cfg, "COPY_LOOKBACK_DAYS", 7.0) or 7.0))
+    ideal_tph = float(getattr(cfg, "COPY_IDEAL_TRADES_PER_HOUR", 3.0) or 3.0)
+    # Round-trips/day from tape; ideal ≈ 3/hour = 72/day.
+    trips_per_day = recent.round_trips / lookback_d if recent.round_trips > 0 else recent.fills_per_day / 2.0
+    ideal_tpd = max(1.0, ideal_tph * 24.0)
 
-    # Realized profit quality — stronger weight than board ROI.
-    recent_pnl = math.log10(max(recent.closed_pnl, 1.0) + 10.0) * 14.0
-    hist_pnl = math.log10(max(history.closed_pnl, 1.0) + 10.0) * 9.0
+    # Realized profit is the main signal (not board lottery ROI).
+    recent_pnl = math.log10(max(recent.closed_pnl, 1.0) + 10.0) * 22.0
+    hist_pnl = math.log10(max(history.closed_pnl, 1.0) + 10.0) * 14.0
     if recent.closed_pnl < 0:
-        recent_pnl -= 30.0
+        recent_pnl -= 40.0
     if history.closed_pnl < 0:
-        hist_pnl -= 25.0
+        hist_pnl -= 30.0
 
-    # Soft ROI tilt (leaderboard) — secondary.
-    roi = max(wallet.rank_roi, -0.2) * 100.0 * 0.15
+    wr = recent.win_rate * 45.0 + history.win_rate * 25.0
+    pf = min(recent.profit_factor, 4.0) * 12.0 + min(history.profit_factor, 4.0) * 6.0
 
-    # Prefer ~45m median gap / ~2–10 fills/day (copyable, not extract-flip).
-    ideal_gap = float(getattr(cfg, "COPY_IDEAL_GAP_S", 2700.0) or 2700.0)
+    # Soft ROI tilt only.
+    roi = max(min(wallet.rank_roi, 3.0), -0.2) * 100.0 * 0.08
+
+    # Activity: prefer ~3 complete trades/hour (gap ~10m fills / ~20m RTs).
+    ideal_gap = float(getattr(cfg, "COPY_IDEAL_GAP_S", 600.0) or 600.0)
     gap_pen = abs(math.log(max(recent.median_gap_s, 30.0) / max(ideal_gap, 30.0)))
-    activity = max(0.0, 16.0 - gap_pen * 5.0)
+    activity = max(0.0, 20.0 - gap_pen * 6.0)
+    tpd_pen = abs(math.log(max(trips_per_day, 0.1) / ideal_tpd))
+    activity += max(0.0, 18.0 - tpd_pen * 8.0)
     fpd = recent.fills_per_day
-    if 2.0 <= fpd <= 10.0:
-        activity += 10.0
-    elif 1.5 <= fpd < 2.0 or 10.0 < fpd <= 15.0:
-        activity += 3.0
+    if 20.0 <= fpd <= 120.0:
+        activity += 8.0
+    elif 12.0 <= fpd < 20.0 or 120.0 < fpd <= 160.0:
+        activity += 2.0
     else:
-        activity -= 6.0
+        activity -= 8.0
 
-    # Penalize bait / extract-flip tape.
-    bait_pen = recent.fast_flip_ratio * 35.0
+    bait_pen = recent.fast_flip_ratio * 40.0
 
     freshness = 0.0
     if recent.last_fill_ms > 0:
         age_h = max(0.0, (time.time() * 1000 - recent.last_fill_ms) / 3_600_000)
-        if age_h <= 6:
-            freshness = 8.0
-        elif age_h <= 24:
-            freshness = 4.0
-        elif age_h <= 48:
-            freshness = 1.0
+        if age_h <= 3:
+            freshness = 12.0
+        elif age_h <= 12:
+            freshness = 6.0
+        elif age_h <= 36:
+            freshness = 2.0
         else:
-            freshness = -8.0
+            freshness = -10.0
 
     return wr + pf + recent_pnl + hist_pnl + roi + activity + freshness - bait_pen
 
@@ -285,22 +291,24 @@ def _relaxed_copy_cfg(cfg: Any) -> Any:
         "COPY_MAX_FAST_FLIP_RATIO",
         "COPY_MIN_HOLD_S",
         "COPY_IDEAL_GAP_S",
+        "COPY_IDEAL_TRADES_PER_HOUR",
+        "COPY_LOOKBACK_DAYS",
     ]
     vals = {k: getattr(cfg, k) for k in keys if hasattr(cfg, k)}
     vals.update(
         {
-            "COPY_MIN_FILLS": 3,
-            "COPY_MAX_FILLS": 500,
-            "COPY_MIN_MEDIAN_GAP_S": 45.0,
-            "COPY_MAX_MEDIAN_GAP_S": 86400.0,
-            "COPY_MIN_FILLS_PER_DAY": 0.4,
-            "COPY_MAX_FILLS_PER_DAY": 40.0,
+            "COPY_MIN_FILLS": 4,
+            "COPY_MAX_FILLS": 2000,
+            "COPY_MIN_MEDIAN_GAP_S": 30.0,
+            "COPY_MAX_MEDIAN_GAP_S": 43200.0,
+            "COPY_MIN_FILLS_PER_DAY": 4.0,
+            "COPY_MAX_FILLS_PER_DAY": 250.0,
             "COPY_MIN_WIN_RATE": 0.40,
             "COPY_MIN_HIST_WIN_RATE": 0.38,
-            "COPY_MIN_RECENT_PNL": -200.0,
-            "COPY_MIN_HIST_PNL": -500.0,
+            "COPY_MIN_RECENT_PNL": 0.0,
+            "COPY_MIN_HIST_PNL": 0.0,
             "COPY_MIN_PROFIT_FACTOR": 0.95,
-            "COPY_MAX_FAST_FLIP_RATIO": 0.60,
+            "COPY_MAX_FAST_FLIP_RATIO": 0.65,
         }
     )
     return SimpleNamespace(**vals)
