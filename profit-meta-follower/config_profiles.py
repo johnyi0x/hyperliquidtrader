@@ -19,29 +19,31 @@ RESEARCH_GATHER_SIZE = 200
 # Wallets live cloud polls and backtest uses for votes / agreement %.
 TRADE_BASKET_SIZE = 50
 
-# Copy-mode knobs (RUN_MODE=copy). Crowd mode ignores these.
-# Prefer active but not sub-minute scalpers; rescore leaders often.
-COPY_TOP_N = 3
+# Copy-mode knobs (RUN_MODE=copy | copy_reverse). Crowd mode ignores these.
+# 5 leaders on watch; favor consistent profit; reject bait/flip scalpers.
+COPY_TOP_N = 5
 COPY_CANDIDATE_SCAN = 200
 COPY_REFRESH_HOURS = 4.0
 COPY_RESELECT_HOURS = 4.0
 COPY_LOOKBACK_DAYS = 7.0
 COPY_HISTORY_DAYS = 30.0
-# Activity band: only reject ultra-scalp (<2m) and near-dead (>12h).
-COPY_MIN_MEDIAN_GAP_S = 120.0
+# Activity band: reject sub-5m tape and near-dead; ideal ~45m holds.
+COPY_MIN_MEDIAN_GAP_S = 300.0
 COPY_MAX_MEDIAN_GAP_S = 43200.0
 COPY_MIN_FILLS = 6
-COPY_MAX_FILLS = 180
+COPY_MAX_FILLS = 120
 COPY_MIN_FILLS_PER_DAY = 1.5
-COPY_MAX_FILLS_PER_DAY = 40.0
+COPY_MAX_FILLS_PER_DAY = 18.0
 COPY_MIN_WIN_RATE = 0.52
 COPY_MIN_HIST_WIN_RATE = 0.48
-COPY_MIN_RECENT_PNL = 50.0
-COPY_MIN_HIST_PNL = 100.0
-COPY_MIN_PROFIT_FACTOR = 1.15
-COPY_MAX_POSITIONS = 4
+COPY_MIN_RECENT_PNL = 100.0
+COPY_MIN_HIST_PNL = 200.0
+COPY_MIN_PROFIT_FACTOR = 1.25
+COPY_MAX_FAST_FLIP_RATIO = 0.35
+COPY_MIN_HOLD_S = 300.0
+COPY_MAX_POSITIONS = 5
 COPY_MIN_FRESH_LEADERS_PCT = 0.34
-COPY_IDEAL_GAP_S = 1800.0
+COPY_IDEAL_GAP_S = 2700.0
 COPY_REBALANCE_COOLDOWN_S = 45.0
 
 # Live trading — cloud only. Leave alone while Railway is live.
@@ -109,6 +111,8 @@ _TRADE: dict = {
     "COPY_MIN_RECENT_PNL": COPY_MIN_RECENT_PNL,
     "COPY_MIN_HIST_PNL": COPY_MIN_HIST_PNL,
     "COPY_MIN_PROFIT_FACTOR": COPY_MIN_PROFIT_FACTOR,
+    "COPY_MAX_FAST_FLIP_RATIO": COPY_MAX_FAST_FLIP_RATIO,
+    "COPY_MIN_HOLD_S": COPY_MIN_HOLD_S,
     "COPY_MAX_POSITIONS": COPY_MAX_POSITIONS,
     "COPY_MIN_FRESH_LEADERS_PCT": COPY_MIN_FRESH_LEADERS_PCT,
     "COPY_IDEAL_GAP_S": COPY_IDEAL_GAP_S,

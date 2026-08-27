@@ -31,8 +31,12 @@ def copy_targets_from_leaders(
     cfg: Any,
     *,
     now: float,
+    reverse: bool = False,
 ) -> list[TargetPos]:
-    """Aggregate leader positions; resolve conflicts by weighted score."""
+    """Aggregate leader positions; resolve conflicts by weighted score.
+
+    reverse=True → opposite side of each mirrored position (copy_reverse mode).
+    """
     if not leaders:
         return []
     stale_s = float(getattr(cfg, "STALE_SNAPSHOT_S", 480.0) or 480.0)
@@ -69,7 +73,10 @@ def copy_targets_from_leaders(
             if margin <= 0:
                 continue
             lev = float(max(1, int(pos.leverage or 1)))
-            if pos.side == "long":
+            side = pos.side
+            if reverse:
+                side = "short" if side == "long" else "long"
+            if side == "long":
                 long_w[coin] += weight
                 long_margin[coin] += margin * weight
                 long_lev[coin].append(lev)
@@ -111,7 +118,7 @@ def copy_targets_from_leaders(
         )
 
     candidates.sort(key=lambda x: x[0], reverse=True)
-    max_pos = max(1, int(getattr(cfg, "COPY_MAX_POSITIONS", 3) or 3))
+    max_pos = max(1, int(getattr(cfg, "COPY_MAX_POSITIONS", 5) or 5))
     return [t for _w, t in candidates[:max_pos]]
 
 

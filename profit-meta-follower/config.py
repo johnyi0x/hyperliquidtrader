@@ -25,32 +25,35 @@ MIN_ORDER_NOTIONAL_USD = 10.0
 # RUN MODE — crowd (default) vs copy
 # =============================================================================
 # "crowd" = existing basket-consensus refine / dump / swing / mtf strategies.
-# "copy"  = pick top COPY_TOP_N wallets by fill stats + ROI, mirror their books.
-# Override at deploy: PMF_RUN_MODE=copy
+# "copy"         = pick top COPY_TOP_N wallets, mirror their books.
+# "copy_reverse" = same wallet pick, opposite side of each mirrored position.
+# Override at deploy: PMF_RUN_MODE=copy or PMF_RUN_MODE=copy_reverse
 RUN_MODE = "crowd"
 
-# --- Copy mode (RUN_MODE=copy). Tune in config_profiles.py COPY_* block too. ---
-COPY_TOP_N = 3
+# --- Copy mode (RUN_MODE=copy|copy_reverse). Tune in config_profiles.py COPY_* block too. ---
+COPY_TOP_N = 5
 COPY_CANDIDATE_SCAN = 200
 COPY_REFRESH_HOURS = 4.0
 COPY_RESELECT_HOURS = 4.0
 COPY_LOOKBACK_DAYS = 7.0
 COPY_HISTORY_DAYS = 30.0
-# Activity band: only reject ultra-scalp (<2m) and near-dead (>12h).
-COPY_MIN_MEDIAN_GAP_S = 120.0
+# Activity band: reject sub-5m tape and near-dead; ideal ~45m holds.
+COPY_MIN_MEDIAN_GAP_S = 300.0
 COPY_MAX_MEDIAN_GAP_S = 43200.0
 COPY_MIN_FILLS = 6
-COPY_MAX_FILLS = 180
+COPY_MAX_FILLS = 120
 COPY_MIN_FILLS_PER_DAY = 1.5
-COPY_MAX_FILLS_PER_DAY = 40.0
+COPY_MAX_FILLS_PER_DAY = 18.0
 COPY_MIN_WIN_RATE = 0.52
 COPY_MIN_HIST_WIN_RATE = 0.48
-COPY_MIN_RECENT_PNL = 50.0
-COPY_MIN_HIST_PNL = 100.0
-COPY_MIN_PROFIT_FACTOR = 1.15
-COPY_MAX_POSITIONS = 4
+COPY_MIN_RECENT_PNL = 100.0
+COPY_MIN_HIST_PNL = 200.0
+COPY_MIN_PROFIT_FACTOR = 1.25
+COPY_MAX_FAST_FLIP_RATIO = 0.35
+COPY_MIN_HOLD_S = 300.0
+COPY_MAX_POSITIONS = 5
 COPY_MIN_FRESH_LEADERS_PCT = 0.34
-COPY_IDEAL_GAP_S = 1800.0
+COPY_IDEAL_GAP_S = 2700.0
 COPY_REBALANCE_COOLDOWN_S = 45.0
 
 # (two bots will fight the same positions). Same wallet is fine if THIS

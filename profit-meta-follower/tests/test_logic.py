@@ -1398,19 +1398,40 @@ class CopyModeTests(unittest.TestCase):
 
         cfg = SimpleNamespace(
             COPY_MIN_FILLS=6,
-            COPY_MAX_FILLS=180,
-            COPY_MIN_MEDIAN_GAP_S=120.0,
+            COPY_MAX_FILLS=120,
+            COPY_MIN_MEDIAN_GAP_S=300.0,
             COPY_MAX_MEDIAN_GAP_S=43200.0,
             COPY_MIN_FILLS_PER_DAY=1.5,
-            COPY_MAX_FILLS_PER_DAY=40.0,
+            COPY_MAX_FILLS_PER_DAY=18.0,
             COPY_MIN_WIN_RATE=0.52,
             COPY_MIN_HIST_WIN_RATE=0.48,
-            COPY_MIN_RECENT_PNL=50.0,
-            COPY_MIN_HIST_PNL=100.0,
-            COPY_MIN_PROFIT_FACTOR=1.15,
+            COPY_MIN_RECENT_PNL=100.0,
+            COPY_MIN_HIST_PNL=200.0,
+            COPY_MIN_PROFIT_FACTOR=1.25,
+            COPY_MAX_FAST_FLIP_RATIO=0.35,
         )
-        recent = FillStats(n_fills=20, median_gap_s=30.0, fills_per_day=10.0, win_rate=0.6, closed_pnl=100.0)
-        hist = FillStats(n_fills=40, median_gap_s=60.0, fills_per_day=8.0, win_rate=0.55, closed_pnl=200.0)
+        recent = FillStats(
+            n_fills=20,
+            median_gap_s=60.0,
+            fills_per_day=10.0,
+            win_rate=0.6,
+            closed_pnl=100.0,
+            wins=6,
+            losses=4,
+            gross_win=200,
+            gross_loss=100,
+        )
+        hist = FillStats(
+            n_fills=40,
+            median_gap_s=90.0,
+            fills_per_day=8.0,
+            win_rate=0.55,
+            closed_pnl=200.0,
+            wins=20,
+            losses=15,
+            gross_win=500,
+            gross_loss=300,
+        )
         ok, why = passes_copy_filters(recent, hist, cfg)
         self.assertFalse(ok)
         self.assertIn("scalpy", why)
@@ -1423,21 +1444,22 @@ class CopyModeTests(unittest.TestCase):
 
         cfg = SimpleNamespace(
             COPY_MIN_FILLS=6,
-            COPY_MAX_FILLS=180,
-            COPY_MIN_MEDIAN_GAP_S=120.0,
+            COPY_MAX_FILLS=120,
+            COPY_MIN_MEDIAN_GAP_S=300.0,
             COPY_MAX_MEDIAN_GAP_S=43200.0,
             COPY_MIN_FILLS_PER_DAY=1.5,
-            COPY_MAX_FILLS_PER_DAY=40.0,
+            COPY_MAX_FILLS_PER_DAY=18.0,
             COPY_MIN_WIN_RATE=0.52,
             COPY_MIN_HIST_WIN_RATE=0.48,
-            COPY_MIN_RECENT_PNL=50.0,
-            COPY_MIN_HIST_PNL=100.0,
-            COPY_MIN_PROFIT_FACTOR=1.15,
-            COPY_IDEAL_GAP_S=1800.0,
+            COPY_MIN_RECENT_PNL=100.0,
+            COPY_MIN_HIST_PNL=200.0,
+            COPY_MIN_PROFIT_FACTOR=1.25,
+            COPY_MAX_FAST_FLIP_RATIO=0.35,
+            COPY_IDEAL_GAP_S=2700.0,
         )
         recent = FillStats(
             n_fills=40,
-            median_gap_s=1500.0,
+            median_gap_s=2500.0,
             fills_per_day=6.0,
             win_rate=0.60,
             closed_pnl=800.0,
@@ -1445,10 +1467,12 @@ class CopyModeTests(unittest.TestCase):
             losses=12,
             gross_win=2000.0,
             gross_loss=1200.0,
+            fast_flips=1,
+            round_trips=10,
         )
         hist = FillStats(
             n_fills=100,
-            median_gap_s=1600.0,
+            median_gap_s=2600.0,
             fills_per_day=4.0,
             win_rate=0.55,
             closed_pnl=2500.0,
@@ -1456,11 +1480,64 @@ class CopyModeTests(unittest.TestCase):
             losses=30,
             gross_win=5000.0,
             gross_loss=2500.0,
+            fast_flips=2,
+            round_trips=20,
         )
         ok, why = passes_copy_filters(recent, hist, cfg)
         self.assertTrue(ok, why)
         w = QualifiedWallet("0xabc", 10_000, 1000, 0.2, 0, 0, 0)
         self.assertGreater(score_copy_wallet(w, recent, hist, cfg), 50.0)
+
+    def test_copy_reverse_flips_side(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_exec import copy_targets_from_leaders
+        from pmf.copy_score import CopyLeader, FillStats
+        from pmf.types import WalletPos, WalletSnapshot
+
+        cfg = SimpleNamespace(
+            STALE_SNAPSHOT_S=9999.0,
+            OUR_GROSS_MARGIN_PCT=90.0,
+            MAX_MARGIN_PER_COIN_PCT=33.33,
+            COPY_MARGIN_CAP_PCT=100.0,
+            COPY_MAX_POSITIONS=5,
+            OUR_MIN_LEVERAGE=2,
+            OUR_MAX_LEVERAGE=20,
+            DEX_SCOPE="include",
+            ALLOW_COINS=(),
+            DENY_COINS=(),
+        )
+        ld = CopyLeader(
+            address="0xabc",
+            score=10.0,
+            rank_roi=0.2,
+            rank_pnl=1000.0,
+            account_value=10_000.0,
+            recent=FillStats(win_rate=0.6),
+        )
+        snap = WalletSnapshot(
+            address="0xabc",
+            account_value=10_000.0,
+            positions=[
+                WalletPos(
+                    coin="BTC",
+                    side="long",
+                    size=1.0,
+                    notional=3000.0,
+                    entry_px=100.0,
+                    leverage=10,
+                    isolated=False,
+                    conviction=0.3,
+                )
+            ],
+            fetched_at=1000.0,
+            fingerprint="x",
+        )
+        follow = copy_targets_from_leaders([ld], [snap], cfg, now=1001.0, reverse=False)
+        reverse = copy_targets_from_leaders([ld], [snap], cfg, now=1001.0, reverse=True)
+        self.assertEqual(follow[0].side, "long")
+        self.assertEqual(reverse[0].side, "short")
+        self.assertEqual(follow[0].coin, reverse[0].coin)
 
     def test_copy_scan_cfg_shortlist(self) -> None:
         from pmf.qualify import shortlist

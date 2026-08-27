@@ -69,6 +69,6 @@ def apply_profile(module_globals: dict[str, Any]) -> str:
         module_globals[key] = val
     module_globals["PMF_PROFILE"] = name
     run_mode = str(os.environ.get("PMF_RUN_MODE", "") or "").strip().lower()
-    if run_mode in ("crowd", "copy"):
+    if run_mode in ("crowd", "copy", "copy_reverse"):
         module_globals["RUN_MODE"] = run_mode
     return name

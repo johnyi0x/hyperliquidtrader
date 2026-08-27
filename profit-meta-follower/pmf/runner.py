@@ -81,7 +81,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v2",
+            "copy-v3",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_CANDIDATE_SCAN", "")),
             str(getattr(cfg, "RANK_WINDOW", "")),
@@ -90,6 +90,8 @@ def _copy_sig(cfg: Any) -> str:
             str(getattr(cfg, "COPY_MIN_WIN_RATE", "")),
             str(getattr(cfg, "COPY_MIN_FILLS_PER_DAY", "")),
             str(getattr(cfg, "COPY_MIN_PROFIT_FACTOR", "")),
+            str(getattr(cfg, "COPY_MAX_FAST_FLIP_RATIO", "")),
+            str(getattr(cfg, "RUN_MODE", "copy")),
         ]
     )
 
@@ -205,7 +207,11 @@ class ProfitMetaRunner:
         self._last_equity: float | None = None
 
     def _is_copy_mode(self) -> bool:
-        return str(getattr(self.cfg, "RUN_MODE", "crowd") or "crowd").strip().lower() == "copy"
+        mode = str(getattr(self.cfg, "RUN_MODE", "crowd") or "crowd").strip().lower()
+        return mode in ("copy", "copy_reverse")
+
+    def _copy_reverse(self) -> bool:
+        return str(getattr(self.cfg, "RUN_MODE", "") or "").strip().lower() == "copy_reverse"
 
     def _copy_age_h(self) -> float:
         if str(self.store.data.get("copy_rank") or "") != _copy_sig(self.cfg):
@@ -290,7 +296,13 @@ class ProfitMetaRunner:
         fresh = self._fresh_count(by_addr, [ld.address for ld in leaders], now=now)
         need = min_fresh_copy_leaders(self.cfg, len(leaders))
         managed = set(str(x) for x in (self.store.data.get("managed_coins") or []))
-        targets = copy_targets_from_leaders(leaders, snaps, self.cfg, now=now)
+        targets = copy_targets_from_leaders(
+            leaders,
+            snaps,
+            self.cfg,
+            now=now,
+            reverse=self._copy_reverse(),
+        )
         trade_keys = [f"{t.side}:{t.coin}" for t in targets]
 
         try:
@@ -312,7 +324,8 @@ class ProfitMetaRunner:
             equity=self._last_equity,
         )
         self.log.info(
-            "Copy tick snaps=%s fresh=%s/%s leaders=%s targets=%s",
+            "Copy tick mode=%s snaps=%s fresh=%s/%s leaders=%s targets=%s",
+            "reverse" if self._copy_reverse() else "follow",
             n,
             fresh,
             len(leaders),
@@ -1062,16 +1075,17 @@ class ProfitMetaRunner:
         else:
             if self._is_copy_mode():
                 self.log.info(
-                    "Copy-trade running | profile=%s paper=%s leaders=%s scan=%s "
+                    "Copy-trade running | mode=%s profile=%s paper=%s leaders=%s scan=%s "
                     "gap=%.0f-%.0fs min_wr=%.0f%% refresh=%sh scope=%s",
+                    "reverse" if self._copy_reverse() else "follow",
                     getattr(self.cfg, "PMF_PROFILE", "local"),
                     bool(self.cfg.PAPER_TRADING),
-                    int(getattr(self.cfg, "COPY_TOP_N", 3) or 3),
-                    int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 120) or 120),
-                    float(getattr(self.cfg, "COPY_MIN_MEDIAN_GAP_S", 900)),
-                    float(getattr(self.cfg, "COPY_MAX_MEDIAN_GAP_S", 28800)),
-                    float(getattr(self.cfg, "COPY_MIN_WIN_RATE", 0.48)) * 100,
-                    float(getattr(self.cfg, "COPY_REFRESH_HOURS", 12)),
+                    int(getattr(self.cfg, "COPY_TOP_N", 5) or 5),
+                    int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 200) or 200),
+                    float(getattr(self.cfg, "COPY_MIN_MEDIAN_GAP_S", 300)),
+                    float(getattr(self.cfg, "COPY_MAX_MEDIAN_GAP_S", 43200)),
+                    float(getattr(self.cfg, "COPY_MIN_WIN_RATE", 0.52)) * 100,
+                    float(getattr(self.cfg, "COPY_REFRESH_HOURS", 4)),
                     self.cfg.DEX_SCOPE,
                 )
             else:
