@@ -204,8 +204,12 @@ def passes_copy_filters(recent: FillStats, history: FillStats, cfg: Any) -> tupl
         return False, f"too_few_fills={recent.n_fills}"
     if max_f > 0 and recent.n_fills > max_f:
         return False, f"too_many_fills={recent.n_fills}"
-    if recent.median_gap_s < min_gap:
-        return False, f"scalpy gap={recent.median_gap_s:.0f}s"
+    # Median inter-fill gap from tape. gap=0 / sub-minute HFT must fail when min_gap>0.
+    if min_gap > 0:
+        if recent.n_fills < 2:
+            return False, f"no_gap_sample fills={recent.n_fills}"
+        if recent.median_gap_s < min_gap:
+            return False, f"scalpy gap={recent.median_gap_s:.0f}s<{min_gap:.0f}s"
     if max_gap > 0 and recent.median_gap_s > max_gap:
         return False, f"dormant gap={recent.median_gap_s:.0f}s"
     if recent.fills_per_day < min_fpd:
@@ -333,16 +337,30 @@ def _relaxed_copy_cfg(cfg: Any) -> Any:
     return SimpleNamespace(**vals)
 
 
+@dataclass
+class CopyScanResult:
+    leaders: list[CopyLeader]
+    rejects: dict[str, str] = field(default_factory=dict)
+    scanned: list[str] = field(default_factory=list)
+    next_offset: int = 0
+    fetched: int = 0
+    exhausted: bool = False
+
+
 def pick_copy_leaders(
     pool: list[QualifiedWallet],
     qualifier: Qualifier,
     cfg: Any,
     *,
     logger: logging.Logger | None = None,
-) -> list[CopyLeader]:
-    """Walk 7d ROI board (highest first), keep first COPY_TOP_N that pass min filters.
+    keep: list[CopyLeader] | None = None,
+    skip_addrs: set[str] | None = None,
+    start_offset: int = 0,
+) -> CopyScanResult:
+    """Walk 7d ROI board highest-first in waves; never re-fetch skip_addrs.
 
-    Matches HL leaderboard ROI ordering. COPY_MAX_* of 0 = unlimited.
+    start_offset resumes after the previous wave (0..N, then N..2N, ...).
+    COPY_MAX_* of 0 = unlimited.
     """
     log = logger or qualifier.log
     want = max(1, _cfg_int(cfg, "COPY_TOP_N", 2))
@@ -357,41 +375,62 @@ def pick_copy_leaders(
     now_ms = int(time.time() * 1000)
     start_hist = now_ms - int(hist_d * 86400_000)
 
-    skipped_roi = 0
-    skipped_eq = 0
     eligible: list[QualifiedWallet] = []
     for w in pool[:board_n]:
         if max_roi > 0 and w.rank_roi > max_roi:
-            skipped_roi += 1
             continue
         if min_eq > 0 and w.account_value < min_eq:
-            skipped_eq += 1
             continue
         eligible.append(w)
-    # Highest ROI first (same as HL UI 7d board).
-    eligible.sort(key=lambda w: w.rank_roi, reverse=True)
+    # Stable order: highest ROI first, address tie-break.
+    eligible.sort(key=lambda w: (-w.rank_roi, w.address.lower()))
+
+    kept: list[CopyLeader] = []
+    seen_keep: set[str] = set()
+    for ld in keep or []:
+        addr = str(ld.address or "").lower()
+        if not addr or addr in seen_keep:
+            continue
+        kept.append(ld)
+        seen_keep.add(addr)
+        if len(kept) >= want:
+            break
+
+    skip = {a.lower() for a in (skip_addrs or set())} | seen_keep
+    offset = max(0, min(int(start_offset), len(eligible)))
+    need = want - len(kept)
 
     log.info(
-        "Copy scan start: board=%s eligible=%s fetch_cap=%s skip_roi_cap=%s skip_low_eq=%s "
-        "max_roi=%s min_eq=$%.0f order=roi window=%s",
+        "Copy scan wave: board=%s eligible=%s resume_idx=%s fetch_cap=%s "
+        "already_seen=%s keep=%s need=%s max_roi=%s min_eq=$%.0f window=%s",
         min(board_n, len(pool)),
         len(eligible),
+        offset,
         fetch_max,
-        skipped_roi,
-        skipped_eq,
+        len(skip),
+        len(kept),
+        need,
         "off" if max_roi <= 0 else f"{max_roi * 100.0:.0f}%",
         min_eq,
         getattr(cfg, "RANK_WINDOW", "week"),
     )
     if eligible:
-        top = eligible[0]
+        last = eligible[-1]
+        head = eligible[0]
+        at = eligible[offset] if offset < len(eligible) else last
         log.info(
-            "Copy board head: %s roi=%.1f%% pnl=$%.0f eq=$%.0f … tail roi=%.1f%%",
-            top.address[:10],
-            top.rank_roi * 100,
-            top.rank_pnl,
-            top.account_value,
-            eligible[min(49, len(eligible) - 1)].rank_roi * 100,
+            "Copy board: head %s roi=%.1f%% | this_wave %s roi=%.1f%% (idx %s) | end roi=%.1f%%",
+            head.address[:10],
+            head.rank_roi * 100,
+            at.address[:10],
+            at.rank_roi * 100,
+            offset,
+            last.rank_roi * 100,
+        )
+
+    if need <= 0:
+        return CopyScanResult(
+            leaders=kept[:want], rejects={}, scanned=[], next_offset=offset, fetched=0
         )
 
     def _to_leader(
@@ -421,19 +460,32 @@ def pick_copy_leaders(
         )
 
     analyzed: list[tuple[QualifiedWallet, FillStats, FillStats]] = []
-    strict_pass: list[CopyLeader] = []
+    new_pass: list[CopyLeader] = []
+    new_rejects: dict[str, str] = {}
+    scanned: list[str] = []
     fetch_fail = 0
     fetched = 0
     skip_logs = 0
-    for w in eligible:
-        if fetched >= fetch_max or len(strict_pass) >= want:
-            break
-        fills = qualifier._recent_fills(w.address, start_hist)
+    cached_hits = 0
+    idx = offset
+    wave_start = offset
+
+    while idx < len(eligible) and fetched < fetch_max and len(new_pass) < need:
+        w = eligible[idx]
+        idx += 1
+        addr = w.address.lower()
+        if addr in skip:
+            cached_hits += 1
+            continue
+        fills = qualifier._recent_fills(addr, start_hist)
         fetched += 1
+        scanned.append(addr)
+        skip.add(addr)
         if fetched > 1:
             time.sleep(sleep_s)
         if fills is None:
             fetch_fail += 1
+            new_rejects[addr] = "fills_failed"
             continue
         recent = analyze_fills(
             fills, now_ms=now_ms, lookback_days=recent_d, min_hold_s=min_hold
@@ -444,21 +496,24 @@ def pick_copy_leaders(
         analyzed.append((w, recent, history))
         ok, why = passes_copy_filters(recent, history, cfg)
         if not ok:
-            if skip_logs < 25:
+            new_rejects[addr] = why
+            if skip_logs < 15:
                 log.info(
-                    "Copy skip [strict] %s roi=%.1f%% — %s",
-                    w.address[:10],
+                    "Copy skip [strict] %s roi=%.1f%% fills=%s gap=%.0fs — %s",
+                    addr[:10],
                     w.rank_roi * 100,
+                    recent.n_fills,
+                    recent.median_gap_s,
                     why,
                 )
                 skip_logs += 1
             continue
-        strict_pass.append(_to_leader(w, recent, history, "strict", why))
+        new_pass.append(_to_leader(w, recent, history, "strict", why))
         log.info(
             "Copy keep [strict] %s/%s %s roi=%.1f%% gap=%.0fs %.1f/d pnl=$%.0f",
-            len(strict_pass),
+            len(kept) + len(new_pass),
             want,
-            w.address[:10],
+            addr[:10],
             w.rank_roi * 100,
             recent.median_gap_s,
             recent.fills_per_day,
@@ -466,54 +521,67 @@ def pick_copy_leaders(
         )
 
     log.info(
-        "Copy strict filter: fetched=%s analyzed=%s passed=%s",
+        "Copy strict wave: fetched=%s already_seen_skip=%s analyzed=%s passed=%s "
+        "idx %s→%s",
         fetched,
+        cached_hits,
         len(analyzed),
-        len(strict_pass),
+        len(new_pass),
+        wave_start,
+        idx,
     )
 
-    leaders = strict_pass[:want]
     label = "strict"
-    if len(leaders) < want:
+    if len(kept) + len(new_pass) < want and analyzed:
         log.warning(
-            "Copy strict pass only %s/%s — applying relaxed filters on same fills",
-            len(leaders),
+            "Copy strict wave %s/%s — relaxed pass on this wave's fills only",
+            len(kept) + len(new_pass),
             want,
         )
         relaxed_cfg = _relaxed_copy_cfg(cfg)
-        relaxed: list[CopyLeader] = []
         skip_logs = 0
         for w, recent, history in analyzed:
+            addr = w.address.lower()
+            if addr in seen_keep or any(x.address == addr for x in new_pass):
+                continue
             ok, why = passes_copy_filters(recent, history, relaxed_cfg)
             if not ok:
-                if skip_logs < 20:
+                new_rejects[addr] = why
+                if skip_logs < 10:
                     log.info(
-                        "Copy skip [relaxed] %s roi=%.1f%% — %s",
-                        w.address[:10],
+                        "Copy skip [relaxed] %s roi=%.1f%% fills=%s gap=%.0fs — %s",
+                        addr[:10],
                         w.rank_roi * 100,
+                        recent.n_fills,
+                        recent.median_gap_s,
                         why,
                     )
                     skip_logs += 1
                 continue
-            relaxed.append(_to_leader(w, recent, history, "relaxed", why))
-            if len(relaxed) >= want:
+            new_pass.append(_to_leader(w, recent, history, "relaxed", why))
+            new_rejects.pop(addr, None)
+            if len(kept) + len(new_pass) >= want:
                 break
-        leaders = relaxed[:want]
         label = "relaxed"
-        log.info(
-            "Copy relaxed filter: analyzed=%s passed=%s",
-            len(analyzed),
-            len(relaxed),
-        )
 
-    # Preserve ROI board order (already highest-first among passers).
+    leaders = (kept + new_pass)[:want]
+    leaders.sort(key=lambda x: (-x.rank_roi, x.address))
+    exhausted = idx >= len(eligible)
+    next_offset = idx  # always advance — next wave starts here
     log.info(
-        "Copy scan done [%s]: fetched=%s fetch_fail=%s analyzed=%s picked=%s",
+        "Copy scan done [%s]: fetched=%s fetch_fail=%s kept=%s new=%s picked=%s "
+        "scanned=+-%s rejects=+-%s next_idx=%s/%s exhausted=%s",
         label,
         fetched,
         fetch_fail,
-        len(analyzed),
+        len(kept),
+        len(new_pass),
         len(leaders),
+        len(scanned),
+        len(new_rejects),
+        next_offset,
+        len(eligible),
+        exhausted,
     )
     for j, ld in enumerate(leaders, 1):
         log.info(
@@ -532,7 +600,14 @@ def pick_copy_leaders(
             ld.history.win_rate * 100,
             ld.history.closed_pnl,
         )
-    return leaders
+    return CopyScanResult(
+        leaders=leaders,
+        rejects=new_rejects,
+        scanned=scanned,
+        next_offset=next_offset,
+        fetched=fetched,
+        exhausted=exhausted,
+    )
 
 
 def leaders_to_state(leaders: list[CopyLeader]) -> list[dict[str, Any]]:

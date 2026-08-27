@@ -81,7 +81,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v8",
+            "copy-v10",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_REQUIRE_FULL_WATCHLIST", "")),
             str(getattr(cfg, "COPY_MAX_ROI", "")),
@@ -231,6 +231,90 @@ class ProfitMetaRunner:
             return False
         return len(cur) >= want
 
+    def _copy_reject_addrs(self) -> set[str]:
+        """Addresses already fetched/rejected — never re-query in later waves."""
+        ttl_h = float(getattr(self.cfg, "COPY_REJECT_TTL_H", 24.0) or 24.0)
+        now = time.time()
+        out: set[str] = set()
+
+        raw = self.store.data.get("copy_rejects") or {}
+        alive: dict[str, Any] = {}
+        if isinstance(raw, dict):
+            for addr, meta in raw.items():
+                a = str(addr).lower()
+                if not a.startswith("0x"):
+                    continue
+                ts = 0.0
+                reason = ""
+                if isinstance(meta, dict):
+                    ts = float(meta.get("ts") or 0)
+                    reason = str(meta.get("why") or "")
+                elif isinstance(meta, (int, float)):
+                    ts = float(meta)
+                if ttl_h > 0 and ts > 0 and (now - ts) > ttl_h * 3600.0:
+                    continue
+                alive[a] = {"ts": ts or now, "why": reason}
+                out.add(a)
+        self.store.data["copy_rejects"] = alive
+
+        scanned_raw = self.store.data.get("copy_scanned") or {}
+        scanned_alive: dict[str, Any] = {}
+        if isinstance(scanned_raw, dict):
+            for addr, meta in scanned_raw.items():
+                a = str(addr).lower()
+                if not a.startswith("0x"):
+                    continue
+                ts = float(meta.get("ts") or 0) if isinstance(meta, dict) else float(meta or 0)
+                if ttl_h > 0 and ts > 0 and (now - ts) > ttl_h * 3600.0:
+                    continue
+                scanned_alive[a] = {"ts": ts or now}
+                out.add(a)
+        elif isinstance(scanned_raw, list):
+            for addr in scanned_raw:
+                a = str(addr).lower()
+                if a.startswith("0x"):
+                    scanned_alive[a] = {"ts": now}
+                    out.add(a)
+        self.store.data["copy_scanned"] = scanned_alive
+        return out
+
+    def _merge_copy_rejects(self, rejects: dict[str, str]) -> None:
+        if not rejects:
+            return
+        cur = self.store.data.get("copy_rejects") or {}
+        if not isinstance(cur, dict):
+            cur = {}
+        now = time.time()
+        for addr, why in rejects.items():
+            a = str(addr).lower()
+            cur[a] = {"ts": now, "why": str(why or "")[:80]}
+        if len(cur) > 5000:
+            items = sorted(
+                cur.items(),
+                key=lambda kv: float((kv[1] or {}).get("ts") or 0) if isinstance(kv[1], dict) else 0,
+            )
+            cur = dict(items[-4000:])
+        self.store.data["copy_rejects"] = cur
+
+    def _merge_copy_scanned(self, scanned: list[str]) -> None:
+        if not scanned:
+            return
+        cur = self.store.data.get("copy_scanned") or {}
+        if not isinstance(cur, dict):
+            cur = {}
+        now = time.time()
+        for addr in scanned:
+            a = str(addr).lower()
+            if a.startswith("0x"):
+                cur[a] = {"ts": now}
+        if len(cur) > 8000:
+            items = sorted(
+                cur.items(),
+                key=lambda kv: float((kv[1] or {}).get("ts") or 0) if isinstance(kv[1], dict) else 0,
+            )
+            cur = dict(items[-6000:])
+        self.store.data["copy_scanned"] = cur
+
     def refresh_copy_leaders_if_needed(self) -> None:
         existing = self._copy_leaders()
         want = max(1, int(getattr(self.cfg, "COPY_TOP_N", 5) or 5))
@@ -238,8 +322,12 @@ class ProfitMetaRunner:
         refresh_h = float(getattr(self.cfg, "COPY_REFRESH_HOURS", 12.0) or 12.0)
         retry_min = float(getattr(self.cfg, "COPY_INCOMPLETE_RETRY_MIN", 10.0) or 10.0)
         full = self._copy_watchlist_full(existing)
+        sig = _copy_sig(self.cfg)
+        old_sig = str(self.store.data.get("copy_rank") or "")
+        # Only reset progress when config actually changed from a prior known sig.
+        sig_changed = bool(old_sig) and old_sig != sig
 
-        if existing and full and self._copy_age_h() < refresh_h:
+        if existing and full and self._copy_age_h() < refresh_h and not sig_changed:
             self.log.info(
                 "Using saved copy leaders (%s/%s wallets, %.1fh old)",
                 len(existing),
@@ -251,14 +339,21 @@ class ProfitMetaRunner:
 
         failed_at = float(self.store.data.get("copy_scan_failed_at") or 0)
         backoff_s = retry_min * 60.0 if not full else 1800.0
-        if failed_at > 0 and (time.time() - failed_at) < backoff_s and not full:
+        if (
+            failed_at > 0
+            and (time.time() - failed_at) < backoff_s
+            and not full
+            and not sig_changed
+        ):
             last_log = float(self.store.data.get("copy_backoff_log_at") or 0)
             if time.time() - last_log >= 120.0:
                 self.log.warning(
-                    "Copy scan backoff — last incomplete/fail %.0f min ago (have %s/%s)",
+                    "Copy scan backoff — last wave %.0f min ago (have %s/%s next_idx=%s seen=%s)",
                     (time.time() - failed_at) / 60.0,
                     len(existing),
                     want,
+                    int(self.store.data.get("copy_scan_offset") or 0),
+                    len(self.store.data.get("copy_scanned") or {}),
                 )
                 self.store.data["copy_backoff_log_at"] = time.time()
                 self.store.save()
@@ -266,11 +361,20 @@ class ProfitMetaRunner:
                 self.tracker.set_basket(leaders_to_basket(existing))
             return
 
+        if sig_changed:
+            self.log.info("Copy config changed (%s → %s) — reset scan progress", old_sig[:24], sig[:24])
+            self.store.data["copy_rejects"] = {}
+            self.store.data["copy_scanned"] = {}
+            self.store.data["copy_scan_offset"] = 0
+            existing = []
+
+        offset = int(self.store.data.get("copy_scan_offset") or 0)
         self.log.info(
-            "Refreshing copy-trade leaders (need full=%s want=%s have=%s)",
+            "Refreshing copy-trade leaders (need full=%s want=%s have=%s next_idx=%s)",
             require_full,
             want,
             len(existing),
+            offset,
         )
         rows = load_leaderboard(
             self.data_dir / "leaderboard_cache.json",
@@ -283,7 +387,7 @@ class ProfitMetaRunner:
             rows, self.cfg, scan_n=scan_n, min_equity=min_eq
         )
         self.log.info(
-            "Copy shortlist %s/%s by %s ROI (min_eq=$%.0f) — matches HL leaderboard order",
+            "Copy shortlist %s/%s by %s ROI (min_eq=$%.0f) — HL leaderboard order",
             len(pool),
             len(rows),
             getattr(self.cfg, "RANK_WINDOW", "week"),
@@ -293,10 +397,45 @@ class ProfitMetaRunner:
             self.log.error("No wallets on copy shortlist")
             self.store.data["copy_scan_failed_at"] = time.time()
             self.store.data["copy_ready"] = False
+            self.store.data["copy_rank"] = sig
             self.store.save()
             return
+
+        # Keep partial watchlist; only hunt for missing slots.
+        keep = existing if (existing and not full) else []
+        if existing and full and self._copy_age_h() >= refresh_h:
+            keep = []
+            self.store.data["copy_scan_offset"] = 0
+            offset = 0
+
+        skip = self._copy_reject_addrs()
+        # If cursor past board end, restart from head but still skip already-seen addrs
+        # (picks up new high-ROI wallets after leaderboard churn).
+        if offset >= len(pool):
+            self.log.info(
+                "Copy cursor past board end (%s>=%s) — wrap to 0, still skipping %s seen",
+                offset,
+                len(pool),
+                len(skip),
+            )
+            offset = 0
+
         qualifier = Qualifier(self.client.info, self.log, self.cfg)
-        leaders = pick_copy_leaders(pool, qualifier, self.cfg, logger=self.log)
+        result = pick_copy_leaders(
+            pool,
+            qualifier,
+            self.cfg,
+            logger=self.log,
+            keep=keep,
+            skip_addrs=skip,
+            start_offset=offset,
+        )
+        self._merge_copy_rejects(result.rejects)
+        self._merge_copy_scanned(result.scanned)
+        self.store.data["copy_scan_offset"] = int(result.next_offset)
+        self.store.data["copy_rank"] = sig  # always — avoids false "config changed" resets
+
+        leaders = result.leaders
         if not leaders:
             if existing and full:
                 self.log.warning(
@@ -305,7 +444,12 @@ class ProfitMetaRunner:
                 )
                 self.tracker.set_basket(leaders_to_basket(existing))
                 return
-            self.log.error("Copy scan found 0 leaders — backoff then retry")
+            self.log.error(
+                "Copy wave found 0 leaders — next wave at idx %s (seen=%s); retry in %.0fm",
+                self.store.data["copy_scan_offset"],
+                len(self.store.data.get("copy_scanned") or {}),
+                retry_min,
+            )
             self.store.data["copy_scan_failed_at"] = time.time()
             self.store.data["copy_ready"] = False
             self.store.save()
@@ -313,19 +457,22 @@ class ProfitMetaRunner:
 
         ready = (not require_full) or (len(leaders) >= want)
         self.store.data["copy_leaders"] = leaders_to_state(leaders)
-        self.store.data["copy_rank"] = _copy_sig(self.cfg)
         self.store.data["copy_ready"] = ready
         if ready:
             self.store.data["copy_built_at"] = time.time()
             self.store.data["copy_scan_failed_at"] = 0
+            # Keep seen/rejects so a later full reselect still skips known HFT.
+            self.store.data["copy_scan_offset"] = 0
             self.log.info("Copy watchlist READY %s/%s — trading enabled", len(leaders), want)
         else:
             self.store.data["copy_built_at"] = 0
             self.store.data["copy_scan_failed_at"] = time.time()
             self.log.warning(
-                "Copy watchlist INCOMPLETE %s/%s — NOT trading until full; retry in %.0fm",
+                "Copy watchlist INCOMPLETE %s/%s — next wave idx=%s seen=%s; retry in %.0fm",
                 len(leaders),
                 want,
+                self.store.data["copy_scan_offset"],
+                len(self.store.data.get("copy_scanned") or {}),
                 retry_min,
             )
         self.store.save()
@@ -337,6 +484,8 @@ class ProfitMetaRunner:
                 "count": len(leaders),
                 "want": want,
                 "ready": ready,
+                "offset": int(self.store.data.get("copy_scan_offset") or 0),
+                "seen": len(self.store.data.get("copy_scanned") or {}),
                 "leaders": [ld.address[:10] for ld in leaders],
             },
         )
