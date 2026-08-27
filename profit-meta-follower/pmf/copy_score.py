@@ -185,52 +185,102 @@ def _cfg_int(cfg: Any, name: str, default: int) -> int:
     return int(raw)
 
 
-def passes_copy_filters(recent: FillStats, history: FillStats, cfg: Any) -> tuple[bool, str]:
-    """Minimum floors only for fills/PnL; max_* of 0 means unlimited."""
-    min_f = _cfg_int(cfg, "COPY_MIN_FILLS", 10)
-    max_f = _cfg_int(cfg, "COPY_MAX_FILLS", 0)
-    min_gap = _cfg_float(cfg, "COPY_MIN_MEDIAN_GAP_S", 90.0)
-    max_gap = _cfg_float(cfg, "COPY_MAX_MEDIAN_GAP_S", 0.0)
-    min_fpd = _cfg_float(cfg, "COPY_MIN_FILLS_PER_DAY", 6.0)
-    max_fpd = _cfg_float(cfg, "COPY_MAX_FILLS_PER_DAY", 0.0)
-    min_wr = _cfg_float(cfg, "COPY_MIN_WIN_RATE", 0.40)
-    min_hist_wr = _cfg_float(cfg, "COPY_MIN_HIST_WIN_RATE", 0.38)
-    min_pnl = _cfg_float(cfg, "COPY_MIN_RECENT_PNL", 0.0)
-    min_hist_pnl = _cfg_float(cfg, "COPY_MIN_HIST_PNL", 0.0)
-    min_pf = _cfg_float(cfg, "COPY_MIN_PROFIT_FACTOR", 1.0)
-    max_flip = _cfg_float(cfg, "COPY_MAX_FAST_FLIP_RATIO", 0.0)
+def _board_yield(wallet: QualifiedWallet) -> float:
+    vol = max(float(wallet.rank_volume or 0), 1.0)
+    return float(wallet.rank_pnl or 0) / vol
 
-    if recent.n_fills < min_f:
-        return False, f"too_few_fills={recent.n_fills}"
-    if max_f > 0 and recent.n_fills > max_f:
-        return False, f"too_many_fills={recent.n_fills}"
-    # Median inter-fill gap from tape. gap=0 / sub-minute HFT must fail when min_gap>0.
-    if min_gap > 0:
-        if recent.n_fills < 2:
-            return False, f"no_gap_sample fills={recent.n_fills}"
-        if recent.median_gap_s < min_gap:
-            return False, f"scalpy gap={recent.median_gap_s:.0f}s<{min_gap:.0f}s"
-    if max_gap > 0 and recent.median_gap_s > max_gap:
-        return False, f"dormant gap={recent.median_gap_s:.0f}s"
-    if recent.fills_per_day < min_fpd:
-        return False, f"slow {recent.fills_per_day:.1f}/d"
-    if max_fpd > 0 and recent.fills_per_day > max_fpd:
-        return False, f"hyper {recent.fills_per_day:.1f}/d"
-    if recent.wins + recent.losses < 3:
-        return False, f"few_closed={recent.wins + recent.losses}"
-    if recent.win_rate < min_wr:
-        return False, f"low_wr={recent.win_rate:.0%}"
-    if history.win_rate < min_hist_wr and history.wins + history.losses >= 8:
-        return False, f"hist_wr={history.win_rate:.0%}"
-    if recent.closed_pnl < min_pnl:
-        return False, f"recent_pnl=${recent.closed_pnl:.0f}"
-    if history.closed_pnl < min_hist_pnl:
-        return False, f"hist_pnl=${history.closed_pnl:.0f}"
-    if min_pf > 0 and recent.profit_factor < min_pf and recent.losses >= 2:
-        return False, f"pf={recent.profit_factor:.2f}"
-    if max_flip > 0 and recent.round_trips >= 4 and recent.fast_flip_ratio > max_flip:
-        return False, f"bait_flips={recent.fast_flip_ratio:.0%}"
+
+def _fmt_board(wallet: QualifiedWallet) -> str:
+    vol = float(wallet.rank_volume or 0)
+    pnl = float(wallet.rank_pnl or 0)
+    y = _board_yield(wallet) if vol > 0 else 0.0
+    return (
+        f"roi={wallet.rank_roi * 100:.1f}% pnl=${pnl:,.0f} vol=${vol:,.0f} "
+        f"yield={y * 100:.4f}% eq=${wallet.account_value:,.0f}"
+    )
+
+
+def _fmt_fills(recent: FillStats) -> str:
+    return (
+        f"fills={recent.n_fills} {recent.fills_per_day:.1f}/d gap={recent.median_gap_s:.1f}s "
+        f"wr={recent.win_rate:.0%} tape_pnl=${recent.closed_pnl:.0f} "
+        f"flip={recent.fast_flip_ratio:.0%}"
+    )
+
+
+def _loosen_steps(cfg: Any) -> list[dict[str, float]]:
+    base_yield = _cfg_float(cfg, "COPY_MIN_PNL_VOLUME_RATIO", 0.00005)
+    base_gap = _cfg_float(cfg, "COPY_MIN_MEDIAN_GAP_S", 20.0)
+    return [
+        {"yield_mult": 1.0, "min_gap": base_gap, "hyper_fpd": 800.0},
+        {"yield_mult": 0.25, "min_gap": max(10.0, base_gap * 0.5), "hyper_fpd": 1200.0},
+        {"yield_mult": 0.05, "min_gap": 5.0, "hyper_fpd": 2000.0},
+        {"yield_mult": 0.0, "min_gap": 2.0, "hyper_fpd": 3000.0},
+        {"yield_mult": 0.0, "min_gap": 0.0, "hyper_fpd": 0.0},
+    ]
+
+
+def passes_copy_board(
+    wallet: QualifiedWallet,
+    cfg: Any,
+    *,
+    yield_mult: float = 1.0,
+) -> tuple[bool, str]:
+    min_vol = _cfg_float(cfg, "COPY_MIN_BOARD_VOLUME", 1.0)
+    base_yield = _cfg_float(cfg, "COPY_MIN_PNL_VOLUME_RATIO", 0.00005)
+    min_yield = base_yield * max(0.0, yield_mult)
+    vol = float(wallet.rank_volume or 0)
+    pnl = float(wallet.rank_pnl or 0)
+    y = pnl / max(vol, 1.0) if vol > 0 else 0.0
+    detail = _fmt_board(wallet)
+
+    if vol <= 0 or (min_vol > 0 and vol < min_vol):
+        return False, f"zero_volume | {detail}"
+    if min_yield > 0 and y < min_yield:
+        need = min_yield * 100.0
+        return False, (
+            f"low_pnl_yield yield={y * 100:.4f}% need>={need:.4f}% "
+            f"(pnl/vol churn) | {detail}"
+        )
     return True, "ok"
+
+
+def passes_copy_fills(
+    recent: FillStats,
+    history: FillStats,
+    cfg: Any,
+    *,
+    min_gap: float,
+    hyper_fpd: float,
+) -> tuple[bool, str]:
+    min_f = max(0, _cfg_int(cfg, "COPY_MIN_FILLS", 1))
+    detail = _fmt_fills(recent)
+
+    if min_f > 0 and recent.n_fills < min_f:
+        return False, f"too_few_fills={recent.n_fills} need>={min_f} | {detail}"
+
+    if min_gap > 0:
+        if recent.n_fills >= 2 and recent.median_gap_s < min_gap:
+            return False, (
+                f"scalpy gap={recent.median_gap_s:.1f}s need>={min_gap:.0f}s | {detail}"
+            )
+    elif hyper_fpd > 0 and recent.fills_per_day > hyper_fpd and recent.median_gap_s < 3.0:
+        return False, (
+            f"hyper_churn {recent.fills_per_day:.0f}/d gap={recent.median_gap_s:.1f}s "
+            f"cap={hyper_fpd:.0f}/d | {detail}"
+        )
+
+    min_pnl = _cfg_float(cfg, "COPY_MIN_RECENT_PNL", 0.0)
+    if min_pnl > 0 and recent.closed_pnl < min_pnl:
+        return False, f"tape_pnl=${recent.closed_pnl:.0f} need>=${min_pnl:.0f} | {detail}"
+
+    return True, "ok"
+
+
+def passes_copy_filters(recent: FillStats, history: FillStats, cfg: Any) -> tuple[bool, str]:
+    """Strictest fill tier (tests / back-compat). Board filters use passes_copy_board."""
+    gap = _cfg_float(cfg, "COPY_MIN_MEDIAN_GAP_S", 20.0)
+    return passes_copy_fills(recent, history, cfg, min_gap=gap, hyper_fpd=800.0)
 
 
 def score_copy_wallet(
@@ -295,48 +345,6 @@ def score_copy_wallet(
     return wr + pf + recent_pnl + hist_pnl + board_pnl + roi + activity + freshness - bait_pen
 
 
-def _relaxed_copy_cfg(cfg: Any) -> Any:
-    """Softer second-pass thresholds when strict scan finds too few leaders."""
-    from types import SimpleNamespace
-
-    keys = [
-        "COPY_MIN_FILLS",
-        "COPY_MAX_FILLS",
-        "COPY_MIN_MEDIAN_GAP_S",
-        "COPY_MAX_MEDIAN_GAP_S",
-        "COPY_MIN_FILLS_PER_DAY",
-        "COPY_MAX_FILLS_PER_DAY",
-        "COPY_MIN_WIN_RATE",
-        "COPY_MIN_HIST_WIN_RATE",
-        "COPY_MIN_RECENT_PNL",
-        "COPY_MIN_HIST_PNL",
-        "COPY_MIN_PROFIT_FACTOR",
-        "COPY_MAX_FAST_FLIP_RATIO",
-        "COPY_MIN_HOLD_S",
-        "COPY_IDEAL_GAP_S",
-        "COPY_IDEAL_TRADES_PER_HOUR",
-        "COPY_LOOKBACK_DAYS",
-    ]
-    vals = {k: getattr(cfg, k) for k in keys if hasattr(cfg, k)}
-    vals.update(
-        {
-            "COPY_MIN_FILLS": 6,
-            "COPY_MAX_FILLS": 0,
-            "COPY_MIN_MEDIAN_GAP_S": 60.0,
-            "COPY_MAX_MEDIAN_GAP_S": 0.0,
-            "COPY_MIN_FILLS_PER_DAY": 4.0,
-            "COPY_MAX_FILLS_PER_DAY": 0.0,
-            "COPY_MIN_WIN_RATE": 0.35,
-            "COPY_MIN_HIST_WIN_RATE": 0.35,
-            "COPY_MIN_RECENT_PNL": 0.0,
-            "COPY_MIN_HIST_PNL": 0.0,
-            "COPY_MIN_PROFIT_FACTOR": 0.0,
-            "COPY_MAX_FAST_FLIP_RATIO": 0.0,
-        }
-    )
-    return SimpleNamespace(**vals)
-
-
 @dataclass
 class CopyScanResult:
     leaders: list[CopyLeader]
@@ -357,33 +365,34 @@ def pick_copy_leaders(
     skip_addrs: set[str] | None = None,
     start_offset: int = 0,
 ) -> CopyScanResult:
-    """Walk 7d ROI board highest-first in waves; never re-fetch skip_addrs.
-
-    start_offset resumes after the previous wave (0..N, then N..2N, ...).
-    COPY_MAX_* of 0 = unlimited.
-    """
+    """Top COPY_BOARD_SCAN by ROI → board filters → fetch fills → auto-loosen → top COPY_TOP_N."""
+    del start_offset  # legacy param; board scan is always from rank #1
     log = logger or qualifier.log
-    want = max(1, _cfg_int(cfg, "COPY_TOP_N", 2))
-    board_n = max(want, _cfg_int(cfg, "COPY_CANDIDATE_SCAN", 1200))
-    fetch_max = max(want, _cfg_int(cfg, "COPY_FILL_FETCH_MAX", 100))
+    want = max(1, _cfg_int(cfg, "COPY_TOP_N", 5))
+    board_scan = max(want, _cfg_int(cfg, "COPY_BOARD_SCAN", 200))
+    fetch_max = max(board_scan, _cfg_int(cfg, "COPY_FILL_FETCH_MAX", 220))
     max_roi = _cfg_float(cfg, "COPY_MAX_ROI", 0.0)
     min_eq = _cfg_float(cfg, "COPY_MIN_EQUITY", 1000.0)
     sleep_s = _cfg_float(cfg, "COPY_FILL_SLEEP_S", 0.7)
     recent_d = _cfg_float(cfg, "COPY_LOOKBACK_DAYS", 7.0)
     hist_d = _cfg_float(cfg, "COPY_HISTORY_DAYS", 30.0)
     min_hold = _cfg_float(cfg, "COPY_MIN_HOLD_S", 90.0)
+    min_pass_pct = _cfg_float(cfg, "COPY_MIN_PASS_PCT", 0.10)
     now_ms = int(time.time() * 1000)
     start_hist = now_ms - int(hist_d * 86400_000)
 
     eligible: list[QualifiedWallet] = []
-    for w in pool[:board_n]:
+    for w in pool:
         if max_roi > 0 and w.rank_roi > max_roi:
             continue
         if min_eq > 0 and w.account_value < min_eq:
             continue
+        if w.rank_roi <= 0:
+            continue
         eligible.append(w)
-    # Stable order: highest ROI first, address tie-break.
     eligible.sort(key=lambda w: (-w.rank_roi, w.address.lower()))
+    board_pool = eligible[:board_scan]
+    min_pass = max(want, int(math.ceil(len(board_pool) * min_pass_pct)))
 
     kept: list[CopyLeader] = []
     seen_keep: set[str] = set()
@@ -397,86 +406,43 @@ def pick_copy_leaders(
             break
 
     skip = {a.lower() for a in (skip_addrs or set())} | seen_keep
-    offset = max(0, min(int(start_offset), len(eligible)))
-    need = want - len(kept)
 
     log.info(
-        "Copy scan wave: board=%s eligible=%s resume_idx=%s fetch_cap=%s "
-        "already_seen=%s keep=%s need=%s max_roi=%s min_eq=$%.0f window=%s",
-        min(board_n, len(pool)),
+        "Copy pick: board_top=%s eligible=%s need=%s min_pass=%s (%.0f%%) keep=%s window=%s",
+        len(board_pool),
         len(eligible),
-        offset,
-        fetch_max,
-        len(skip),
+        want,
+        min_pass,
+        min_pass_pct * 100.0,
         len(kept),
-        need,
-        "off" if max_roi <= 0 else f"{max_roi * 100.0:.0f}%",
-        min_eq,
         getattr(cfg, "RANK_WINDOW", "week"),
     )
-    if eligible:
-        last = eligible[-1]
-        head = eligible[0]
-        at = eligible[offset] if offset < len(eligible) else last
+    if board_pool:
         log.info(
-            "Copy board: head %s roi=%.1f%% | this_wave %s roi=%.1f%% (idx %s) | end roi=%.1f%%",
-            head.address[:10],
-            head.rank_roi * 100,
-            at.address[:10],
-            at.rank_roi * 100,
-            offset,
-            last.rank_roi * 100,
+            "Copy board span: #%s %s roi=%.1f%% … #%s %s roi=%.1f%%",
+            1,
+            board_pool[0].address[:10],
+            board_pool[0].rank_roi * 100,
+            len(board_pool),
+            board_pool[-1].address[:10],
+            board_pool[-1].rank_roi * 100,
         )
 
-    if need <= 0:
-        return CopyScanResult(
-            leaders=kept[:want], rejects={}, scanned=[], next_offset=offset, fetched=0
-        )
-
-    def _to_leader(
-        w: QualifiedWallet,
-        recent: FillStats,
-        history: FillStats,
-        label: str,
-        why: str,
-    ) -> CopyLeader:
-        return CopyLeader(
-            address=w.address.lower(),
-            score=score_copy_wallet(w, recent, history, cfg),
-            rank_roi=w.rank_roi,
-            rank_pnl=w.rank_pnl,
-            account_value=w.account_value,
-            recent=recent,
-            history=history,
-            reasons=[
-                f"{label}:{why}",
-                (
-                    f"fills={recent.n_fills} {recent.fills_per_day:.1f}/d "
-                    f"gap={recent.median_gap_s:.0f}s wr={recent.win_rate:.0%} "
-                    f"pf={recent.profit_factor:.2f} pnl=${recent.closed_pnl:.0f} "
-                    f"flip={recent.fast_flip_ratio:.0%}"
-                ),
-            ],
-        )
+    if len(kept) >= want:
+        return CopyScanResult(leaders=kept[:want], rejects={}, scanned=[], next_offset=0, fetched=0)
 
     analyzed: list[tuple[QualifiedWallet, FillStats, FillStats]] = []
-    new_pass: list[CopyLeader] = []
-    new_rejects: dict[str, str] = {}
     scanned: list[str] = []
+    rejects: dict[str, str] = {}
     fetch_fail = 0
     fetched = 0
-    skip_logs = 0
-    cached_hits = 0
-    idx = offset
-    wave_start = offset
 
-    while idx < len(eligible) and fetched < fetch_max and len(new_pass) < need:
-        w = eligible[idx]
-        idx += 1
+    for w in board_pool:
         addr = w.address.lower()
         if addr in skip:
-            cached_hits += 1
             continue
+        if fetched >= fetch_max:
+            break
         fills = qualifier._recent_fills(addr, start_hist)
         fetched += 1
         scanned.append(addr)
@@ -485,7 +451,8 @@ def pick_copy_leaders(
             time.sleep(sleep_s)
         if fills is None:
             fetch_fail += 1
-            new_rejects[addr] = "fills_failed"
+            rejects[addr] = f"fills_failed | {_fmt_board(w)}"
+            log.info("Copy skip [fetch] %s — fills_failed | %s", addr[:10], _fmt_board(w))
             continue
         recent = analyze_fills(
             fills, now_ms=now_ms, lookback_days=recent_d, min_hold_s=min_hold
@@ -494,119 +461,98 @@ def pick_copy_leaders(
             fills, now_ms=now_ms, lookback_days=hist_d, min_hold_s=min_hold
         )
         analyzed.append((w, recent, history))
-        ok, why = passes_copy_filters(recent, history, cfg)
-        if not ok:
-            new_rejects[addr] = why
-            if skip_logs < 15:
-                log.info(
-                    "Copy skip [strict] %s roi=%.1f%% fills=%s gap=%.0fs — %s",
-                    addr[:10],
-                    w.rank_roi * 100,
-                    recent.n_fills,
-                    recent.median_gap_s,
-                    why,
-                )
-                skip_logs += 1
-            continue
-        new_pass.append(_to_leader(w, recent, history, "strict", why))
-        log.info(
-            "Copy keep [strict] %s/%s %s roi=%.1f%% gap=%.0fs %.1f/d pnl=$%.0f",
-            len(kept) + len(new_pass),
-            want,
-            addr[:10],
-            w.rank_roi * 100,
-            recent.median_gap_s,
-            recent.fills_per_day,
-            recent.closed_pnl,
-        )
 
-    log.info(
-        "Copy strict wave: fetched=%s already_seen_skip=%s analyzed=%s passed=%s "
-        "idx %s→%s",
-        fetched,
-        cached_hits,
-        len(analyzed),
-        len(new_pass),
-        wave_start,
-        idx,
-    )
+    steps = _loosen_steps(cfg)
+    passers: list[CopyLeader] = []
+    used_label = "strict"
+    skip_logs = 0
 
-    label = "strict"
-    if len(kept) + len(new_pass) < want and analyzed:
-        log.warning(
-            "Copy strict wave %s/%s — relaxed pass on this wave's fills only",
-            len(kept) + len(new_pass),
-            want,
-        )
-        relaxed_cfg = _relaxed_copy_cfg(cfg)
-        skip_logs = 0
+    for si, step in enumerate(steps):
+        label = f"tier{si}"
+        passers = []
         for w, recent, history in analyzed:
             addr = w.address.lower()
-            if addr in seen_keep or any(x.address == addr for x in new_pass):
+            ok_b, why_b = passes_copy_board(w, cfg, yield_mult=step["yield_mult"])
+            if not ok_b:
+                rejects[addr] = f"[{label}] {why_b}"
+                if skip_logs < 25:
+                    log.info("Copy skip [%s] %s — %s", label, addr[:10], why_b)
+                    skip_logs += 1
                 continue
-            ok, why = passes_copy_filters(recent, history, relaxed_cfg)
-            if not ok:
-                new_rejects[addr] = why
-                if skip_logs < 10:
+            ok_f, why_f = passes_copy_fills(
+                recent,
+                history,
+                cfg,
+                min_gap=step["min_gap"],
+                hyper_fpd=step["hyper_fpd"],
+            )
+            if not ok_f:
+                rejects[addr] = f"[{label}] {why_f}"
+                if skip_logs < 25:
                     log.info(
-                        "Copy skip [relaxed] %s roi=%.1f%% fills=%s gap=%.0fs — %s",
+                        "Copy skip [%s] %s — %s | %s",
+                        label,
                         addr[:10],
-                        w.rank_roi * 100,
-                        recent.n_fills,
-                        recent.median_gap_s,
-                        why,
+                        why_f,
+                        _fmt_board(w),
                     )
                     skip_logs += 1
                 continue
-            new_pass.append(_to_leader(w, recent, history, "relaxed", why))
-            new_rejects.pop(addr, None)
-            if len(kept) + len(new_pass) >= want:
-                break
-        label = "relaxed"
+            passers.append(
+                CopyLeader(
+                    address=addr,
+                    score=score_copy_wallet(w, recent, history, cfg),
+                    rank_roi=w.rank_roi,
+                    rank_pnl=w.rank_pnl,
+                    account_value=w.account_value,
+                    recent=recent,
+                    history=history,
+                    reasons=[f"{label}:ok", _fmt_board(w), _fmt_fills(recent)],
+                )
+            )
+        used_label = label
+        log.info(
+            "Copy tier %s: yield_mult=%.2f min_gap=%.0fs pass=%s/%s (need>=%s)",
+            si,
+            step["yield_mult"],
+            step["min_gap"],
+            len(passers),
+            len(analyzed),
+            min_pass,
+        )
+        if len(passers) >= min_pass:
+            break
 
-    leaders = (kept + new_pass)[:want]
-    leaders.sort(key=lambda x: (-x.rank_roi, x.address))
-    exhausted = idx >= len(eligible)
-    next_offset = idx  # always advance — next wave starts here
+    passers.sort(key=lambda x: (-x.rank_roi, x.address))
+    new_pick = passers[: max(0, want - len(kept))]
+    leaders = (kept + new_pick)[:want]
+
     log.info(
-        "Copy scan done [%s]: fetched=%s fetch_fail=%s kept=%s new=%s picked=%s "
-        "scanned=+-%s rejects=+-%s next_idx=%s/%s exhausted=%s",
-        label,
+        "Copy scan done [%s]: fetched=%s fail=%s analyzed=%s pass=%s picked=%s/%s",
+        used_label,
         fetched,
         fetch_fail,
-        len(kept),
-        len(new_pass),
+        len(analyzed),
+        len(passers),
         len(leaders),
-        len(scanned),
-        len(new_rejects),
-        next_offset,
-        len(eligible),
-        exhausted,
+        want,
     )
     for j, ld in enumerate(leaders, 1):
         log.info(
-            "  copy #%s %s score=%.1f roi=%.1f%% wr=%.0f%% pf=%.2f pnl=$%.0f "
-            "%.1f/d gap=%.0fm flip=%.0f%% hist_wr=%.0f%% hist_pnl=$%.0f",
+            "  copy #%s %s roi=%.1f%% %s",
             j,
             ld.address[:10],
-            ld.score,
             ld.rank_roi * 100,
-            ld.recent.win_rate * 100,
-            ld.recent.profit_factor,
-            ld.recent.closed_pnl,
-            ld.recent.fills_per_day,
-            ld.recent.median_gap_s / 60.0,
-            ld.recent.fast_flip_ratio * 100,
-            ld.history.win_rate * 100,
-            ld.history.closed_pnl,
+            ld.reasons[-1] if ld.reasons else "",
         )
+
     return CopyScanResult(
         leaders=leaders,
-        rejects=new_rejects,
+        rejects=rejects,
         scanned=scanned,
-        next_offset=next_offset,
+        next_offset=0,
         fetched=fetched,
-        exhausted=exhausted,
+        exhausted=True,
     )
 
 

@@ -1391,7 +1391,7 @@ class PlanTests(unittest.TestCase):
 
 
 class CopyModeTests(unittest.TestCase):
-    def test_copy_scan_resumes_past_rejects(self) -> None:
+    def test_copy_picks_top_roi_from_board(self) -> None:
         import time
         from types import SimpleNamespace
         from unittest.mock import MagicMock
@@ -1400,13 +1400,12 @@ class CopyModeTests(unittest.TestCase):
         from pmf.types import QualifiedWallet
 
         pool = [
-            QualifiedWallet("0xaaa0000000000000000000000000000000000001", 5_000, 100, 5.0, 0, 0, 5.0),
-            QualifiedWallet("0xbbb0000000000000000000000000000000000002", 5_000, 90, 4.0, 0, 0, 4.0),
-            QualifiedWallet("0xccc0000000000000000000000000000000000003", 5_000, 80, 3.0, 0, 0, 3.0),
+            QualifiedWallet("0xaaa0000000000000000000000000000000000001", 5_000, 100, 5.0, 100_000, 0, 5.0),
+            QualifiedWallet("0xbbb0000000000000000000000000000000000002", 5_000, 90, 4.0, 100_000, 0, 4.0),
+            QualifiedWallet("0xccc0000000000000000000000000000000000003", 5_000, 80, 3.0, 100_000, 0, 3.0),
             QualifiedWallet("0xddd0000000000000000000000000000000000004", 5_000, 70, 2.0, 0, 0, 2.0),
         ]
         now_ms = int(time.time() * 1000)
-        # Scalper tape: many fills, 0s gaps → rejected by min_gap.
         scalpy = [
             {
                 "time": now_ms - i * 100,
@@ -1417,7 +1416,6 @@ class CopyModeTests(unittest.TestCase):
             }
             for i in range(30)
         ]
-        # Copyable tape: ~10m gaps.
         good = [
             {
                 "time": now_ms - i * 600_000,
@@ -1432,61 +1430,103 @@ class CopyModeTests(unittest.TestCase):
         class _Q:
             def __init__(self) -> None:
                 self.log = MagicMock()
-                self.calls: list[str] = []
 
             def _recent_fills(self, address: str, start_ms: int):
-                self.calls.append(address.lower())
-                # First two addresses are HFT; later ones are copyable.
                 if address.lower() in (pool[0].address, pool[1].address):
                     return list(scalpy)
+                if address.lower() == pool[3].address:
+                    return list(good)
                 return list(good)
 
         cfg = SimpleNamespace(
             COPY_TOP_N=1,
-            COPY_CANDIDATE_SCAN=10,
-            COPY_FILL_FETCH_MAX=2,
+            COPY_BOARD_SCAN=4,
+            COPY_MIN_PASS_PCT=0.25,
+            COPY_FILL_FETCH_MAX=10,
             COPY_MAX_ROI=0.0,
             COPY_MIN_EQUITY=0.0,
             COPY_FILL_SLEEP_S=0.0,
             COPY_LOOKBACK_DAYS=7.0,
             COPY_HISTORY_DAYS=30.0,
             COPY_MIN_HOLD_S=90.0,
+            COPY_MIN_BOARD_VOLUME=1.0,
+            COPY_MIN_PNL_VOLUME_RATIO=0.00005,
             COPY_MIN_FILLS=10,
-            COPY_MAX_FILLS=0,
             COPY_MIN_MEDIAN_GAP_S=90.0,
-            COPY_MAX_MEDIAN_GAP_S=0.0,
-            COPY_MIN_FILLS_PER_DAY=1.0,
-            COPY_MAX_FILLS_PER_DAY=0.0,
-            COPY_MIN_WIN_RATE=0.0,
-            COPY_MIN_HIST_WIN_RATE=0.0,
             COPY_MIN_RECENT_PNL=-1e9,
-            COPY_MIN_HIST_PNL=-1e9,
-            COPY_MIN_PROFIT_FACTOR=0.0,
-            COPY_MAX_FAST_FLIP_RATIO=0.0,
-            COPY_IDEAL_GAP_S=600.0,
-            COPY_IDEAL_TRADES_PER_HOUR=3.0,
             RANK_WINDOW="week",
         )
-        q1 = _Q()
-        w1 = pick_copy_leaders(pool, q1, cfg, keep=[], skip_addrs=set(), start_offset=0)
-        self.assertEqual(q1.calls, [pool[0].address, pool[1].address])
-        self.assertEqual(w1.next_offset, 2)
-        self.assertEqual(len(w1.leaders), 0)
-        self.assertIn("scalpy", " ".join(w1.rejects.values()))
+        result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set())
+        self.assertEqual(len(result.leaders), 1)
+        self.assertEqual(result.leaders[0].address, pool[2].address.lower())
+        self.assertIn("zero_volume", result.rejects[pool[3].address.lower()])
 
-        q2 = _Q()
-        w2 = pick_copy_leaders(
-            pool,
-            q2,
-            cfg,
-            keep=[],
-            skip_addrs=set(w1.scanned),
-            start_offset=w1.next_offset,
+    def test_copy_board_low_yield_rejected(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_score import passes_copy_board
+        from pmf.types import QualifiedWallet
+
+        cfg = SimpleNamespace(
+            COPY_MIN_BOARD_VOLUME=1.0,
+            COPY_MIN_PNL_VOLUME_RATIO=0.001,
         )
-        self.assertTrue(set(q2.calls).isdisjoint(set(q1.calls)))
-        self.assertEqual(q2.calls[0], pool[2].address)
-        self.assertEqual(len(w2.leaders), 1)
-        self.assertEqual(w2.leaders[0].address, pool[2].address)
+        w = QualifiedWallet("0xabc", 10_000, 100, 0.5, 1_000_000, 0, 0.5)
+        ok, why = passes_copy_board(w, cfg, yield_mult=1.0)
+        self.assertFalse(ok)
+        self.assertIn("low_pnl_yield", why)
+        self.assertIn("yield=", why)
+
+    def test_copy_auto_loosen_until_min_pass(self) -> None:
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from pmf.copy_score import pick_copy_leaders
+        from pmf.types import QualifiedWallet
+
+        pool = [
+            QualifiedWallet(f"0x{'a' * 39}{i}", 5_000, 100 - i, 5.0 - i * 0.1, 100_000, 0, 5.0)
+            for i in range(4)
+        ]
+        now_ms = int(time.time() * 1000)
+        borderline = [
+            {
+                "time": now_ms - i * 30_000,
+                "closedPnl": 5.0,
+                "fee": 0.01,
+                "coin": "BTC",
+                "side": "B" if i % 2 == 0 else "A",
+            }
+            for i in range(20)
+        ]
+
+        class _Q:
+            log = MagicMock()
+
+            def _recent_fills(self, address: str, start_ms: int):
+                return list(borderline)
+
+        cfg = SimpleNamespace(
+            COPY_TOP_N=2,
+            COPY_BOARD_SCAN=4,
+            COPY_MIN_PASS_PCT=0.5,
+            COPY_FILL_FETCH_MAX=10,
+            COPY_MAX_ROI=0.0,
+            COPY_MIN_EQUITY=0.0,
+            COPY_FILL_SLEEP_S=0.0,
+            COPY_LOOKBACK_DAYS=7.0,
+            COPY_HISTORY_DAYS=30.0,
+            COPY_MIN_HOLD_S=90.0,
+            COPY_MIN_BOARD_VOLUME=1.0,
+            COPY_MIN_PNL_VOLUME_RATIO=0.00005,
+            COPY_MIN_FILLS=10,
+            COPY_MIN_MEDIAN_GAP_S=90.0,
+            COPY_MIN_RECENT_PNL=-1e9,
+            RANK_WINDOW="week",
+        )
+        result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set())
+        self.assertGreaterEqual(len(result.leaders), 2)
 
     def test_copy_gap_zero_rejected(self) -> None:
         from types import SimpleNamespace
