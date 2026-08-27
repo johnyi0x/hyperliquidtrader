@@ -21,10 +21,9 @@ TRADE_BASKET_SIZE = 50
 
 # Copy-mode knobs (RUN_MODE=copy | copy_reverse). Crowd mode ignores these.
 # Rank top COPY_BOARD_SCAN by 7d ROI; exclude zero volume + churn; light scalper check.
-# Auto-loosen until >= COPY_MIN_PASS_PCT of board pass, then pick top COPY_TOP_N ROI.
+# Auto-loosen until COPY_TOP_N wallets pass, then pick highest ROI at that tier.
 COPY_TOP_N = 5
 COPY_BOARD_SCAN = 200
-COPY_MIN_PASS_PCT = 0.10
 COPY_REQUIRE_FULL_WATCHLIST = True
 COPY_CANDIDATE_SCAN = 4000
 COPY_FILL_FETCH_MAX = 220
@@ -108,7 +107,6 @@ _TRADE: dict = {
     "RUN_MODE": "crowd",
     "COPY_TOP_N": COPY_TOP_N,
     "COPY_BOARD_SCAN": COPY_BOARD_SCAN,
-    "COPY_MIN_PASS_PCT": COPY_MIN_PASS_PCT,
     "COPY_REQUIRE_FULL_WATCHLIST": COPY_REQUIRE_FULL_WATCHLIST,
     "COPY_CANDIDATE_SCAN": COPY_CANDIDATE_SCAN,
     "COPY_FILL_FETCH_MAX": COPY_FILL_FETCH_MAX,

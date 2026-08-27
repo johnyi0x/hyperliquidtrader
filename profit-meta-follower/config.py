@@ -33,7 +33,6 @@ RUN_MODE = "crowd"
 # --- Copy mode (RUN_MODE=copy|copy_reverse). Tune in config_profiles.py COPY_* block too. ---
 COPY_TOP_N = 5
 COPY_BOARD_SCAN = 200
-COPY_MIN_PASS_PCT = 0.10
 COPY_REQUIRE_FULL_WATCHLIST = True
 COPY_CANDIDATE_SCAN = 4000
 COPY_FILL_FETCH_MAX = 220

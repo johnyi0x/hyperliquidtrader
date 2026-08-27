@@ -81,10 +81,9 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v11",
+            "copy-v12",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
-            str(getattr(cfg, "COPY_MIN_PASS_PCT", "")),
             str(getattr(cfg, "COPY_MIN_PNL_VOLUME_RATIO", "")),
             str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
             str(getattr(cfg, "RUN_MODE", "copy")),

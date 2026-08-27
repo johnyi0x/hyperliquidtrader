@@ -1441,7 +1441,6 @@ class CopyModeTests(unittest.TestCase):
         cfg = SimpleNamespace(
             COPY_TOP_N=1,
             COPY_BOARD_SCAN=4,
-            COPY_MIN_PASS_PCT=0.25,
             COPY_FILL_FETCH_MAX=10,
             COPY_MAX_ROI=0.0,
             COPY_MIN_EQUITY=0.0,
@@ -1510,7 +1509,6 @@ class CopyModeTests(unittest.TestCase):
         cfg = SimpleNamespace(
             COPY_TOP_N=2,
             COPY_BOARD_SCAN=4,
-            COPY_MIN_PASS_PCT=0.5,
             COPY_FILL_FETCH_MAX=10,
             COPY_MAX_ROI=0.0,
             COPY_MIN_EQUITY=0.0,

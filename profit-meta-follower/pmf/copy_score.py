@@ -215,8 +215,7 @@ def _loosen_steps(cfg: Any) -> list[dict[str, float]]:
         {"yield_mult": 1.0, "min_gap": base_gap, "hyper_fpd": 800.0},
         {"yield_mult": 0.25, "min_gap": max(10.0, base_gap * 0.5), "hyper_fpd": 1200.0},
         {"yield_mult": 0.05, "min_gap": 5.0, "hyper_fpd": 2000.0},
-        {"yield_mult": 0.0, "min_gap": 2.0, "hyper_fpd": 3000.0},
-        {"yield_mult": 0.0, "min_gap": 0.0, "hyper_fpd": 0.0},
+        {"yield_mult": 0.0, "min_gap": max(5.0, base_gap * 0.25), "hyper_fpd": 2500.0},
     ]
 
 
@@ -377,7 +376,6 @@ def pick_copy_leaders(
     recent_d = _cfg_float(cfg, "COPY_LOOKBACK_DAYS", 7.0)
     hist_d = _cfg_float(cfg, "COPY_HISTORY_DAYS", 30.0)
     min_hold = _cfg_float(cfg, "COPY_MIN_HOLD_S", 90.0)
-    min_pass_pct = _cfg_float(cfg, "COPY_MIN_PASS_PCT", 0.10)
     now_ms = int(time.time() * 1000)
     start_hist = now_ms - int(hist_d * 86400_000)
 
@@ -392,7 +390,6 @@ def pick_copy_leaders(
         eligible.append(w)
     eligible.sort(key=lambda w: (-w.rank_roi, w.address.lower()))
     board_pool = eligible[:board_scan]
-    min_pass = max(want, int(math.ceil(len(board_pool) * min_pass_pct)))
 
     kept: list[CopyLeader] = []
     seen_keep: set[str] = set()
@@ -405,15 +402,16 @@ def pick_copy_leaders(
         if len(kept) >= want:
             break
 
+    min_pass = max(1, want - len(kept))
+
     skip = {a.lower() for a in (skip_addrs or set())} | seen_keep
 
     log.info(
-        "Copy pick: board_top=%s eligible=%s need=%s min_pass=%s (%.0f%%) keep=%s window=%s",
+        "Copy pick: board_top=%s eligible=%s need=%s min_pass=%s keep=%s window=%s",
         len(board_pool),
         len(eligible),
         want,
         min_pass,
-        min_pass_pct * 100.0,
         len(kept),
         getattr(cfg, "RANK_WINDOW", "week"),
     )
@@ -512,10 +510,11 @@ def pick_copy_leaders(
             )
         used_label = label
         log.info(
-            "Copy tier %s: yield_mult=%.2f min_gap=%.0fs pass=%s/%s (need>=%s)",
+            "Copy tier %s: yield_mult=%.2f min_gap=%.0fs hyper_fpd=%.0f pass=%s/%s (need>=%s)",
             si,
             step["yield_mult"],
             step["min_gap"],
+            step["hyper_fpd"],
             len(passers),
             len(analyzed),
             min_pass,
