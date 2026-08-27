@@ -68,4 +68,7 @@ def apply_profile(module_globals: dict[str, Any]) -> str:
     for key, val in overrides.items():
         module_globals[key] = val
     module_globals["PMF_PROFILE"] = name
+    run_mode = str(os.environ.get("PMF_RUN_MODE", "") or "").strip().lower()
+    if run_mode in ("crowd", "copy"):
+        module_globals["RUN_MODE"] = run_mode
     return name

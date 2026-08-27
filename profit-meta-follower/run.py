@@ -65,8 +65,9 @@ def main() -> None:
     logger = setup_logger("profit-meta", log_dir)
     research_only = bool(getattr(cfg, "RESEARCH_ONLY", False))
     logger.info(
-        "Instance profile=%s data=%s filter=%s research_only=%s",
+        "Instance profile=%s run_mode=%s data=%s filter=%s research_only=%s",
         getattr(cfg, "PMF_PROFILE", "local"),
+        getattr(cfg, "RUN_MODE", "crowd"),
         data_dir,
         getattr(cfg, "BASKET_FILTER_MODE", "off"),
         research_only,

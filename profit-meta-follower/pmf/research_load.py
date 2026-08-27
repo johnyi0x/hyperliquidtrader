@@ -630,7 +630,7 @@ def build_dataset(
         live_listed=live_listed,
         live_basket_target=live_target,
         cloud_basket_addrs=cloud_basket,
-        pool_size=max(pool_n, 50),
+        pool_size=max(pool_n, 1),
         span_days=span_days,
         source=source,
         price_engine=price_eng,

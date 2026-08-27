@@ -697,25 +697,27 @@ class BacktestTests(unittest.TestCase):
             assert ds is not None
             self.assertEqual(ds.n_ticks, 1)
             self.assertIn("BTC", ds.coin_index)
-            self.assertEqual(ds.live_basket_target, 200)
+            self.assertEqual(ds.live_basket_target, 50)
 
     def test_crowd_all_uses_full_pool(self) -> None:
         from types import SimpleNamespace
 
         from pmf.bt_replay import _crowd, _filter_snaps
 
+        basket = frozenset(f"0x{i:040x}" for i in range(50))
         ds = SimpleNamespace(
-            live_basket_target=200,
-            pool_size=200,
+            live_basket_target=50,
+            pool_size=50,
             live_holder_addrs=set(),
             holder_addrs=set(),
+            cloud_basket_addrs=basket,
         )
         holders, listed = _crowd(ds, "all")
-        self.assertEqual(listed, 200)
-        self.assertEqual(holders, set())
+        self.assertEqual(listed, 50)
+        self.assertEqual(holders, basket)
 
         snaps = [_snap(f"0x{i:040x}", 1000.0, {}, 1000.0) for i in range(200)]
-        self.assertEqual(len(_filter_snaps(snaps, set(), "all")), 200)
+        self.assertEqual(len(_filter_snaps(snaps, basket, "all", listed=50)), 50)
 
     def test_live_holders_are_first_n_in_roi_order(self) -> None:
         from pmf.research_load import holders_from_ranked_pool
@@ -1386,6 +1388,79 @@ class PlanTests(unittest.TestCase):
         managed, attempted = equity_zero.run([], set(), 0.0, 10_000.0)
         self.assertEqual(managed, set())
         self.assertFalse(attempted)
+
+
+class CopyModeTests(unittest.TestCase):
+    def test_copy_filter_rejects_scalper(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_score import FillStats, passes_copy_filters
+
+        cfg = SimpleNamespace(
+            COPY_MIN_FILLS=4,
+            COPY_MAX_FILLS=35,
+            COPY_MIN_MEDIAN_GAP_S=900.0,
+            COPY_MAX_MEDIAN_GAP_S=28800.0,
+            COPY_MIN_WIN_RATE=0.48,
+            COPY_MIN_HIST_WIN_RATE=0.42,
+            COPY_MIN_RECENT_PNL=0.0,
+            COPY_MIN_HIST_PNL=-50.0,
+        )
+        recent = FillStats(n_fills=20, median_gap_s=120.0, win_rate=0.6, closed_pnl=100.0)
+        hist = FillStats(n_fills=40, median_gap_s=300.0, win_rate=0.55, closed_pnl=200.0)
+        ok, why = passes_copy_filters(recent, hist, cfg)
+        self.assertFalse(ok)
+        self.assertIn("scalpy", why)
+
+    def test_copy_targets_from_leaders(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_exec import copy_targets_from_leaders
+        from pmf.copy_score import CopyLeader, FillStats
+        from pmf.types import WalletPos, WalletSnapshot
+
+        cfg = SimpleNamespace(
+            STALE_SNAPSHOT_S=9999.0,
+            OUR_GROSS_MARGIN_PCT=90.0,
+            MAX_MARGIN_PER_COIN_PCT=33.33,
+            COPY_MARGIN_CAP_PCT=100.0,
+            COPY_MAX_POSITIONS=3,
+            OUR_MIN_LEVERAGE=2,
+            OUR_MAX_LEVERAGE=20,
+            DEX_SCOPE="include",
+            ALLOW_COINS=(),
+            DENY_COINS=(),
+        )
+        ld = CopyLeader(
+            address="0xabc",
+            score=10.0,
+            rank_roi=0.2,
+            rank_pnl=1000.0,
+            account_value=10_000.0,
+            recent=FillStats(win_rate=0.6),
+        )
+        snap = WalletSnapshot(
+            address="0xabc",
+            account_value=10_000.0,
+            positions=[
+                WalletPos(
+                    coin="BTC",
+                    side="long",
+                    size=1.0,
+                    notional=3000.0,
+                    entry_px=100.0,
+                    leverage=10,
+                    isolated=False,
+                    conviction=0.3,
+                )
+            ],
+            fetched_at=1000.0,
+            fingerprint="x",
+        )
+        targets = copy_targets_from_leaders([ld], [snap], cfg, now=1001.0)
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].coin, "BTC")
+        self.assertEqual(targets[0].side, "long")
 
 
 if __name__ == "__main__":

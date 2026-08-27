@@ -78,9 +78,9 @@ def _print_results(results, ds) -> None:
             f"span={ds.span_days:.2f}d days={','.join(ds.day_labels)} source={ds.source}"
         )
         print(
-            f"Crowd: listed={ds.pool_size} (full pool) live_holders={len(ds.live_holder_addrs)}/"
-            f"{ds.live_basket_target} labeled_holders={len(ds.holder_addrs)} "
-            f"cloud_basket={len(ds.cloud_basket_addrs)}"
+            f"Crowd: gather_pool={ds.pool_size} trade_listed={ds.live_basket_target} "
+            f"live_holders={len(ds.live_holder_addrs)}/{ds.live_basket_target} "
+            f"labeled_holders={len(ds.holder_addrs)} cloud_basket={len(ds.cloud_basket_addrs)}"
         )
         print(
             f"PriceEngine: candle_coins={n_candle}/{ds.n_coins} "

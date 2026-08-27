@@ -11,31 +11,58 @@ research = gather-only (data-research/).
 
 from __future__ import annotations
 
+# =============================================================================
+# CROWD LIST SIZES — adjust here; all profiles inherit these.
+# =============================================================================
+# Wallets local/research gather into books.jsonl (full research pool).
+RESEARCH_GATHER_SIZE = 200
+# Wallets live cloud polls and backtest uses for votes / agreement %.
+TRADE_BASKET_SIZE = 50
+
+# Copy-mode knobs (RUN_MODE=copy). Crowd mode ignores these.
+COPY_TOP_N = 3
+COPY_CANDIDATE_SCAN = 120
+COPY_REFRESH_HOURS = 12.0
+COPY_RESELECT_HOURS = 24.0
+COPY_LOOKBACK_DAYS = 7.0
+COPY_HISTORY_DAYS = 30.0
+COPY_MIN_MEDIAN_GAP_S = 900.0
+COPY_MAX_MEDIAN_GAP_S = 28800.0
+COPY_MIN_FILLS = 4
+COPY_MAX_FILLS = 35
+COPY_MIN_WIN_RATE = 0.48
+COPY_MIN_HIST_WIN_RATE = 0.42
+COPY_MIN_RECENT_PNL = 0.0
+COPY_MIN_HIST_PNL = -50.0
+COPY_MAX_POSITIONS = 3
+COPY_MIN_FRESH_LEADERS_PCT = 0.67
+COPY_IDEAL_GAP_S = 7200.0
+
 # Live trading — cloud only. Leave alone while Railway is live.
-# Cloud _TRADE last tuned: 2026-08-27 03:50 UTC strategy=crowd_dump_all score=24.321782809242592 ret=41.45447486243077%
+# Cloud _TRADE last tuned: 2026-08-27 05:08 UTC strategy=cloud_all score=-16.036601627936605 ret=4.991863669691288%
 _TRADE: dict = {
     "BASKET_FILTER_MODE": 'off',
     "MAX_BOOK_CHANGES_PER_HOUR": 6,
-    "FLOW_EMA_ALPHA": 0.36,
+    "FLOW_EMA_ALPHA": 0.28,
     "OPEN_CONFIRM_S": 330.0,
-    "EXIT_RAW_FLOW": -0.024,
+    "EXIT_RAW_FLOW": -0.045,
     "EXIT_AGREEMENT_GIVEBACK": 0.34,
-    "REBALANCE_COOLDOWN_S": 480.0,
+    "REBALANCE_COOLDOWN_S": 300.0,
     "STICKY_BOOK_SLOTS": True,
     "RANK_WINDOW": "week",
-    "BASKET_SIZE": 200,
-    "CANDIDATE_POOL": 200,
+    "BASKET_SIZE": TRADE_BASKET_SIZE,
+    "CANDIDATE_POOL": TRADE_BASKET_SIZE,
     "RESEARCH_DATA_ENABLED": False,
     "RESEARCH_ONLY": False,
-    "BACKTEST_LIVE_STRATEGY": 'crowd_dump_all',
-    "CONV_GIVEBACK": 0.36,
+    "BACKTEST_LIVE_STRATEGY": 'cloud_all',
+    "CONV_GIVEBACK": 0.38,
     "EXIT_AVG_CONVICTION": 0.024,
-    "EXIT_FLOW": -0.015,
-    "EXIT_SIDE_AGREEMENT": 0.04,
-    "LIVE_CANDLE_SEED": True,
-    "MIN_AVG_CONVICTION": 0.028,
-    "MIN_ENTRY_FLOW": 0.001,
-    "MIN_SIDE_AGREEMENT": 0.06,
+    "EXIT_FLOW": -0.013,
+    "EXIT_SIDE_AGREEMENT": 0.055,
+    "LIVE_CANDLE_SEED": False,
+    "MIN_AVG_CONVICTION": 0.04,
+    "MIN_ENTRY_FLOW": 0.006,
+    "MIN_SIDE_AGREEMENT": 0.12,
     "LIVE_CANDLES_PER_TICK": 1,
     "LIVE_CANDLE_BARS_15M": 64,
     "LIVE_CANDLE_BARS_1H": 48,
@@ -57,6 +84,25 @@ _TRADE: dict = {
     "DUMP_LOOKBACK_S": 1350.0,
     "DUMP_RANGE_PCT": -0.04,
     "DUMP_RET_PCT": -0.03,
+    # Copy mode — enable with PMF_RUN_MODE=copy on deploy (crowd unchanged).
+    "RUN_MODE": "crowd",
+    "COPY_TOP_N": COPY_TOP_N,
+    "COPY_CANDIDATE_SCAN": COPY_CANDIDATE_SCAN,
+    "COPY_REFRESH_HOURS": COPY_REFRESH_HOURS,
+    "COPY_RESELECT_HOURS": COPY_RESELECT_HOURS,
+    "COPY_LOOKBACK_DAYS": COPY_LOOKBACK_DAYS,
+    "COPY_HISTORY_DAYS": COPY_HISTORY_DAYS,
+    "COPY_MIN_MEDIAN_GAP_S": COPY_MIN_MEDIAN_GAP_S,
+    "COPY_MAX_MEDIAN_GAP_S": COPY_MAX_MEDIAN_GAP_S,
+    "COPY_MIN_FILLS": COPY_MIN_FILLS,
+    "COPY_MAX_FILLS": COPY_MAX_FILLS,
+    "COPY_MIN_WIN_RATE": COPY_MIN_WIN_RATE,
+    "COPY_MIN_HIST_WIN_RATE": COPY_MIN_HIST_WIN_RATE,
+    "COPY_MIN_RECENT_PNL": COPY_MIN_RECENT_PNL,
+    "COPY_MIN_HIST_PNL": COPY_MIN_HIST_PNL,
+    "COPY_MAX_POSITIONS": COPY_MAX_POSITIONS,
+    "COPY_MIN_FRESH_LEADERS_PCT": COPY_MIN_FRESH_LEADERS_PCT,
+    "COPY_IDEAL_GAP_S": COPY_IDEAL_GAP_S,
 }
 
 # Gather-only: crowd books first (live-parity cadence), then marks, then candles.
@@ -68,14 +114,14 @@ _GATHER: dict = {
     "RESEARCH_DATA_ENABLED": True,
     "RANK_WINDOW": "week",
     "BASKET_FILTER_MODE": "off",
-    "BASKET_SIZE": 200,
-    "CANDIDATE_POOL": 200,
-    "RESEARCH_POOL_SIZE": 200,
-    "HOLDER_SCAN_POOL": 200,
+    "BASKET_SIZE": TRADE_BASKET_SIZE,
+    "CANDIDATE_POOL": TRADE_BASKET_SIZE,
+    "RESEARCH_POOL_SIZE": RESEARCH_GATHER_SIZE,
+    "HOLDER_SCAN_POOL": 400,
     "BASKET_REFRESH_HOURS": 12.0,
     "LEADERBOARD_CACHE_HOURS": 6.0,
-    # 200 wallets × slow HL REST (~2 min/tick with market cache) needs a long stale
-    # window or coverage never climbs (8 min stale capped you at ~40% forever).
+    # Research gathers RESEARCH_GATHER_SIZE wallets; trade/backtest use TRADE_BASKET_SIZE.
+    # Long stale window so a full gather lap can finish before books drop wallets.
     "RESEARCH_WALLETS_PER_TICK": 25,
     "RESEARCH_SNAPSHOT_INTERVAL_S": 8.0,
     "RESEARCH_RECORD_INTERVAL_S": 60.0,

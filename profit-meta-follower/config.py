@@ -21,19 +21,45 @@ USE_MARKET_ORDERS = True
 MARKET_ORDER_SLIPPAGE = 0.015  # 1.5% — thin HIP-3 needs more; keep tighter than 5%
 MIN_ORDER_NOTIONAL_USD = 10.0
 
-# Do not run this at the same time as bot_live.py on this wallet
+# =============================================================================
+# RUN MODE — crowd (default) vs copy
+# =============================================================================
+# "crowd" = existing basket-consensus refine / dump / swing / mtf strategies.
+# "copy"  = pick top COPY_TOP_N wallets by fill stats + ROI, mirror their books.
+# Override at deploy: PMF_RUN_MODE=copy
+RUN_MODE = "crowd"
+
+# --- Copy mode (RUN_MODE=copy). Tune in config_profiles.py COPY_* block too. ---
+COPY_TOP_N = 3
+COPY_CANDIDATE_SCAN = 120
+COPY_REFRESH_HOURS = 12.0
+COPY_RESELECT_HOURS = 24.0
+COPY_LOOKBACK_DAYS = 7.0
+COPY_HISTORY_DAYS = 30.0
+# Activity band: reject scalpers (gap too low) and dormant wallets (gap too high).
+COPY_MIN_MEDIAN_GAP_S = 900.0
+COPY_MAX_MEDIAN_GAP_S = 28800.0
+COPY_MIN_FILLS = 4
+COPY_MAX_FILLS = 35
+COPY_MIN_WIN_RATE = 0.48
+COPY_MIN_HIST_WIN_RATE = 0.42
+COPY_MIN_RECENT_PNL = 0.0
+COPY_MIN_HIST_PNL = -50.0
+COPY_MAX_POSITIONS = 3
+COPY_MIN_FRESH_LEADERS_PCT = 0.67
+COPY_IDEAL_GAP_S = 7200.0
+
 # (two bots will fight the same positions). Same wallet is fine if THIS
 # is the only script running.
 
 # =============================================================================
 # WALLET BASKET
 # =============================================================================
-# How many qualified wallets to keep in the live basket.
-# Snapshot cost is weight 2. IP budget is 1200/min (~950 usable). 50 wallets
-# every ~15s is ~400 weight/min — under the cap. More than ~50 and books go
-# stale before we finish a lap (each REST snapshot is ~1–6s on a real link).
+# Profile overrides in config_profiles.py: RESEARCH_GATHER_SIZE vs TRADE_BASKET_SIZE.
+# How many qualified wallets live cloud polls and backtest votes use.
 BASKET_SIZE = 50
-# Score a larger pool first, then keep BASKET_SIZE. With filters off, set equal.
+# Leaderboard shortlist before audit. With filters off, research gather expands to
+# RESEARCH_POOL_SIZE automatically (see qualify.shortlist).
 CANDIDATE_POOL = 50
 BASKET_REFRESH_HOURS = 12.0
 # Reuse a cached leaderboard dump this long (avoids re-downloading 15k+ rows).
@@ -260,7 +286,7 @@ TELEMETRY_ENABLED = True
 RESEARCH_DATA_ENABLED = False
 # If True: no live orders — only leaderboard pool + books/marks/candles.
 RESEARCH_ONLY = False
-# How many top-ROI wallets to label + track for research (pre-filter).
+# How many top-ROI wallets local/research gather into books (independent of trade list).
 RESEARCH_POOL_SIZE = 200
 # Clearinghouse snapshots per tick for research wallets (match live cadence when gather-only).
 RESEARCH_WALLETS_PER_TICK = 25

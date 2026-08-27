@@ -15,6 +15,13 @@ from hyperliquid.utils import constants
 from types import SimpleNamespace
 
 from .consensus import BookEngine, build_votes, crashed_wallets, min_live_voters, min_wallets_on_coin, votes_to_targets
+from .copy_exec import copy_targets_from_leaders, min_fresh_copy_leaders
+from .copy_score import (
+    leaders_from_state,
+    leaders_to_basket,
+    leaders_to_state,
+    pick_copy_leaders,
+)
 from .leaderboard import load_leaderboard
 from .markets import MarketCache
 from .price_engine import PriceEngine
@@ -69,6 +76,20 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
         }
         for w in wallets
     ]
+
+
+def _copy_sig(cfg: Any) -> str:
+    return "|".join(
+        [
+            "copy-v1",
+            str(getattr(cfg, "COPY_TOP_N", "")),
+            str(getattr(cfg, "COPY_CANDIDATE_SCAN", "")),
+            str(getattr(cfg, "RANK_WINDOW", "")),
+            str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
+            str(getattr(cfg, "COPY_MAX_MEDIAN_GAP_S", "")),
+            str(getattr(cfg, "COPY_MIN_WIN_RATE", "")),
+        ]
+    )
 
 
 def _basket_sig(cfg: Any) -> str:
@@ -180,6 +201,174 @@ class ProfitMetaRunner:
                 [QualifiedWallet(a, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) for a in self._research_addrs]
             )
         self._last_equity: float | None = None
+
+    def _is_copy_mode(self) -> bool:
+        return str(getattr(self.cfg, "RUN_MODE", "crowd") or "crowd").strip().lower() == "copy"
+
+    def _copy_age_h(self) -> float:
+        if str(self.store.data.get("copy_rank") or "") != _copy_sig(self.cfg):
+            return 1e9
+        built = float(self.store.data.get("copy_built_at") or 0)
+        if built <= 0:
+            return 1e9
+        return (time.time() - built) / 3600.0
+
+    def _copy_leaders(self) -> list:
+        return leaders_from_state(self.store.data.get("copy_leaders") or [])
+
+    def refresh_copy_leaders_if_needed(self) -> None:
+        existing = self._copy_leaders()
+        refresh_h = float(getattr(self.cfg, "COPY_REFRESH_HOURS", 12.0) or 12.0)
+        if existing and self._copy_age_h() < refresh_h:
+            self.log.info(
+                "Using saved copy leaders (%s wallets, %.1fh old)",
+                len(existing),
+                self._copy_age_h(),
+            )
+            self.tracker.set_basket(leaders_to_basket(existing))
+            return
+
+        self.log.info("Refreshing copy-trade leaders from leaderboard")
+        rows = load_leaderboard(
+            self.data_dir / "leaderboard_cache.json",
+            float(self.cfg.LEADERBOARD_CACHE_HOURS),
+            self.log,
+        )
+        scan_n = int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 120) or 120)
+
+        class _ScanCfg:
+            def __getattr__(self, name: str) -> Any:
+                if name == "CANDIDATE_POOL":
+                    return scan_n
+                if name == "RESEARCH_DATA_ENABLED":
+                    return False
+                return getattr(self.cfg, name)
+
+        pool = shortlist(rows, _ScanCfg())
+        self.log.info("Copy shortlist %s/%s leaderboard rows", len(pool), len(rows))
+        if not pool:
+            raise RuntimeError("No wallets on copy shortlist — loosen COPY_* filters")
+        qualifier = Qualifier(self.client.info, self.log, self.cfg)
+        leaders = pick_copy_leaders(pool, qualifier, self.cfg, logger=self.log)
+        if not leaders:
+            raise RuntimeError(
+                "No wallets passed copy filters — loosen COPY_MIN_* / gap band or widen COPY_CANDIDATE_SCAN"
+            )
+        self.store.data["copy_leaders"] = leaders_to_state(leaders)
+        self.store.data["copy_built_at"] = time.time()
+        self.store.data["copy_rank"] = _copy_sig(self.cfg)
+        self.store.save()
+        self.tracker.set_basket(leaders_to_basket(leaders))
+        self.telemetry.record_event(
+            ts=time.time(),
+            kind="copy_leaders_refresh",
+            payload={
+                "count": len(leaders),
+                "leaders": [ld.address[:10] for ld in leaders],
+            },
+        )
+
+    def cycle_copy(self) -> None:
+        """Copy top-N leader books — separate from crowd consensus."""
+        now = time.time()
+        n = self.tracker.poll_some(now)
+        snaps = self.tracker.live_snapshots()
+        leaders = self._copy_leaders()
+        if not leaders:
+            self.log.warning("Copy mode — no leaders loaded yet")
+            return
+
+        try:
+            self.markets.refresh_if_needed(now, [p.coin for s in snaps for p in s.positions])
+        except Exception as exc:
+            self.log.debug("Market cache: %s", exc)
+
+        by_addr = {s.address.lower(): s for s in snaps}
+        fresh = self._fresh_count(by_addr, [ld.address for ld in leaders], now=now)
+        need = min_fresh_copy_leaders(self.cfg, len(leaders))
+        managed = set(str(x) for x in (self.store.data.get("managed_coins") or []))
+        targets = copy_targets_from_leaders(leaders, snaps, self.cfg, now=now)
+        trade_keys = [f"{t.side}:{t.coin}" for t in targets]
+
+        try:
+            if self.paper is not None:
+                marks = {c: 1.0 for c in {p.coin for s in snaps for p in s.positions}}
+                self._last_equity = self.paper.equity(marks)
+            else:
+                _, self._last_equity = self.rebalancer.current_book()
+        except Exception:
+            pass
+
+        self.telemetry.record_tick(
+            ts=now,
+            voters=fresh,
+            listed=len(leaders),
+            raw=[],
+            trade=trade_keys,
+            managed=sorted(managed),
+            equity=self._last_equity,
+        )
+        self.log.info(
+            "Copy tick snaps=%s fresh=%s/%s leaders=%s targets=%s",
+            n,
+            fresh,
+            len(leaders),
+            ", ".join(f"{ld.address[:8]}({ld.recent.win_rate:.0%})" for ld in leaders),
+            ", ".join(trade_keys) or "-",
+        )
+
+        if fresh < need:
+            self.log.info(
+                "Copy warm-up — need %s/%s fresh leader snapshots",
+                need,
+                len(leaders),
+            )
+            self.store.heartbeat({"mode": "copy", "fresh": fresh, "warm": True})
+            self._persist_tracker()
+            return
+
+        last_reb = float(self.store.data.get("last_rebalance_at") or 0)
+        result = self.rebalancer.run(targets, managed, last_reb, now)
+        if not isinstance(result, tuple) or len(result) != 2:
+            self.log.error("rebalancer.run returned %r — skipping this tick", result)
+            new_managed, attempted = managed, False
+        else:
+            new_managed, attempted = result
+        if attempted or new_managed != managed:
+            self.store.data["managed_coins"] = sorted(new_managed)
+            self.store.data["last_targets"] = [
+                {
+                    "coin": t.coin,
+                    "side": t.side,
+                    "leverage": t.leverage,
+                    "margin_pct": t.margin_pct,
+                    "conviction": t.conviction,
+                }
+                for t in targets
+            ]
+            if attempted:
+                self.store.data["last_rebalance_at"] = now
+                self.telemetry.record_event(
+                    ts=now,
+                    kind="rebalance",
+                    payload={
+                        "mode": "copy",
+                        "targets": trade_keys,
+                        "managed": sorted(new_managed),
+                        "equity": self._last_equity,
+                    },
+                )
+            self.store.save()
+            self._save_paper()
+        self._persist_tracker()
+        self.store.heartbeat(
+            {
+                "mode": "copy",
+                "fresh": fresh,
+                "targets": len(targets),
+                "managed": sorted(new_managed),
+            }
+        )
 
     def _save_paper(self) -> None:
         if self.paper is None:
@@ -451,6 +640,9 @@ class ProfitMetaRunner:
         if self.research_only:
             self.refresh_research_pool_if_needed()
             return
+        if self._is_copy_mode():
+            self.refresh_copy_leaders_if_needed()
+            return
         existing = _basket_from_state(self.store.data.get("basket") or [])
         if existing and self._basket_age_h() < float(self.cfg.BASKET_REFRESH_HOURS):
             self.log.info(
@@ -697,6 +889,9 @@ class ProfitMetaRunner:
         if self.research_only:
             self.cycle_research_only()
             return
+        if self._is_copy_mode():
+            self.cycle_copy()
+            return
         now = time.time()
         equity_baseline = dict(self.tracker.last_equity)
         # --- Live trade path only (identical whether research is on or off) ---
@@ -855,42 +1050,67 @@ class ProfitMetaRunner:
                 getattr(self.cfg, "EXIT_RAW_FLOW", None),
             )
         else:
-            spec = strategy_from_cfg(self.cfg)
-            tuned = str(getattr(self.cfg, "TUNED_STRATEGY", "") or spec.name)
-            tuned_at = float(getattr(self.cfg, "TUNED_AT", 0) or 0)
-            self.log.info(
-                "Profit-meta follower running | profile=%s paper=%s trade=%s size=%s filter=%s "
-                "strategy=%s gate=%s candles=%s research=%s scope=%s basket=%s interval=%ss "
-                "need_voters=%s enter=%.0f%% exit=%.0f%% raw_exit=%s agr_gb=%.0f%% tuned=%s",
-                getattr(self.cfg, "PMF_PROFILE", "local"),
-                bool(self.cfg.PAPER_TRADING),
-                str(getattr(self.cfg, "TRADE_MODE", "follow") or "follow"),
-                str(getattr(self.cfg, "SIZE_MODE", "fixed") or "fixed"),
-                str(getattr(self.cfg, "BASKET_FILTER_MODE", "off") or "off"),
-                spec.name,
-                spec.gate or "-",
-                "on-demand" if spec.needs_candles else "off",
-                bool(getattr(self.cfg, "RESEARCH_DATA_ENABLED", False)),
-                self.cfg.DEX_SCOPE,
-                len(self.tracker.addrs),
-                self.cfg.SNAPSHOT_INTERVAL_S,
-                min_live_voters(self.cfg),
-                float(self.cfg.MIN_SIDE_AGREEMENT) * 100.0,
-                float(getattr(self.cfg, "EXIT_SIDE_AGREEMENT", 0) or 0) * 100.0,
-                getattr(self.cfg, "EXIT_RAW_FLOW", 0),
-                float(getattr(self.cfg, "EXIT_AGREEMENT_GIVEBACK", 0) or 0) * 100.0,
-                tuned or "none",
-            )
-            if tuned_at > 0:
-                self.log.info("Tuned params loaded (saved_at=%.0f strategy=%s)", tuned_at, tuned or "cloud_refine")
+            if self._is_copy_mode():
+                self.log.info(
+                    "Copy-trade running | profile=%s paper=%s leaders=%s scan=%s "
+                    "gap=%.0f-%.0fs min_wr=%.0f%% refresh=%sh scope=%s",
+                    getattr(self.cfg, "PMF_PROFILE", "local"),
+                    bool(self.cfg.PAPER_TRADING),
+                    int(getattr(self.cfg, "COPY_TOP_N", 3) or 3),
+                    int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 120) or 120),
+                    float(getattr(self.cfg, "COPY_MIN_MEDIAN_GAP_S", 900)),
+                    float(getattr(self.cfg, "COPY_MAX_MEDIAN_GAP_S", 28800)),
+                    float(getattr(self.cfg, "COPY_MIN_WIN_RATE", 0.48)) * 100,
+                    float(getattr(self.cfg, "COPY_REFRESH_HOURS", 12)),
+                    self.cfg.DEX_SCOPE,
+                )
+            else:
+                spec = strategy_from_cfg(self.cfg)
+                tuned = str(getattr(self.cfg, "TUNED_STRATEGY", "") or spec.name)
+                tuned_at = float(getattr(self.cfg, "TUNED_AT", 0) or 0)
+                self.log.info(
+                    "Profit-meta follower running | profile=%s paper=%s trade=%s size=%s filter=%s "
+                    "strategy=%s gate=%s candles=%s research=%s scope=%s basket=%s interval=%ss "
+                    "need_voters=%s enter=%.0f%% exit=%.0f%% raw_exit=%s agr_gb=%.0f%% tuned=%s",
+                    getattr(self.cfg, "PMF_PROFILE", "local"),
+                    bool(self.cfg.PAPER_TRADING),
+                    str(getattr(self.cfg, "TRADE_MODE", "follow") or "follow"),
+                    str(getattr(self.cfg, "SIZE_MODE", "fixed") or "fixed"),
+                    str(getattr(self.cfg, "BASKET_FILTER_MODE", "off") or "off"),
+                    spec.name,
+                    spec.gate or "-",
+                    "on-demand" if spec.needs_candles else "off",
+                    bool(getattr(self.cfg, "RESEARCH_DATA_ENABLED", False)),
+                    self.cfg.DEX_SCOPE,
+                    len(self.tracker.addrs),
+                    self.cfg.SNAPSHOT_INTERVAL_S,
+                    min_live_voters(self.cfg),
+                    float(self.cfg.MIN_SIDE_AGREEMENT) * 100.0,
+                    float(getattr(self.cfg, "EXIT_SIDE_AGREEMENT", 0) or 0) * 100.0,
+                    getattr(self.cfg, "EXIT_RAW_FLOW", 0),
+                    float(getattr(self.cfg, "EXIT_AGREEMENT_GIVEBACK", 0) or 0) * 100.0,
+                    tuned or "none",
+                )
+                if tuned_at > 0:
+                    self.log.info("Tuned params loaded (saved_at=%.0f strategy=%s)", tuned_at, tuned or "cloud_refine")
         fails = 0
         while True:
             try:
                 refresh_due = (
                     self._research_pool_age_h()
                     if self.research_only
-                    else self._basket_age_h()
-                ) >= float(self.cfg.BASKET_REFRESH_HOURS)
+                    else (
+                        self._copy_age_h()
+                        if self._is_copy_mode()
+                        else self._basket_age_h()
+                    )
+                ) >= float(
+                    getattr(
+                        self.cfg,
+                        "COPY_REFRESH_HOURS" if self._is_copy_mode() else "BASKET_REFRESH_HOURS",
+                        12.0,
+                    )
+                )
                 if refresh_due:
                     try:
                         self.refresh_basket_if_needed()

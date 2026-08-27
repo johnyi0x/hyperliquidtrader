@@ -147,10 +147,14 @@ def _votes_from_compact(raw: list[dict[str, Any]], listed: int) -> list[CoinVote
 
 
 def _crowd(ds: ResearchDataset, wallet_mode: str) -> tuple[set[str], int]:
-    """Full research/trade pool — listed = pool_size (200), same as live BASKET_SIZE."""
-    listed = max(int(getattr(ds, "pool_size", 0) or 0), 1)
+    """Live-parity crowd — listed = live_basket_target (BASKET_SIZE)."""
+    listed = max(
+        int(getattr(ds, "live_basket_target", 0) or getattr(ds, "pool_size", 0) or 0),
+        1,
+    )
+    basket = getattr(ds, "cloud_basket_addrs", None) or frozenset()
     if wallet_mode == "all":
-        return set(), listed
+        return set(basket), listed
     holders = ds.live_holder_addrs or ds.holder_addrs
     return holders, listed
 
@@ -159,9 +163,17 @@ def _filter_snaps(
     snaps: list[WalletSnapshot],
     holders: set[str],
     mode: str,
+    *,
+    listed: int = 0,
 ) -> list[WalletSnapshot]:
     if mode == "holders":
         return [s for s in snaps if s.address in holders]
+    if holders:
+        out = [s for s in snaps if s.address in holders]
+        if out:
+            return out
+    if listed > 0 and len(snaps) > listed:
+        return snaps[:listed]
     return snaps
 
 
@@ -302,7 +314,7 @@ def replay_cloud_refine(
             if cached is not None:
                 raw_votes = _copy_votes(cached)
             else:
-                snaps = _filter_snaps(book.wallets, holders, wallet_mode)
+                snaps = _filter_snaps(book.wallets, holders, wallet_mode, listed=listed)
                 raw_votes = build_votes(snaps, set(), cfg, ts, listed=listed)
                 _RAW_VOTE_CACHE[vk] = _copy_votes(raw_votes)
         elif tick is not None:
