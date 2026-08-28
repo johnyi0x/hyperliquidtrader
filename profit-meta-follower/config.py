@@ -31,7 +31,7 @@ MIN_ORDER_NOTIONAL_USD = 10.0
 RUN_MODE = "crowd"
 
 # --- Copy mode (RUN_MODE=copy|copy_reverse). Tune in config_profiles.py COPY_* block too. ---
-COPY_TOP_N = 2
+COPY_TOP_N = 5
 COPY_RANK_WINDOW = "day"
 COPY_BOARD_SCAN = 200
 COPY_REQUIRE_FULL_WATCHLIST = True
