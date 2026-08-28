@@ -364,12 +364,11 @@ def pick_copy_leaders(
     skip_addrs: set[str] | None = None,
     start_offset: int = 0,
 ) -> CopyScanResult:
-    """Top COPY_BOARD_SCAN by ROI → board filters → fetch fills → auto-loosen → top COPY_TOP_N."""
-    del start_offset  # legacy param; board scan is always from rank #1
+    """Walk ROI board in waves; auto-loosen per wave; pick top COPY_TOP_N."""
     log = logger or qualifier.log
     want = max(1, _cfg_int(cfg, "COPY_TOP_N", 5))
-    board_scan = max(want, _cfg_int(cfg, "COPY_BOARD_SCAN", 200))
-    fetch_max = max(board_scan, _cfg_int(cfg, "COPY_FILL_FETCH_MAX", 220))
+    wave_size = max(1, _cfg_int(cfg, "COPY_BOARD_SCAN", 200))
+    fetch_max = max(wave_size, _cfg_int(cfg, "COPY_FILL_FETCH_MAX", 220))
     max_roi = _cfg_float(cfg, "COPY_MAX_ROI", 0.0)
     min_eq = _cfg_float(cfg, "COPY_MIN_EQUITY", 1000.0)
     sleep_s = _cfg_float(cfg, "COPY_FILL_SLEEP_S", 0.7)
@@ -389,7 +388,6 @@ def pick_copy_leaders(
             continue
         eligible.append(w)
     eligible.sort(key=lambda w: (-w.rank_roi, w.address.lower()))
-    board_pool = eligible[:board_scan]
 
     kept: list[CopyLeader] = []
     seen_keep: set[str] = set()
@@ -402,42 +400,58 @@ def pick_copy_leaders(
         if len(kept) >= want:
             break
 
-    min_pass = max(1, want - len(kept))
+    slots = max(0, want - len(kept))
+    min_pass = max(1, slots) if slots > 0 else 0
+    offset = max(0, min(int(start_offset), len(eligible)))
+    wave_end = min(len(eligible), offset + wave_size)
+    wave = eligible[offset:wave_end]
 
     skip = {a.lower() for a in (skip_addrs or set())} | seen_keep
 
     log.info(
-        "Copy pick: board_top=%s eligible=%s need=%s min_pass=%s keep=%s window=%s",
-        len(board_pool),
+        "Copy pick: wave=%s..%s eligible=%s need=%s min_pass=%s keep=%s window=%s",
+        offset + 1 if wave else offset,
+        wave_end,
         len(eligible),
         want,
         min_pass,
         len(kept),
         copy_rank_window(cfg),
     )
-    if board_pool:
+    if wave:
         log.info(
             "Copy board span: #%s %s roi=%.1f%% … #%s %s roi=%.1f%%",
-            1,
-            board_pool[0].address[:10],
-            board_pool[0].rank_roi * 100,
-            len(board_pool),
-            board_pool[-1].address[:10],
-            board_pool[-1].rank_roi * 100,
+            offset + 1,
+            wave[0].address[:10],
+            wave[0].rank_roi * 100,
+            wave_end,
+            wave[-1].address[:10],
+            wave[-1].rank_roi * 100,
         )
 
     if len(kept) >= want:
-        return CopyScanResult(leaders=kept[:want], rejects={}, scanned=[], next_offset=0, fetched=0)
+        return CopyScanResult(
+            leaders=kept[:want],
+            rejects={},
+            scanned=[],
+            next_offset=offset,
+            fetched=0,
+            exhausted=wave_end >= len(eligible),
+        )
 
     analyzed: list[tuple[QualifiedWallet, FillStats, FillStats]] = []
     scanned: list[str] = []
     rejects: dict[str, str] = {}
     fetch_fail = 0
     fetched = 0
+    cached_hits = 0
+    idx = offset
 
-    for w in board_pool:
+    for w in wave:
         addr = w.address.lower()
+        idx += 1
         if addr in skip:
+            cached_hits += 1
             continue
         if fetched >= fetch_max:
             break
@@ -470,6 +484,8 @@ def pick_copy_leaders(
         passers = []
         for w, recent, history in analyzed:
             addr = w.address.lower()
+            if addr in seen_keep:
+                continue
             ok_b, why_b = passes_copy_board(w, cfg, yield_mult=step["yield_mult"])
             if not ok_b:
                 rejects[addr] = f"[{label}] {why_b}"
@@ -519,17 +535,23 @@ def pick_copy_leaders(
             len(analyzed),
             min_pass,
         )
-        if len(passers) >= min_pass:
+        if slots <= 0 or len(passers) >= min_pass:
             break
 
     passers.sort(key=lambda x: (-x.rank_roi, x.address))
-    new_pick = passers[: max(0, want - len(kept))]
+    new_pick = passers[:slots]
     leaders = (kept + new_pick)[:want]
+    next_offset = idx if fetched > 0 or cached_hits > 0 else wave_end
+    exhausted = next_offset >= len(eligible)
 
     log.info(
-        "Copy scan done [%s]: fetched=%s fail=%s analyzed=%s pass=%s picked=%s/%s",
+        "Copy scan done [%s]: wave_idx=%s→%s fetched=%s skip=%s fail=%s "
+        "analyzed=%s pass=%s picked=%s/%s",
         used_label,
+        offset,
+        next_offset,
         fetched,
+        cached_hits,
         fetch_fail,
         len(analyzed),
         len(passers),
@@ -549,9 +571,9 @@ def pick_copy_leaders(
         leaders=leaders,
         rejects=rejects,
         scanned=scanned,
-        next_offset=0,
+        next_offset=next_offset,
         fetched=fetched,
-        exhausted=True,
+        exhausted=exhausted,
     )
 
 

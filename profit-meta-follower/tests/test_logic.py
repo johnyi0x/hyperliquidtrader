@@ -1460,6 +1460,69 @@ class CopyModeTests(unittest.TestCase):
         self.assertEqual(result.leaders[0].address, pool[2].address.lower())
         self.assertIn("zero_volume", result.rejects[pool[3].address.lower()])
 
+    def test_copy_scan_advances_wave_when_incomplete(self) -> None:
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from pmf.copy_score import pick_copy_leaders
+        from pmf.types import QualifiedWallet
+
+        pool = [
+            QualifiedWallet(f"0x{'a' * 39}{i}", 5_000, 100 - i, 5.0 - i * 0.1, 100_000, 0, 5.0)
+            for i in range(6)
+        ]
+        now_ms = int(time.time() * 1000)
+        good = [
+            {
+                "time": now_ms - i * 600_000,
+                "closedPnl": 10.0,
+                "fee": 0.1,
+                "coin": "BTC",
+                "side": "B" if i % 2 == 0 else "A",
+            }
+            for i in range(20)
+        ]
+
+        class _Q:
+            log = MagicMock()
+
+            def _recent_fills(self, address: str, start_ms: int):
+                return list(good)
+
+        cfg = SimpleNamespace(
+            COPY_TOP_N=5,
+            COPY_BOARD_SCAN=2,
+            COPY_FILL_FETCH_MAX=10,
+            COPY_MAX_ROI=0.0,
+            COPY_MIN_EQUITY=0.0,
+            COPY_FILL_SLEEP_S=0.0,
+            COPY_LOOKBACK_DAYS=7.0,
+            COPY_HISTORY_DAYS=30.0,
+            COPY_MIN_HOLD_S=90.0,
+            COPY_MIN_BOARD_VOLUME=1.0,
+            COPY_MIN_PNL_VOLUME_RATIO=0.00005,
+            COPY_MIN_FILLS=10,
+            COPY_MIN_MEDIAN_GAP_S=90.0,
+            COPY_MIN_RECENT_PNL=-1e9,
+            RANK_WINDOW="week",
+        )
+        w1 = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set(), start_offset=0)
+        self.assertEqual(w1.next_offset, 2)
+        self.assertEqual(len(w1.leaders), 2)
+
+        w2 = pick_copy_leaders(
+            pool,
+            _Q(),
+            cfg,
+            keep=w1.leaders,
+            skip_addrs=set(w1.scanned),
+            start_offset=w1.next_offset,
+        )
+        self.assertEqual(w2.next_offset, 4)
+        self.assertEqual(len(w2.leaders), 4)
+        self.assertTrue(set(w2.scanned).isdisjoint(set(w1.scanned)))
+
     def test_copy_board_low_yield_rejected(self) -> None:
         from types import SimpleNamespace
 
