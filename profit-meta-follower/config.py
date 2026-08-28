@@ -66,6 +66,7 @@ COPY_MIN_FRESH_LEADERS_PCT = 0.5
 COPY_IDEAL_GAP_S = 600.0
 COPY_REBALANCE_COOLDOWN_S = 45.0
 COPY_FILL_SLEEP_S = 0.7
+HL_API_TIMEOUT_S = 30.0
 
 # (two bots will fight the same positions). Same wallet is fine if THIS
 # is the only script running.

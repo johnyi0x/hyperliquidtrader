@@ -81,7 +81,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v15",
+            "copy-v16",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
@@ -408,6 +408,7 @@ class ProfitMetaRunner:
             offset = 0
 
         skip = self._copy_reject_addrs()
+        old_leader_addrs = {ld.address.lower() for ld in existing}
         # If cursor past board end, restart from head but still skip already-seen addrs
         # (picks up new high-ROI wallets after leaderboard churn).
         if offset >= len(pool):
@@ -455,6 +456,14 @@ class ProfitMetaRunner:
             return
 
         ready = (not require_full) or (len(leaders) >= want)
+        new_leader_addrs = {ld.address.lower() for ld in leaders}
+        if ready and old_leader_addrs and old_leader_addrs != new_leader_addrs:
+            self.log.info(
+                "Copy leaders changed (%s→%s wallets) — clearing managed_coins for resync",
+                len(old_leader_addrs),
+                len(new_leader_addrs),
+            )
+            self.store.data["managed_coins"] = []
         self.store.data["copy_leaders"] = leaders_to_state(leaders)
         self.store.data["copy_ready"] = ready
         if ready:
@@ -536,13 +545,19 @@ class ProfitMetaRunner:
             reverse=self._copy_reverse(),
         )
         trade_keys = [f"{t.side}:{t.coin}" for t in targets]
+        our_keys: list[str] = []
 
         try:
             if self.paper is not None:
                 marks = {c: 1.0 for c in {p.coin for s in snaps for p in s.positions}}
                 self._last_equity = self.paper.equity(marks)
+                our_keys = [f"{p.side}:{p.coin}" for p in self.paper.positions.values()]
+                managed |= set(self.paper.positions.keys())
             else:
-                _, self._last_equity = self.rebalancer.current_book()
+                ours, self._last_equity = self.rebalancer.current_book()
+                our_keys = [f"{p.side}:{p.coin}" for p in ours]
+                # Copy mode: flatten any live position not in current leader targets.
+                managed |= {p.coin for p in ours}
         except Exception:
             pass
 
@@ -556,13 +571,14 @@ class ProfitMetaRunner:
             equity=self._last_equity,
         )
         self.log.info(
-            "Copy tick mode=%s snaps=%s fresh=%s/%s leaders=%s targets=%s",
+            "Copy tick mode=%s snaps=%s fresh=%s/%s leaders=%s targets=%s ours=%s",
             "reverse" if self._copy_reverse() else "follow",
             n,
             fresh,
             len(leaders),
             ", ".join(f"{ld.address[:8]}({ld.recent.win_rate:.0%})" for ld in leaders),
             ", ".join(trade_keys) or "-",
+            ", ".join(our_keys) or "-",
         )
 
         if fresh < need:
@@ -1351,6 +1367,7 @@ class ProfitMetaRunner:
                 if tuned_at > 0:
                     self.log.info("Tuned params loaded (saved_at=%.0f strategy=%s)", tuned_at, tuned or "cloud_refine")
         fails = 0
+        last_alive_log = 0.0
         while True:
             try:
                 refresh_due = (
@@ -1375,6 +1392,15 @@ class ProfitMetaRunner:
                         self.log.error("Pool/basket refresh failed (keeping old): %s", exc)
                 self.cycle()
                 fails = 0
+                if self._is_copy_mode():
+                    now_alive = time.time()
+                    if now_alive - last_alive_log >= 300.0:
+                        self.log.info(
+                            "Copy loop alive equity=$%.2f leaders=%s",
+                            float(self._last_equity or 0),
+                            len(self._copy_leaders()),
+                        )
+                        last_alive_log = now_alive
             except Exception as exc:
                 fails += 1
                 delay = min(20.0, 4.0 * (2 ** min(fails, 3)))
@@ -1392,13 +1418,14 @@ def build_live_client(
 ) -> HyperliquidClient:
     use_testnet = bool(cfg.USE_TESTNET) and not bool(cfg.PAPER_TRADING)
     base_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
+    api_timeout_s = float(getattr(cfg, "HL_API_TIMEOUT_S", 30.0) or 30.0)
     guard = RequestGuard(
         min_interval_s=0.12,
         max_429_retries=8,
         logger=logger,
         shared_budget=default_shared_budget(),
     )
-    info = ThrottledInfo(base_url, skip_ws=True, guard=guard)
+    info = ThrottledInfo(base_url, skip_ws=True, guard=guard, timeout=api_timeout_s)
     try:
         named = set(list_perp_dex_names(info))
     except Exception:
@@ -1411,4 +1438,5 @@ def build_live_client(
         logger=logger,
         use_testnet=use_testnet,
         sdk_perp_dexs=sdk,
+        api_timeout_s=float(getattr(cfg, "HL_API_TIMEOUT_S", 30.0) or 30.0),
     )

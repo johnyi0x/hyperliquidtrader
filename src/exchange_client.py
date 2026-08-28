@@ -62,6 +62,7 @@ class HyperliquidClient:
         perp_dex: str | None = None,
         market: MarketSpec | None = None,
         sdk_perp_dexs: list[str] | None = None,
+        api_timeout_s: float = 30.0,
     ) -> None:
         self.address = wallet_address
         self.logger = logger
@@ -86,7 +87,9 @@ class HyperliquidClient:
         self._candle_cache_interval: str | None = None
         self._candle_cache_bucket: int | None = None
         self._candle_cache_rows: list[dict] = []
-        bootstrap_info = ThrottledInfo(base_url, skip_ws=True, guard=self._hl_guard)
+        bootstrap_info = ThrottledInfo(
+            base_url, skip_ws=True, guard=self._hl_guard, timeout=api_timeout_s
+        )
         if market is None:
             market = resolve_market(bootstrap_info, coin, perp_dex)
         self.market = market
@@ -100,6 +103,7 @@ class HyperliquidClient:
             skip_ws=True,
             guard=self._hl_guard,
             perp_dexs=sdk_perp_dexs,
+            timeout=api_timeout_s,
         )
         self.exchange = Exchange(
             account,

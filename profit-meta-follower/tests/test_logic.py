@@ -1391,6 +1391,28 @@ class PlanTests(unittest.TestCase):
 
 
 class CopyModeTests(unittest.TestCase):
+    def test_copy_managed_includes_open_positions_for_flatten(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.rebalancer import plan_actions
+        from pmf.types import OurPos, TargetPos
+
+        cfg = SimpleNamespace(
+            MANAGED_ONLY=True,
+            FLATTEN_WHEN_DROPPED=True,
+            REBALANCE_DRIFT_PCT=35.0,
+            MAX_ACTIONS_PER_CYCLE=10,
+        )
+        ours = [
+            OurPos("BTC", "long", 1, 1000, 100, 5),
+            OurPos("ETH", "short", 1, 500, 100, 5),
+        ]
+        targets = [TargetPos("BTC", "long", 5, 18.0, 1.0), TargetPos("SOL", "short", 5, 18.0, -1.0)]
+        # ETH not in stored managed — copy mode must still plan a close.
+        acts = plan_actions(ours, targets, 5000, cfg, managed={"BTC", "ETH"})
+        closed = {a.coin for a in acts if a.kind == "close"}
+        self.assertIn("ETH", closed)
+
     def test_copy_picks_top_roi_from_board(self) -> None:
         import time
         from types import SimpleNamespace

@@ -57,6 +57,7 @@ COPY_MIN_FRESH_LEADERS_PCT = 0.5
 COPY_IDEAL_GAP_S = 600.0
 COPY_REBALANCE_COOLDOWN_S = 45.0
 COPY_FILL_SLEEP_S = 0.7
+HL_API_TIMEOUT_S = 30.0
 
 # Live trading — cloud only. Leave alone while Railway is live.
 # Cloud _TRADE last tuned: 2026-08-27 05:08 UTC strategy=cloud_all score=-16.036601627936605 ret=4.991863669691288%
@@ -141,6 +142,7 @@ _TRADE: dict = {
     "COPY_IDEAL_GAP_S": COPY_IDEAL_GAP_S,
     "COPY_REBALANCE_COOLDOWN_S": COPY_REBALANCE_COOLDOWN_S,
     "COPY_FILL_SLEEP_S": COPY_FILL_SLEEP_S,
+    "HL_API_TIMEOUT_S": HL_API_TIMEOUT_S,
 }
 
 # Gather-only: crowd books first (live-parity cadence), then marks, then candles.
