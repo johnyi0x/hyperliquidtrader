@@ -1463,6 +1463,7 @@ class CopyModeTests(unittest.TestCase):
         cfg = SimpleNamespace(
             COPY_TOP_N=1,
             COPY_BOARD_SCAN=4,
+            COPY_CANDIDATE_SCAN=4,
             COPY_FILL_FETCH_MAX=10,
             COPY_MAX_ROI=0.0,
             COPY_MIN_EQUITY=0.0,
@@ -1489,7 +1490,7 @@ class CopyModeTests(unittest.TestCase):
             or pool[3].address.lower() in result.rejects
         )
 
-    def test_copy_scan_advances_wave_when_incomplete(self) -> None:
+    def test_copy_one_shot_picks_top_n_by_score(self) -> None:
         import time
         from types import SimpleNamespace
         from unittest.mock import MagicMock
@@ -1521,7 +1522,8 @@ class CopyModeTests(unittest.TestCase):
 
         cfg = SimpleNamespace(
             COPY_TOP_N=5,
-            COPY_BOARD_SCAN=2,
+            COPY_BOARD_SCAN=6,
+            COPY_CANDIDATE_SCAN=6,
             COPY_FILL_FETCH_MAX=10,
             COPY_MAX_ROI=0.0,
             COPY_MIN_EQUITY=0.0,
@@ -1540,21 +1542,10 @@ class CopyModeTests(unittest.TestCase):
             COPY_MIN_RECENT_PNL=-1e9,
             RANK_WINDOW="week",
         )
-        w1 = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set(), start_offset=0)
-        self.assertEqual(w1.next_offset, 2)
-        self.assertEqual(len(w1.leaders), 2)
-
-        w2 = pick_copy_leaders(
-            pool,
-            _Q(),
-            cfg,
-            keep=w1.leaders,
-            skip_addrs=set(w1.scanned),
-            start_offset=w1.next_offset,
-        )
-        self.assertEqual(w2.next_offset, 4)
-        self.assertEqual(len(w2.leaders), 4)
-        self.assertTrue(set(w2.scanned).isdisjoint(set(w1.scanned)))
+        result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set(), start_offset=0)
+        self.assertTrue(result.exhausted)
+        self.assertEqual(len(result.leaders), 5)
+        self.assertEqual(len(result.scanned), 6)
 
     def test_copy_board_low_yield_rejected(self) -> None:
         from types import SimpleNamespace
@@ -1572,7 +1563,7 @@ class CopyModeTests(unittest.TestCase):
         self.assertIn("low_pnl_yield", why)
         self.assertIn("yield=", why)
 
-    def test_copy_auto_loosen_until_min_pass(self) -> None:
+    def test_copy_score_picks_without_tier_pass(self) -> None:
         import time
         from types import SimpleNamespace
         from unittest.mock import MagicMock
@@ -1587,7 +1578,7 @@ class CopyModeTests(unittest.TestCase):
         now_ms = int(time.time() * 1000)
         borderline = [
             {
-                "time": now_ms - i * 120_000,
+                "time": now_ms - i * 200_000,
                 "closedPnl": 5.0,
                 "fee": 0.01,
                 "coin": "BTC",
@@ -1605,6 +1596,7 @@ class CopyModeTests(unittest.TestCase):
         cfg = SimpleNamespace(
             COPY_TOP_N=2,
             COPY_BOARD_SCAN=4,
+            COPY_CANDIDATE_SCAN=4,
             COPY_FILL_FETCH_MAX=10,
             COPY_MAX_ROI=0.0,
             COPY_MIN_EQUITY=0.0,
@@ -1618,13 +1610,14 @@ class CopyModeTests(unittest.TestCase):
             COPY_MIN_FILLS=20,
             COPY_MIN_FILLS_PER_DAY=5.0,
             COPY_MAX_FILLS_PER_DAY=0.0,
-            COPY_MIN_MEDIAN_GAP_S=180.0,
+            COPY_MIN_MEDIAN_GAP_S=90.0,
             COPY_MAX_MEDIAN_GAP_S=0.0,
-            COPY_MIN_RECENT_PNL=-1e9,
+            COPY_MIN_RECENT_PNL=1.0,
             RANK_WINDOW="week",
         )
         result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set())
-        self.assertGreaterEqual(len(result.leaders), 2)
+        self.assertTrue(result.exhausted)
+        self.assertEqual(len(result.leaders), 2)
 
     def test_copy_gap_zero_rejected(self) -> None:
         from types import SimpleNamespace

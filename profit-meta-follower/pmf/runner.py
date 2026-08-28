@@ -81,7 +81,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v18",
+            "copy-v19",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
@@ -228,9 +228,8 @@ class ProfitMetaRunner:
         cur = leaders if leaders is not None else self._copy_leaders()
         if not bool(getattr(self.cfg, "COPY_REQUIRE_FULL_WATCHLIST", True)):
             return len(cur) >= 1
-        ready_flag = self.store.data.get("copy_ready")
-        if ready_flag is False:
-            return False
+        if self.store.data.get("copy_ready") is True and len(cur) > 0:
+            return True
         return len(cur) >= want
 
     def _copy_reject_addrs(self) -> set[str]:
@@ -370,13 +369,11 @@ class ProfitMetaRunner:
             self.store.data["copy_scan_offset"] = 0
             existing = []
 
-        offset = int(self.store.data.get("copy_scan_offset") or 0)
+        offset = 0
         self.log.info(
-            "Refreshing copy-trade leaders (need full=%s want=%s have=%s next_idx=%s)",
-            require_full,
+            "Refreshing copy-trade leaders (want=%s have=%s)",
             want,
             len(existing),
-            offset,
         )
         rows = load_leaderboard(
             self.data_dir / "leaderboard_cache.json",
@@ -403,45 +400,14 @@ class ProfitMetaRunner:
             self.store.save()
             return
 
-        # Keep partial watchlist; only hunt for missing slots.
-        keep = existing if (existing and not full) else []
+        # One-shot score scan: always rescore the full shortlist.
+        keep = []
+        self.store.data["copy_rejects"] = {}
+        self.store.data["copy_scanned"] = {}
+        self.store.data["copy_scan_offset"] = 0
+        skip: set[str] = set()
         if existing and full and self._copy_age_h() >= refresh_h:
-            keep = []
-            self.store.data["copy_scan_offset"] = 0
-            # Full reselect must re-fetch top board — old reject cache caused skip=100 forever.
-            self.store.data["copy_rejects"] = {}
-            self.store.data["copy_scanned"] = {}
-            offset = 0
-            self.log.info("Copy full refresh — cleared reject/scanned cache for rescore")
-
-        skip = self._copy_reject_addrs()
-        old_leader_addrs = {ld.address.lower() for ld in existing}
-        # If cursor past board end, restart from head with a clean skip set for this pool.
-        if offset >= len(pool):
-            self.log.info(
-                "Copy cursor past board end (%s>=%s) — wrap to 0 and clear seen cache",
-                offset,
-                len(pool),
-            )
-            offset = 0
-            self.store.data["copy_rejects"] = {}
-            self.store.data["copy_scanned"] = {}
-            skip = set()
-        # If every wallet in the upcoming wave is cached-skipped, clear and rescan once.
-        elif skip and len(pool) > 0:
-            wave_n = max(1, int(getattr(self.cfg, "COPY_BOARD_SCAN", 100) or 100))
-            wave_addrs = {w.address.lower() for w in pool[offset : offset + wave_n]}
-            if wave_addrs and wave_addrs.issubset(skip):
-                self.log.warning(
-                    "Copy wave %s..%s entirely in reject cache — clearing cache to rescore",
-                    offset + 1,
-                    offset + len(wave_addrs),
-                )
-                self.store.data["copy_rejects"] = {}
-                self.store.data["copy_scanned"] = {}
-                skip = set()
-                offset = 0
-                self.store.data["copy_scan_offset"] = 0
+            self.log.info("Copy full refresh — rescore full shortlist")
 
         qualifier = Qualifier(self.client.info, self.log, self.cfg)
         result = pick_copy_leaders(
@@ -451,7 +417,7 @@ class ProfitMetaRunner:
             logger=self.log,
             keep=keep,
             skip_addrs=skip,
-            start_offset=offset,
+            start_offset=0,
         )
         self._merge_copy_rejects(result.rejects)
         self._merge_copy_scanned(result.scanned)
@@ -459,6 +425,7 @@ class ProfitMetaRunner:
         self.store.data["copy_rank"] = sig  # always — avoids false "config changed" resets
 
         leaders = result.leaders
+        old_leader_addrs = {ld.address.lower() for ld in existing}
         if not leaders:
             if existing and full:
                 self.log.warning(
@@ -478,7 +445,9 @@ class ProfitMetaRunner:
             self.store.save()
             return
 
-        ready = (not require_full) or (len(leaders) >= want)
+        ready = (not require_full) or (len(leaders) >= want) or (
+            result.exhausted and len(leaders) > 0
+        )
         new_leader_addrs = {ld.address.lower() for ld in leaders}
         if ready and old_leader_addrs and old_leader_addrs != new_leader_addrs:
             self.log.info(
@@ -499,11 +468,9 @@ class ProfitMetaRunner:
             self.store.data["copy_built_at"] = 0
             self.store.data["copy_scan_failed_at"] = time.time()
             self.log.warning(
-                "Copy watchlist INCOMPLETE %s/%s — next wave idx=%s seen=%s; retry in %.0fm",
+                "Copy watchlist INCOMPLETE %s/%s after full score scan — retry in %.0fm",
                 len(leaders),
                 want,
-                self.store.data["copy_scan_offset"],
-                len(self.store.data.get("copy_scanned") or {}),
                 retry_min,
             )
         self.store.save()

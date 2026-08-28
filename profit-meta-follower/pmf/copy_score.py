@@ -339,6 +339,45 @@ def passes_copy_filters(recent: FillStats, history: FillStats, cfg: Any) -> tupl
     return passes_copy_fills(recent, history, cfg, min_gap=gap, hyper_fpd=0.0)
 
 
+def hard_disqualify_copy(
+    wallet: QualifiedWallet,
+    recent: FillStats,
+    history: FillStats,
+    cfg: Any,
+    *,
+    holder_reason: str = "",
+) -> tuple[bool, str]:
+    """Hard gates only — soft quality issues are handled via score_copy_wallet."""
+    detail_b = _fmt_board(wallet)
+    detail_f = _fmt_fills(recent)
+    if holder_reason:
+        return False, f"holder:{holder_reason} | {detail_b}"
+
+    min_vol = _cfg_float(cfg, "COPY_MIN_BOARD_VOLUME", 1.0)
+    vol = float(wallet.rank_volume or 0)
+    pnl = float(wallet.rank_pnl or 0)
+    if vol <= 0 or (min_vol > 0 and vol < min_vol):
+        return False, f"zero_volume | {detail_b}"
+    if pnl <= 0:
+        return False, f"no_board_profit pnl=${pnl:,.0f} | {detail_b}"
+    if recent.n_fills <= 0:
+        return False, f"no_trades fills=0 | {detail_f}"
+
+    hard_min_gap = max(60.0, _cfg_float(cfg, "COPY_MIN_MEDIAN_GAP_S", 90.0))
+    if recent.n_fills >= 2 and recent.median_gap_s < hard_min_gap:
+        return False, (
+            f"too_fast_scalp gap={recent.median_gap_s:.1f}s need>={hard_min_gap:.0f}s | {detail_f}"
+        )
+
+    max_fpd = _cfg_float(cfg, "COPY_MAX_FILLS_PER_DAY", 300.0)
+    if max_fpd > 0 and recent.fills_per_day > max_fpd:
+        return False, (
+            f"hyper_fpd {recent.fills_per_day:.0f}/d cap={max_fpd:.0f}/d | {detail_f}"
+        )
+
+    return True, "ok"
+
+
 def score_copy_wallet(
     wallet: QualifiedWallet,
     recent: FillStats,
@@ -411,7 +450,28 @@ def score_copy_wallet(
     else:
         freshness = -20.0
 
-    return wr + pf + recent_pnl + hist_pnl + board_pnl + roi + activity + freshness - bait_pen
+    soft_pen = 0.0
+    min_f = max(0, _cfg_int(cfg, "COPY_MIN_FILLS", 12))
+    if min_f > 0 and recent.n_fills < min_f:
+        soft_pen += (min_f - recent.n_fills) * 2.5
+    need_fpd = _cfg_float(cfg, "COPY_MIN_FILLS_PER_DAY", 10.0)
+    if need_fpd > 0 and recent.fills_per_day < need_fpd:
+        soft_pen += (need_fpd - recent.fills_per_day) * 3.0
+    gap_max = _cfg_float(cfg, "COPY_MAX_MEDIAN_GAP_S", 2700.0)
+    if gap_max > 0 and recent.n_fills >= 2 and recent.median_gap_s > gap_max:
+        soft_pen += min(40.0, (recent.median_gap_s - gap_max) / 120.0)
+    min_yield = _cfg_float(cfg, "COPY_MIN_PNL_VOLUME_RATIO", 0.00005)
+    vol = max(float(wallet.rank_volume or 0), 1.0)
+    y = float(wallet.rank_pnl or 0) / vol
+    if min_yield > 0 and y < min_yield:
+        soft_pen += min(30.0, (min_yield - y) / max(min_yield, 1e-9) * 12.0)
+    tape_need = _cfg_float(cfg, "COPY_MIN_RECENT_PNL", 1.0)
+    if tape_need > 0 and recent.closed_pnl < tape_need:
+        soft_pen += min(35.0, (tape_need - recent.closed_pnl) * 0.05)
+
+    return (
+        wr + pf + recent_pnl + hist_pnl + board_pnl + roi + activity + freshness - bait_pen - soft_pen
+    )
 
 
 @dataclass
@@ -434,11 +494,12 @@ def pick_copy_leaders(
     skip_addrs: set[str] | None = None,
     start_offset: int = 0,
 ) -> CopyScanResult:
-    """Score top-ROI board wallets; pick best stable decent-scalp leaders."""
+    """One full pass over the ROI shortlist; pick top-N by copy-trade score."""
     log = logger or qualifier.log
     want = max(1, _cfg_int(cfg, "COPY_TOP_N", 5))
-    wave_size = max(1, _cfg_int(cfg, "COPY_BOARD_SCAN", 100))
-    fetch_max = max(wave_size, _cfg_int(cfg, "COPY_FILL_FETCH_MAX", 110))
+    board_scan = max(1, _cfg_int(cfg, "COPY_BOARD_SCAN", 100))
+    candidate_scan = max(board_scan, _cfg_int(cfg, "COPY_CANDIDATE_SCAN", board_scan))
+    fetch_max = max(candidate_scan, _cfg_int(cfg, "COPY_FILL_FETCH_MAX", candidate_scan + 10))
     max_roi = _cfg_float(cfg, "COPY_MAX_ROI", 0.0)
     min_eq = _cfg_float(cfg, "COPY_MIN_EQUITY", 1000.0)
     sleep_s = _cfg_float(cfg, "COPY_FILL_SLEEP_S", 0.7)
@@ -460,76 +521,43 @@ def pick_copy_leaders(
         eligible.append(w)
     eligible.sort(key=lambda w: (-w.rank_roi, w.address.lower()))
 
-    kept: list[CopyLeader] = []
-    seen_keep: set[str] = set()
-    for ld in keep or []:
-        addr = str(ld.address or "").lower()
-        if not addr or addr in seen_keep:
-            continue
-        kept.append(ld)
-        seen_keep.add(addr)
-        if len(kept) >= want:
-            break
-
-    slots = max(0, want - len(kept))
-    min_pass = max(1, slots) if slots > 0 else 0
-    offset = max(0, min(int(start_offset), len(eligible)))
-    wave_end = min(len(eligible), offset + wave_size)
-    wave = eligible[offset:wave_end]
-
-    skip = {a.lower() for a in (skip_addrs or set())} | seen_keep
+    scan_size = min(len(eligible), candidate_scan, fetch_max)
+    wave = eligible[:scan_size]
 
     log.info(
-        "Copy pick: wave=%s..%s eligible=%s need=%s min_pass=%s keep=%s window=%s",
-        offset + 1 if wave else offset,
-        wave_end,
+        "Copy score scan: board=%s eligible=%s want=%s window=%s",
+        scan_size,
         len(eligible),
         want,
-        min_pass,
-        len(kept),
         copy_rank_window(cfg),
     )
     if wave:
         log.info(
             "Copy board span: #%s %s roi=%.1f%% … #%s %s roi=%.1f%%",
-            offset + 1,
+            1,
             wave[0].address[:10],
             wave[0].rank_roi * 100,
-            wave_end,
+            scan_size,
             wave[-1].address[:10],
             wave[-1].rank_roi * 100,
         )
 
-    if len(kept) >= want:
-        return CopyScanResult(
-            leaders=kept[:want],
-            rejects={},
-            scanned=[],
-            next_offset=offset,
-            fetched=0,
-            exhausted=wave_end >= len(eligible),
-        )
-
-    analyzed: list[tuple[QualifiedWallet, FillStats, FillStats]] = []
+    scored: list[CopyLeader] = []
     scanned: list[str] = []
     rejects: dict[str, str] = {}
     fetch_fail = 0
     fetched = 0
-    cached_hits = 0
-    idx = offset
+    holder_n = 0
+    hard_n = 0
+    skip_logs = 0
 
     for w in wave:
         addr = w.address.lower()
-        idx += 1
-        if addr in skip:
-            cached_hits += 1
-            continue
         if fetched >= fetch_max:
             break
         fills = qualifier._recent_fills(addr, start_hist)
         fetched += 1
         scanned.append(addr)
-        skip.add(addr)
         if fetched > 1:
             time.sleep(sleep_s)
         if fills is None:
@@ -537,136 +565,64 @@ def pick_copy_leaders(
             rejects[addr] = f"fills_failed | {_fmt_board(w)}"
             log.info("Copy skip [fetch] %s — fills_failed | %s", addr[:10], _fmt_board(w))
             continue
+
         if exclude_holders:
             is_hold, hold_why = is_holder_tape(fills, now_ms, cfg)
             if is_hold:
+                holder_n += 1
                 rejects[addr] = f"holder:{hold_why} | {_fmt_board(w)}"
-                log.info(
-                    "Copy skip [holder] %s — %s | %s",
-                    addr[:10],
-                    hold_why,
-                    _fmt_board(w),
-                )
+                if skip_logs < 25:
+                    log.info(
+                        "Copy skip [holder] %s — %s | %s",
+                        addr[:10],
+                        hold_why,
+                        _fmt_board(w),
+                    )
+                    skip_logs += 1
                 continue
+
         recent = analyze_fills(
             fills, now_ms=now_ms, lookback_days=recent_d, min_hold_s=min_hold
         )
         history = analyze_fills(
             fills, now_ms=now_ms, lookback_days=hist_d, min_hold_s=min_hold
         )
-        analyzed.append((w, recent, history))
+        ok, why = hard_disqualify_copy(w, recent, history, cfg)
+        if not ok:
+            hard_n += 1
+            rejects[addr] = why
+            if skip_logs < 25:
+                log.info("Copy skip [hard] %s — %s", addr[:10], why)
+                skip_logs += 1
+            continue
 
-    # Whole wave already rejected → advance cursor so we don't spin forever.
-    if fetched == 0 and cached_hits > 0 and not analyzed:
-        next_offset = wave_end
-        log.warning(
-            "Copy wave fully cached-skip (%s) — advance idx %s→%s",
-            cached_hits,
-            offset,
-            next_offset,
-        )
-        return CopyScanResult(
-            leaders=kept[:want],
-            rejects=rejects,
-            scanned=scanned,
-            next_offset=next_offset,
-            fetched=0,
-            exhausted=next_offset >= len(eligible),
-        )
-
-    steps = _loosen_steps(cfg)
-    passers: list[CopyLeader] = []
-    used_label = "strict"
-    skip_logs = 0
-
-    for si, step in enumerate(steps):
-        label = f"tier{si}"
-        passers = []
-        for w, recent, history in analyzed:
-            addr = w.address.lower()
-            if addr in seen_keep:
-                continue
-            ok_b, why_b = passes_copy_board(w, cfg, yield_mult=step["yield_mult"])
-            if not ok_b:
-                rejects[addr] = f"[{label}] {why_b}"
-                if skip_logs < 30:
-                    log.info("Copy skip [%s] %s — %s", label, addr[:10], why_b)
-                    skip_logs += 1
-                continue
-            ok_f, why_f = passes_copy_fills(
-                recent,
-                history,
-                cfg,
-                min_gap=step["min_gap"],
-                max_gap=step.get("max_gap", 0.0),
-                min_fills=step.get("min_fills"),
-                min_fpd=step.get("min_fpd"),
-                min_tape_pnl=step.get("min_tape_pnl"),
+        score = score_copy_wallet(w, recent, history, cfg)
+        scored.append(
+            CopyLeader(
+                address=addr,
+                score=score,
+                rank_roi=w.rank_roi,
+                rank_pnl=w.rank_pnl,
+                account_value=w.account_value,
+                recent=recent,
+                history=history,
+                reasons=[
+                    f"score={score:.1f}",
+                    _fmt_board(w),
+                    _fmt_fills(recent),
+                ],
             )
-            if not ok_f:
-                rejects[addr] = f"[{label}] {why_f}"
-                if skip_logs < 30:
-                    log.info(
-                        "Copy skip [%s] %s — %s | %s",
-                        label,
-                        addr[:10],
-                        why_f,
-                        _fmt_board(w),
-                    )
-                    skip_logs += 1
-                continue
-            score = score_copy_wallet(w, recent, history, cfg)
-            passers.append(
-                CopyLeader(
-                    address=addr,
-                    score=score,
-                    rank_roi=w.rank_roi,
-                    rank_pnl=w.rank_pnl,
-                    account_value=w.account_value,
-                    recent=recent,
-                    history=history,
-                    reasons=[
-                        f"{label}:score={score:.1f}",
-                        _fmt_board(w),
-                        _fmt_fills(recent),
-                    ],
-                )
-            )
-        used_label = label
-        log.info(
-            "Copy tier %s: gap=%.0f-%.0fs fills>=%.0f fpd>=%.1f tape>=%.0f "
-            "pass=%s/%s (need>=%s)",
-            si,
-            step["min_gap"],
-            step.get("max_gap") or 0.0,
-            step.get("min_fills") or 0.0,
-            step.get("min_fpd") or 0.0,
-            step.get("min_tape_pnl") if (step.get("min_tape_pnl") or 0) > -1e8 else 0.0,
-            len(passers),
-            len(analyzed),
-            min_pass,
         )
-        if slots <= 0 or len(passers) >= min_pass:
-            break
 
-    # Best stable-scalp score first (ROI already constrained by top-100 shortlist).
-    passers.sort(key=lambda x: (-x.score, -x.rank_roi, x.address))
-    new_pick = passers[:slots]
-    leaders = (kept + new_pick)[:want]
-    next_offset = idx if fetched > 0 or cached_hits > 0 else wave_end
-    exhausted = next_offset >= len(eligible)
+    scored.sort(key=lambda x: (-x.score, -x.rank_roi, x.address))
+    leaders = scored[:want]
 
     log.info(
-        "Copy scan done [%s]: wave_idx=%s→%s fetched=%s skip=%s fail=%s "
-        "analyzed=%s pass=%s picked=%s/%s",
-        used_label,
-        offset,
-        next_offset,
+        "Copy scan done [score]: fetched=%s holders=%s hard_skip=%s scored=%s picked=%s/%s",
         fetched,
-        cached_hits,
-        fetch_fail,
-        len(analyzed),
-        len(passers),
+        holder_n,
+        hard_n,
+        len(scored),
         len(leaders),
         want,
     )
@@ -684,9 +640,9 @@ def pick_copy_leaders(
         leaders=leaders,
         rejects=rejects,
         scanned=scanned,
-        next_offset=next_offset,
+        next_offset=scan_size,
         fetched=fetched,
-        exhausted=exhausted,
+        exhausted=True,
     )
 
 
