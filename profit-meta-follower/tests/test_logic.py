@@ -1821,8 +1821,46 @@ class CopyModeTests(unittest.TestCase):
         self.assertEqual(follow[0].side, "long")
         self.assertEqual(reverse[0].side, "short")
         self.assertEqual(follow[0].coin, reverse[0].coin)
-        # Our budget slot (not whale micro-margin) — ~90% for single-pos leader.
-        self.assertGreaterEqual(follow[0].margin_pct, 20.0)
+        self.assertEqual(reverse[0].conviction, -1.0)
+        # Single leader with one position should use the full copy budget.
+        self.assertGreaterEqual(follow[0].margin_pct, 80.0)
+
+    def test_copy_budget_splits_evenly_across_targets(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_exec import fit_copy_targets_to_budget
+        from pmf.types import TargetPos
+
+        cfg = SimpleNamespace(OUR_GROSS_MARGIN_PCT=90.0, MAX_MARGIN_PER_COIN_PCT=33.33)
+        targets = [
+            TargetPos("BTC", "long", 10, 5.0, 1.0),
+            TargetPos("ETH", "short", 10, 5.0, -1.0),
+            TargetPos("SOL", "short", 10, 5.0, -1.0),
+        ]
+        out = fit_copy_targets_to_budget(targets, cfg, n_leaders=1)
+        self.assertEqual(len(out), 3)
+        self.assertAlmostEqual(sum(t.margin_pct for t in out), 90.0, places=1)
+        self.assertAlmostEqual(out[0].margin_pct, 30.0, places=2)
+
+    def test_copy_redistribute_unfilled_margin(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.copy_exec import redistribute_unfilled_copy_targets
+        from pmf.types import TargetPos
+
+        cfg = SimpleNamespace(OUR_GROSS_MARGIN_PCT=90.0, MAX_MARGIN_PER_COIN_PCT=33.33)
+        targets = [
+            TargetPos("BTC", "short", 10, 18.0, -1.0),
+            TargetPos("ETH", "short", 10, 18.0, -1.0),
+            TargetPos("SOL", "short", 10, 18.0, -1.0),
+            TargetPos("ZEC", "short", 10, 18.0, -1.0),
+            TargetPos("PUMP", "short", 10, 18.0, -1.0),
+        ]
+        out = redistribute_unfilled_copy_targets(
+            targets, {"BTC", "ETH", "PUMP"}, cfg, n_leaders=1
+        )
+        self.assertEqual(len(out), 3)
+        self.assertAlmostEqual(sum(t.margin_pct for t in out), 90.0, places=1)
 
     def test_copy_scan_cfg_shortlist(self) -> None:
         from pmf.qualify import shortlist, shortlist_copy_roi

@@ -11,9 +11,83 @@ from .copy_score import CopyLeader
 from .types import TargetPos, WalletSnapshot
 
 
-def _leader_budget_pct(cfg: Any, n_leaders: int) -> float:
+def copy_leader_budget_pct(cfg: Any, n_leaders: int) -> float:
     gross = float(getattr(cfg, "OUR_GROSS_MARGIN_PCT", 90.0) or 90.0)
     return gross / max(1, n_leaders)
+
+
+def _per_coin_margin_cap(cfg: Any) -> float:
+    gross = float(getattr(cfg, "OUR_GROSS_MARGIN_PCT", 90.0) or 90.0)
+    cap_frac = float(getattr(cfg, "MAX_MARGIN_PER_COIN_PCT", 33.33) or 33.33) / 100.0
+    return gross * cap_frac
+
+
+def fit_copy_targets_to_budget(
+    targets: list[TargetPos],
+    cfg: Any,
+    *,
+    n_leaders: int,
+) -> list[TargetPos]:
+    """Split the full copy budget evenly across targets so margin sums to ~gross %."""
+    if not targets:
+        return []
+    budget = copy_leader_budget_pct(cfg, n_leaders)
+    per_coin_cap = _per_coin_margin_cap(cfg)
+    share = budget / len(targets)
+    # With 1–2 targets the default per-coin cap (30% of equity) is too tight for copy mode.
+    per_target = share if len(targets) <= 2 else min(share, per_coin_cap)
+    out: list[TargetPos] = []
+    for t in targets:
+        out.append(
+            TargetPos(
+                coin=t.coin,
+                side=t.side,
+                leverage=t.leverage,
+                margin_pct=per_target,
+                conviction=1.0 if t.side == "long" else -1.0,
+            )
+        )
+    return out
+
+
+def redistribute_unfilled_copy_targets(
+    targets: list[TargetPos],
+    opened_coins: set[str],
+    cfg: Any,
+    *,
+    n_leaders: int,
+) -> list[TargetPos]:
+    """Move margin from targets we could not open onto positions we did open."""
+    if not targets or not opened_coins:
+        return targets
+    missing = [t for t in targets if t.coin not in opened_coins]
+    filled = [t for t in targets if t.coin in opened_coins]
+    if not missing or not filled:
+        return targets
+    budget = copy_leader_budget_pct(cfg, n_leaders)
+    per_coin_cap = _per_coin_margin_cap(cfg)
+    freed = sum(t.margin_pct for t in missing)
+    if freed <= 0:
+        return fit_copy_targets_to_budget(filled, cfg, n_leaders=n_leaders)
+    extra = freed / len(filled)
+    out: list[TargetPos] = []
+    for t in filled:
+        share = t.margin_pct + extra
+        margin = share if len(filled) <= 2 else min(share, per_coin_cap)
+        out.append(
+            TargetPos(
+                coin=t.coin,
+                side=t.side,
+                leverage=t.leverage,
+                margin_pct=margin,
+                conviction=1.0 if t.side == "long" else -1.0,
+            )
+        )
+    return out
+
+
+def _leader_budget_pct(cfg: Any, n_leaders: int) -> float:
+    return copy_leader_budget_pct(cfg, n_leaders)
 
 
 def _pos_margin_pct(pos, equity: float, budget_pct: float) -> float:
@@ -120,7 +194,8 @@ def copy_targets_from_leaders(
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     max_pos = max(1, int(getattr(cfg, "COPY_MAX_POSITIONS", 5) or 5))
-    return [t for _w, t in candidates[:max_pos]]
+    picked = [t for _w, t in candidates[:max_pos]]
+    return fit_copy_targets_to_budget(picked, cfg, n_leaders=len(leaders))
 
 
 def min_fresh_copy_leaders(cfg: Any, n_leaders: int) -> int:

@@ -15,7 +15,12 @@ from hyperliquid.utils import constants
 from types import SimpleNamespace
 
 from .consensus import BookEngine, build_votes, crashed_wallets, min_live_voters, min_wallets_on_coin, votes_to_targets
-from .copy_exec import copy_targets_from_leaders, min_fresh_copy_leaders
+from .copy_exec import (
+    copy_targets_from_leaders,
+    fit_copy_targets_to_budget,
+    min_fresh_copy_leaders,
+    redistribute_unfilled_copy_targets,
+)
 from .copy_score import (
     leaders_from_state,
     leaders_to_basket,
@@ -81,7 +86,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v19",
+            "copy-v20",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
@@ -620,6 +625,33 @@ class ProfitMetaRunner:
             new_managed, attempted = managed, False
         else:
             new_managed, attempted = result
+
+        if self.paper is None and targets:
+            unfilled = {t.coin for t in targets} - new_managed
+            if unfilled and new_managed:
+                boosted = redistribute_unfilled_copy_targets(
+                    targets,
+                    new_managed,
+                    self.cfg,
+                    n_leaders=len(leaders),
+                )
+                boosted_margin = sum(t.margin_pct for t in boosted)
+                base_margin = sum(t.margin_pct for t in targets if t.coin in new_managed)
+                if boosted_margin > base_margin + 0.05:
+                    self.log.info(
+                        "Copy boost — %s unfilled coin(s); resize %s open to use freed margin",
+                        len(unfilled),
+                        len(boosted),
+                    )
+                    try:
+                        setattr(self.cfg, "REBALANCE_COOLDOWN_S", 0.0)
+                        boost_result = self.rebalancer.run(boosted, new_managed, 0.0, now)
+                        if isinstance(boost_result, tuple) and len(boost_result) == 2:
+                            new_managed, boost_attempted = boost_result
+                            attempted = attempted or boost_attempted
+                            targets = boosted
+                    finally:
+                        setattr(self.cfg, "REBALANCE_COOLDOWN_S", saved_cd)
         if attempted or new_managed != managed:
             self.store.data["managed_coins"] = sorted(new_managed)
             self.store.data["last_targets"] = [

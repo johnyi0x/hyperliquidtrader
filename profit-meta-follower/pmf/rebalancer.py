@@ -183,6 +183,47 @@ class Rebalancer:
             return 0.0, 0.0
         return sz, sz * mark
 
+    def _scale_copy_targets_for_batch_margin(
+        self, targets: list[TargetPos], equity: float
+    ) -> list[TargetPos]:
+        mode = str(getattr(self.cfg, "RUN_MODE", "") or "").lower()
+        if mode not in ("copy", "copy_reverse") or not targets or equity <= 0:
+            return targets
+        try:
+            avail = (
+                equity
+                if self.paper is not None
+                else float(self.client.get_available_margin(force=True))
+            )
+        except Exception:
+            avail = equity * 0.9
+        gross_margin = float(self.cfg.OUR_GROSS_MARGIN_PCT) / 100.0 * equity
+        budget_margin = min(gross_margin, avail * 0.90)
+        need_margin = sum((t.margin_pct / 100.0) * equity for t in targets)
+        if need_margin <= 0 or budget_margin <= 0:
+            return targets
+        per_coin_cap = float(self.cfg.OUR_GROSS_MARGIN_PCT) * (
+            float(self.cfg.MAX_MARGIN_PER_COIN_PCT) / 100.0
+        )
+        if need_margin > budget_margin:
+            scale = budget_margin / need_margin
+        elif need_margin < budget_margin * 0.98:
+            scale = budget_margin / need_margin
+        else:
+            return targets
+        out: list[TargetPos] = []
+        for t in targets:
+            out.append(
+                TargetPos(
+                    coin=t.coin,
+                    side=t.side,
+                    leverage=t.leverage,
+                    margin_pct=min(t.margin_pct * scale, per_coin_cap),
+                    conviction=t.conviction,
+                )
+            )
+        return out
+
     def _close(self, coin: str, size: float) -> bool:
         mark = self._mark(coin)
         if self.paper is not None:
@@ -345,6 +386,7 @@ class Rebalancer:
         if equity <= 0:
             self.log.warning("Equity is 0 — skip rebalance")
             return managed, False
+        targets = self._scale_copy_targets_for_batch_margin(targets, equity)
         have = {p.coin: p for p in ours}
         actions = plan_actions(ours, targets, equity, self.cfg, managed)
         if not actions:
