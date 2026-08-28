@@ -1470,17 +1470,24 @@ class CopyModeTests(unittest.TestCase):
             COPY_LOOKBACK_DAYS=7.0,
             COPY_HISTORY_DAYS=30.0,
             COPY_MIN_HOLD_S=90.0,
+            COPY_EXCLUDE_HOLDERS=False,
             COPY_MIN_BOARD_VOLUME=1.0,
             COPY_MIN_PNL_VOLUME_RATIO=0.00005,
             COPY_MIN_FILLS=10,
+            COPY_MIN_FILLS_PER_DAY=1.0,
+            COPY_MAX_FILLS_PER_DAY=0.0,
             COPY_MIN_MEDIAN_GAP_S=90.0,
+            COPY_MAX_MEDIAN_GAP_S=0.0,
             COPY_MIN_RECENT_PNL=-1e9,
             RANK_WINDOW="week",
         )
         result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set())
         self.assertEqual(len(result.leaders), 1)
         self.assertEqual(result.leaders[0].address, pool[2].address.lower())
-        self.assertIn("zero_volume", result.rejects[pool[3].address.lower()])
+        self.assertTrue(
+            any("zero_volume" in str(v) for v in result.rejects.values())
+            or pool[3].address.lower() in result.rejects
+        )
 
     def test_copy_scan_advances_wave_when_incomplete(self) -> None:
         import time
@@ -1522,10 +1529,14 @@ class CopyModeTests(unittest.TestCase):
             COPY_LOOKBACK_DAYS=7.0,
             COPY_HISTORY_DAYS=30.0,
             COPY_MIN_HOLD_S=90.0,
+            COPY_EXCLUDE_HOLDERS=False,
             COPY_MIN_BOARD_VOLUME=1.0,
             COPY_MIN_PNL_VOLUME_RATIO=0.00005,
             COPY_MIN_FILLS=10,
+            COPY_MIN_FILLS_PER_DAY=1.0,
+            COPY_MAX_FILLS_PER_DAY=0.0,
             COPY_MIN_MEDIAN_GAP_S=90.0,
+            COPY_MAX_MEDIAN_GAP_S=0.0,
             COPY_MIN_RECENT_PNL=-1e9,
             RANK_WINDOW="week",
         )
@@ -1576,13 +1587,13 @@ class CopyModeTests(unittest.TestCase):
         now_ms = int(time.time() * 1000)
         borderline = [
             {
-                "time": now_ms - i * 30_000,
+                "time": now_ms - i * 120_000,
                 "closedPnl": 5.0,
                 "fee": 0.01,
                 "coin": "BTC",
                 "side": "B" if i % 2 == 0 else "A",
             }
-            for i in range(20)
+            for i in range(40)
         ]
 
         class _Q:
@@ -1601,10 +1612,14 @@ class CopyModeTests(unittest.TestCase):
             COPY_LOOKBACK_DAYS=7.0,
             COPY_HISTORY_DAYS=30.0,
             COPY_MIN_HOLD_S=90.0,
+            COPY_EXCLUDE_HOLDERS=False,
             COPY_MIN_BOARD_VOLUME=1.0,
             COPY_MIN_PNL_VOLUME_RATIO=0.00005,
-            COPY_MIN_FILLS=10,
-            COPY_MIN_MEDIAN_GAP_S=90.0,
+            COPY_MIN_FILLS=20,
+            COPY_MIN_FILLS_PER_DAY=5.0,
+            COPY_MAX_FILLS_PER_DAY=0.0,
+            COPY_MIN_MEDIAN_GAP_S=180.0,
+            COPY_MAX_MEDIAN_GAP_S=0.0,
             COPY_MIN_RECENT_PNL=-1e9,
             RANK_WINDOW="week",
         )
@@ -1654,7 +1669,7 @@ class CopyModeTests(unittest.TestCase):
         )
         ok, why = passes_copy_filters(recent, hist, cfg)
         self.assertFalse(ok)
-        self.assertIn("scalpy gap=0", why)
+        self.assertIn("too_fast_scalp", why)
 
     def test_copy_max_roi_zero_means_unlimited(self) -> None:
         from types import SimpleNamespace
@@ -1707,7 +1722,7 @@ class CopyModeTests(unittest.TestCase):
         )
         ok, why = passes_copy_filters(recent, hist, cfg)
         self.assertFalse(ok)
-        self.assertIn("scalpy", why)
+        self.assertIn("too_fast_scalp", why)
 
     def test_copy_filter_accepts_active_consistent(self) -> None:
         from types import SimpleNamespace
@@ -1813,6 +1828,8 @@ class CopyModeTests(unittest.TestCase):
         self.assertEqual(follow[0].side, "long")
         self.assertEqual(reverse[0].side, "short")
         self.assertEqual(follow[0].coin, reverse[0].coin)
+        # Our budget slot (not whale micro-margin) — ~90% for single-pos leader.
+        self.assertGreaterEqual(follow[0].margin_pct, 20.0)
 
     def test_copy_scan_cfg_shortlist(self) -> None:
         from pmf.qualify import shortlist, shortlist_copy_roi

@@ -147,6 +147,7 @@ class Rebalancer:
         self.cfg = cfg
         self.log = logger
         self.paper = paper
+        self._dust_skip_until: dict[str, float] = {}
 
     def _mark(self, coin: str) -> float:
         sym, dex = parse_coin_input(coin)
@@ -223,13 +224,23 @@ class Rebalancer:
             return 1.0
 
     def _open(self, t: TargetPos, equity: float) -> bool:
+        now = time.time()
+        until = float(self._dust_skip_until.get(t.coin) or 0.0)
+        if until > now:
+            return False
         try:
             sz, notional = self._size_for_target(t, equity)
         except Exception as exc:
             self.log.warning("Skip open %s — market resolve failed: %s", t.coin, exc)
+            self._dust_skip_until[t.coin] = now + 300.0
+            return False
+        if sz <= 0 or notional <= 0:
+            self.log.info("Skip open %s — size floors to 0 (dust notional)", t.coin)
+            self._dust_skip_until[t.coin] = now + 600.0
             return False
         if notional < float(self.cfg.MIN_ORDER_NOTIONAL_USD):
             self.log.info("Skip open %s — notional $%.2f below min", t.coin, notional)
+            self._dust_skip_until[t.coin] = now + 300.0
             return False
         mark = self.client.get_mark_price()
         spread = self._spread_pct()

@@ -81,12 +81,15 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v16",
+            "copy-v18",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
+            str(getattr(cfg, "COPY_CANDIDATE_SCAN", "")),
             str(getattr(cfg, "COPY_MIN_PNL_VOLUME_RATIO", "")),
             str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
+            str(getattr(cfg, "COPY_MAX_MEDIAN_GAP_S", "")),
+            str(getattr(cfg, "COPY_EXCLUDE_HOLDERS", "")),
             str(getattr(cfg, "RUN_MODE", "copy")),
         ]
     )
@@ -405,20 +408,40 @@ class ProfitMetaRunner:
         if existing and full and self._copy_age_h() >= refresh_h:
             keep = []
             self.store.data["copy_scan_offset"] = 0
+            # Full reselect must re-fetch top board — old reject cache caused skip=100 forever.
+            self.store.data["copy_rejects"] = {}
+            self.store.data["copy_scanned"] = {}
             offset = 0
+            self.log.info("Copy full refresh — cleared reject/scanned cache for rescore")
 
         skip = self._copy_reject_addrs()
         old_leader_addrs = {ld.address.lower() for ld in existing}
-        # If cursor past board end, restart from head but still skip already-seen addrs
-        # (picks up new high-ROI wallets after leaderboard churn).
+        # If cursor past board end, restart from head with a clean skip set for this pool.
         if offset >= len(pool):
             self.log.info(
-                "Copy cursor past board end (%s>=%s) — wrap to 0, still skipping %s seen",
+                "Copy cursor past board end (%s>=%s) — wrap to 0 and clear seen cache",
                 offset,
                 len(pool),
-                len(skip),
             )
             offset = 0
+            self.store.data["copy_rejects"] = {}
+            self.store.data["copy_scanned"] = {}
+            skip = set()
+        # If every wallet in the upcoming wave is cached-skipped, clear and rescan once.
+        elif skip and len(pool) > 0:
+            wave_n = max(1, int(getattr(self.cfg, "COPY_BOARD_SCAN", 100) or 100))
+            wave_addrs = {w.address.lower() for w in pool[offset : offset + wave_n]}
+            if wave_addrs and wave_addrs.issubset(skip):
+                self.log.warning(
+                    "Copy wave %s..%s entirely in reject cache — clearing cache to rescore",
+                    offset + 1,
+                    offset + len(wave_addrs),
+                )
+                self.store.data["copy_rejects"] = {}
+                self.store.data["copy_scanned"] = {}
+                skip = set()
+                offset = 0
+                self.store.data["copy_scan_offset"] = 0
 
         qualifier = Qualifier(self.client.info, self.log, self.cfg)
         result = pick_copy_leaders(
@@ -582,11 +605,36 @@ class ProfitMetaRunner:
         )
 
         if fresh < need:
-            self.log.info(
-                "Copy warm-up — need %s/%s fresh leader snapshots",
-                need,
-                len(leaders),
-            )
+            # Redeploy safety: still flatten orphaned live positions while warming up.
+            orphans = [c for c in managed if c not in {t.coin for t in targets}]
+            if orphans and self.paper is None:
+                self.log.info(
+                    "Copy warm-up — flattening %s orphan(s) while waiting %s/%s fresh",
+                    len(orphans),
+                    fresh,
+                    need,
+                )
+                saved_cd = getattr(self.cfg, "REBALANCE_COOLDOWN_S", 180.0)
+                try:
+                    setattr(self.cfg, "REBALANCE_COOLDOWN_S", 0.0)
+                    last_reb = float(self.store.data.get("last_rebalance_at") or 0)
+                    # Empty targets + managed live coins → close orphans via FLATTEN_WHEN_DROPPED.
+                    result = self.rebalancer.run([], managed, last_reb, now)
+                finally:
+                    setattr(self.cfg, "REBALANCE_COOLDOWN_S", saved_cd)
+                if isinstance(result, tuple) and len(result) == 2:
+                    new_managed, attempted = result
+                    if attempted or new_managed != managed:
+                        self.store.data["managed_coins"] = sorted(new_managed)
+                        if attempted:
+                            self.store.data["last_rebalance_at"] = now
+                        self.store.save()
+            else:
+                self.log.info(
+                    "Copy warm-up — need %s/%s fresh leader snapshots",
+                    need,
+                    len(leaders),
+                )
             self.store.heartbeat({"mode": "copy", "fresh": fresh, "warm": True})
             self._persist_tracker()
             return

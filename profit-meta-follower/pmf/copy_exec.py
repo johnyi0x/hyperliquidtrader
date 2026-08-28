@@ -67,7 +67,8 @@ def copy_targets_from_leaders(
         weight = max(0.1, ld.score)
         for pos in positions:
             coin = pos.coin
-            margin = _pos_margin_pct(pos, snap.account_value, per_pos)
+            # Size from OUR budget slot — do not shrink to a whale's tiny % of their equity.
+            margin = min(per_pos, per_coin_cap)
             if cap_copy > 0:
                 margin = min(margin, cap_copy)
             if margin <= 0:
