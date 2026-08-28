@@ -86,7 +86,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v20",
+            "copy-v21",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
@@ -333,6 +333,22 @@ class ProfitMetaRunner:
         # Only reset progress when config actually changed from a prior known sig.
         sig_changed = bool(old_sig) and old_sig != sig
 
+        scan_complete = bool(self.store.data.get("copy_scan_complete"))
+        if (
+            existing
+            and scan_complete
+            and self._copy_age_h() < refresh_h
+            and not sig_changed
+        ):
+            self.log.info(
+                "Using scored copy leaders (%s/%s wallets, %.1fh old) — skip rescan",
+                len(existing),
+                want,
+                self._copy_age_h(),
+            )
+            self.tracker.set_basket(leaders_to_basket(existing))
+            return
+
         if existing and full and self._copy_age_h() < refresh_h and not sig_changed:
             self.log.info(
                 "Using saved copy leaders (%s/%s wallets, %.1fh old)",
@@ -372,6 +388,7 @@ class ProfitMetaRunner:
             self.store.data["copy_rejects"] = {}
             self.store.data["copy_scanned"] = {}
             self.store.data["copy_scan_offset"] = 0
+            self.store.data["copy_scan_complete"] = False
             existing = []
 
         offset = 0
@@ -450,9 +467,10 @@ class ProfitMetaRunner:
             self.store.save()
             return
 
-        ready = (not require_full) or (len(leaders) >= want) or (
-            result.exhausted and len(leaders) > 0
-        )
+        ready = bool(result.exhausted and len(leaders) > 0) or (
+            (not require_full) and len(leaders) > 0
+        ) or len(leaders) >= want
+        self.store.data["copy_scan_complete"] = bool(result.exhausted)
         new_leader_addrs = {ld.address.lower() for ld in leaders}
         if ready and old_leader_addrs and old_leader_addrs != new_leader_addrs:
             self.log.info(
