@@ -25,7 +25,7 @@ from .copy_score import (
 from .leaderboard import load_leaderboard
 from .markets import MarketCache
 from .price_engine import PriceEngine
-from .qualify import Qualifier, holder_filter_on, shortlist, shortlist_copy_roi
+from .qualify import Qualifier, copy_rank_window, holder_filter_on, shortlist, shortlist_copy_roi
 from .rebalancer import PaperBook, Rebalancer
 from .research import ResearchWriter, compact_research_votes
 from .snapshots import SnapshotClient, list_dex_query_names
@@ -81,8 +81,9 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v12",
+            "copy-v13",
             str(getattr(cfg, "COPY_TOP_N", "")),
+            str(getattr(cfg, "COPY_RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
             str(getattr(cfg, "COPY_MIN_PNL_VOLUME_RATIO", "")),
             str(getattr(cfg, "COPY_MIN_MEDIAN_GAP_S", "")),
@@ -388,7 +389,7 @@ class ProfitMetaRunner:
             "Copy shortlist %s/%s by %s ROI (min_eq=$%.0f) — HL leaderboard order",
             len(pool),
             len(rows),
-            getattr(self.cfg, "RANK_WINDOW", "week"),
+            copy_rank_window(self.cfg),
             min_eq,
         )
         if not pool:
@@ -1306,12 +1307,13 @@ class ProfitMetaRunner:
         else:
             if self._is_copy_mode():
                 self.log.info(
-                    "Copy-trade running | mode=%s profile=%s paper=%s leaders=%s scan=%s "
+                    "Copy-trade running | mode=%s profile=%s paper=%s leaders=%s rank=%s scan=%s "
                     "gap=%.0f-%.0fs min_wr=%.0f%% refresh=%sh scope=%s",
                     "reverse" if self._copy_reverse() else "follow",
                     getattr(self.cfg, "PMF_PROFILE", "local"),
                     bool(self.cfg.PAPER_TRADING),
                     int(getattr(self.cfg, "COPY_TOP_N", 2) or 2),
+                    copy_rank_window(self.cfg),
                     int(getattr(self.cfg, "COPY_CANDIDATE_SCAN", 200) or 200),
                     float(getattr(self.cfg, "COPY_MIN_MEDIAN_GAP_S", 90) or 0),
                     float(getattr(self.cfg, "COPY_MAX_MEDIAN_GAP_S", 0) or 0),

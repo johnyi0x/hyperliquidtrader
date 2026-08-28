@@ -116,6 +116,11 @@ def shortlist(rows: list[LeaderboardRow], cfg: Any) -> list[QualifiedWallet]:
     return scored[:pool_n]
 
 
+def copy_rank_window(cfg: Any) -> str:
+    """Leaderboard window for copy / copy_reverse only (day=24h, week=7d)."""
+    return str(getattr(cfg, "COPY_RANK_WINDOW", "") or getattr(cfg, "RANK_WINDOW", "week") or "week")
+
+
 def shortlist_copy_roi(
     rows: list[LeaderboardRow],
     cfg: Any,
@@ -123,8 +128,8 @@ def shortlist_copy_roi(
     scan_n: int,
     min_equity: float = 0.0,
 ) -> list[QualifiedWallet]:
-    """Top wallets by RANK_WINDOW ROI (same ordering as HL 7d leaderboard UI)."""
-    rank_n = str(getattr(cfg, "RANK_WINDOW", "week") or "week")
+    """Top wallets by COPY_RANK_WINDOW ROI (HL leaderboard column)."""
+    rank_n = copy_rank_window(cfg)
     out: list[QualifiedWallet] = []
     for row in rows:
         w = _window(row, rank_n)

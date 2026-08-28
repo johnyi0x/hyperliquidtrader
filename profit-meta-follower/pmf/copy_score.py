@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from .qualify import Qualifier, _fill_closed_pnl
+from .qualify import Qualifier, _fill_closed_pnl, copy_rank_window
 from .types import QualifiedWallet, fnum
 
 
@@ -413,7 +413,7 @@ def pick_copy_leaders(
         want,
         min_pass,
         len(kept),
-        getattr(cfg, "RANK_WINDOW", "week"),
+        copy_rank_window(cfg),
     )
     if board_pool:
         log.info(

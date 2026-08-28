@@ -20,9 +20,10 @@ RESEARCH_GATHER_SIZE = 200
 TRADE_BASKET_SIZE = 50
 
 # Copy-mode knobs (RUN_MODE=copy | copy_reverse). Crowd mode ignores these.
-# Rank top COPY_BOARD_SCAN by 7d ROI; exclude zero volume + churn; light scalper check.
+# Rank top COPY_BOARD_SCAN by COPY_RANK_WINDOW ROI (day=24h); exclude churn/scalpers.
 # Auto-loosen until COPY_TOP_N wallets pass, then pick highest ROI at that tier.
-COPY_TOP_N = 5
+COPY_TOP_N = 2
+COPY_RANK_WINDOW = "day"
 COPY_BOARD_SCAN = 200
 COPY_REQUIRE_FULL_WATCHLIST = True
 COPY_CANDIDATE_SCAN = 4000
@@ -106,6 +107,7 @@ _TRADE: dict = {
     # Copy mode — enable with PMF_RUN_MODE=copy on deploy (crowd unchanged).
     "RUN_MODE": "crowd",
     "COPY_TOP_N": COPY_TOP_N,
+    "COPY_RANK_WINDOW": COPY_RANK_WINDOW,
     "COPY_BOARD_SCAN": COPY_BOARD_SCAN,
     "COPY_REQUIRE_FULL_WATCHLIST": COPY_REQUIRE_FULL_WATCHLIST,
     "COPY_CANDIDATE_SCAN": COPY_CANDIDATE_SCAN,
