@@ -1900,5 +1900,51 @@ class CopyModeTests(unittest.TestCase):
         self.assertEqual(targets[0].side, "long")
 
 
+class MarketResolverTests(unittest.TestCase):
+    def test_hip3_symbol_not_matched_on_native_book(self) -> None:
+        from src.market_resolver import _match_asset_name
+
+        self.assertFalse(
+            _match_asset_name("SOL", "xyz:SOL", "SOL", "xyz", book_dex=None),
+            "native SOL must not satisfy xyz:SOL lookup",
+        )
+        self.assertTrue(_match_asset_name("SOL", "SOL", "SOL", None, book_dex=None))
+        self.assertTrue(_match_asset_name("xyz:MU", "xyz:MU", "MU", "xyz", book_dex="xyz"))
+        self.assertTrue(_match_asset_name("MU", "xyz:MU", "MU", "xyz", book_dex="xyz"))
+
+    def test_configure_coin_does_not_inherit_previous_dex(self) -> None:
+        import logging
+        from unittest.mock import MagicMock, patch
+
+        from src.exchange_client import HyperliquidClient
+        from src.market_resolver import MarketSpec
+
+        logger = logging.getLogger("test.dex")
+        native = MarketSpec("SOL", "SOL", None, 2, 20, False)
+        hip3 = MarketSpec("xyz:MU", "MU", "xyz", 3, 10, False)
+        with patch("src.exchange_client.resolve_market", return_value=native) as resolve:
+            with patch.object(HyperliquidClient, "_ensure_sdk_asset_maps"):
+                with patch.object(HyperliquidClient, "__init__", lambda self, *a, **k: None):
+                    client = HyperliquidClient.__new__(HyperliquidClient)
+                    client.info = MagicMock()
+                    client.coin = "xyz:MU"
+                    client.perp_dex = "xyz"
+                    client.market = hip3
+                    client.only_isolated = False
+                    client.sz_decimals = 3
+                    client.max_leverage = 10
+                    client.logger = logger
+                    client._candle_cache_interval = None
+                    client._candle_cache_bucket = None
+                    client._candle_cache_rows = []
+                    client.invalidate_user_state = MagicMock()
+
+                    client.configure_coin("SOL", perp_dex=None)
+                    self.assertEqual(resolve.call_args_list[-1].args[1], "SOL")
+                    self.assertIsNone(resolve.call_args_list[-1].args[2])
+                    self.assertEqual(client.coin, "SOL")
+                    self.assertIsNone(client.perp_dex)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ from .hl_rate_limit import (
 from .market_resolver import (
     MarketSpec,
     find_perp_asset_location,
+    parse_coin_input,
     perp_dexs_for_sdk,
     resolve_market,
     sdk_perp_dexs_for_dexes,
@@ -137,9 +138,13 @@ class HyperliquidClient:
 
     def _lookup_asset_id(self, info: Any, symbol: str) -> int | None:
         """Resolve HIP-3 asset id from whatever name the SDK already registered."""
-        candidates = [symbol, self.coin]
-        if self.perp_dex:
-            candidates.append(f"{self.perp_dex}:{symbol}")
+        dex = self.perp_dex
+        if dex:
+            candidates = [self.coin, f"{dex}:{symbol}"]
+            if self.coin == f"{dex}:{symbol}":
+                candidates.append(symbol)
+        else:
+            candidates = [self.coin, symbol]
         for name in candidates:
             if name in info.coin_to_asset:
                 return int(info.coin_to_asset[name])
@@ -151,7 +156,10 @@ class HyperliquidClient:
             key_str = str(key)
             if key_str in candidates:
                 continue
-            if key_str == symbol or key_str.endswith(f":{symbol}") or key_str == self.coin:
+            if dex:
+                if key_str == self.coin or key_str == f"{dex}:{symbol}":
+                    return int(asset_id)
+            elif key_str == symbol or key_str == self.coin:
                 return int(asset_id)
         return None
 
@@ -256,7 +264,8 @@ class HyperliquidClient:
         max_leverage: int | None = None,
     ) -> None:
         """Switch active perp; refresh sizing metadata when coin changes."""
-        market = resolve_market(self.info, coin, perp_dex or self.perp_dex)
+        _symbol, effective_dex = parse_coin_input(coin, perp_dex)
+        market = resolve_market(self.info, coin, effective_dex)
         if market.api_coin != self.coin:
             self.coin = market.api_coin
             self.market = market

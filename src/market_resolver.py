@@ -87,14 +87,34 @@ def _max_leverage_from_asset(asset: dict[str, Any]) -> int:
     return 40
 
 
-def _match_asset_name(asset_name: str, api_coin: str, symbol: str, perp_dex: str | None) -> bool:
+def _meta_book_dex(meta_idx: int, dex_names: list[str]) -> str | None:
+    """Map allPerpMetas index to builder-dex name (main book → None)."""
+    if meta_idx <= 0:
+        return None
+    idx = meta_idx - 1
+    if 0 <= idx < len(dex_names):
+        return dex_names[idx]
+    return None
+
+
+def _match_asset_name(
+    asset_name: str,
+    api_coin: str,
+    symbol: str,
+    perp_dex: str | None,
+    *,
+    book_dex: str | None = None,
+) -> bool:
     if asset_name == api_coin:
         return True
-    if perp_dex and asset_name == symbol:
-        return True
-    if perp_dex and asset_name == f"{perp_dex}:{symbol}":
-        return True
-    return False
+    if perp_dex:
+        if asset_name == f"{perp_dex}:{symbol}":
+            return True
+        # HIP-3 SDK often registers bare symbols inside that dex book only.
+        if asset_name == symbol and (book_dex or "") == (perp_dex or ""):
+            return True
+        return False
+    return asset_name == symbol
 
 
 def _asset_from_universe(
@@ -103,10 +123,11 @@ def _asset_from_universe(
     api_coin: str,
     symbol: str,
     perp_dex: str | None,
+    book_dex: str | None = None,
 ) -> dict[str, Any] | None:
     for asset in universe:
         name = str(asset.get("name", ""))
-        if _match_asset_name(name, api_coin, symbol, perp_dex):
+        if _match_asset_name(name, api_coin, symbol, perp_dex, book_dex=book_dex):
             return asset
     return None
 
@@ -151,16 +172,19 @@ def _resolve_from_all_perp_metas(
                 api_coin=api_coin,
                 symbol=symbol,
                 perp_dex=perp_dex,
+                book_dex=perp_dex,
             )
             if found is not None:
                 return found
 
-    for meta in metas:
+    dex_names = list_perp_dex_names(info)
+    for meta_idx, meta in enumerate(metas):
         found = _asset_from_universe(
             meta.get("universe", []),
             api_coin=api_coin,
             symbol=symbol,
             perp_dex=perp_dex,
+            book_dex=_meta_book_dex(meta_idx, dex_names),
         )
         if found is not None:
             return found
@@ -201,11 +225,13 @@ def find_perp_asset_location(
 ) -> PerpAssetLocation | None:
     """Locate a perp in allPerpMetas and compute its SDK asset id."""
     metas = fetch_all_perp_metas(info)
+    dex_names = list_perp_dex_names(info)
     for meta_idx, meta in enumerate(metas):
+        book_dex = _meta_book_dex(meta_idx, dex_names)
         universe = meta.get("universe", [])
         for universe_idx, asset in enumerate(universe):
             name = str(asset.get("name", ""))
-            if not _match_asset_name(name, api_coin, symbol, perp_dex):
+            if not _match_asset_name(name, api_coin, symbol, perp_dex, book_dex=book_dex):
                 continue
             asset_id = asset_id_for_meta_slot(meta_idx, universe_idx)
             return PerpAssetLocation(
@@ -281,6 +307,7 @@ def resolve_market(info: Any, coin: str, perp_dex: str | None = None) -> MarketS
                     api_coin=api_coin,
                     symbol=symbol,
                     perp_dex=dex,
+                    book_dex=dex,
                 )
             except Exception:
                 asset = None
