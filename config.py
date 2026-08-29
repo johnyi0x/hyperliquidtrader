@@ -29,7 +29,7 @@ MAX_MAX_LEVERAGE = 20
 #   "native"   = Hyperliquid main perps only (no HIP-3)
 #   "include"  = native + HIP-3 (xyz:...)
 #   "xyz_only" = HIP-3 builder dexes only (e.g. xyz:SKHY)
-XYZ_PAIR_MODE = "xyz_only"
+XYZ_PAIR_MODE = "include"
 # Legacy alias (used only if XYZ_PAIR_MODE is missing/invalid):
 # False → native, True → include. Prefer XYZ_PAIR_MODE.
 INCLUDE_XYZ_PAIRS = False
@@ -159,7 +159,7 @@ STOP_LOSS_PCT = 1.0
 # =============================================================================
 # DCA (mandatory when True + USE_TP_SL; equal-size legs from total balance_pct)
 # =============================================================================
-ALLOW_DCA = False
+ALLOW_DCA = True
 
 
 # =============================================================================
