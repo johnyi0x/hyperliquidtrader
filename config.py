@@ -17,7 +17,7 @@ PAIR_SELECTION_MODE = "top_volume"
 
 # --- top_volume mode only ---
 # How many highest-volume perps to backtest each tune (before MAX_LIVE_PAIRS cut).
-TOP_VOLUME_COUNT = 20
+TOP_VOLUME_COUNT = 15
 # Skip markets whose exchange max leverage is below this (e.g. 3x/5x memes).
 # 0 = no filter. 10 = only pairs with maxLev ≥ 10, then take top TOP_VOLUME_COUNT
 # by volume among those (still fills N if ≥N qualifying markets exist).
@@ -122,7 +122,7 @@ MIN_TRADES_ABS = 5
 # for live scanning (saves Hyperliquid IP weight). ≤N winners → keep all.
 # IMPORTANT: 1 starves live to a single coin (often silent for days).
 # Example ratios: manual 14→5, top_volume 50→15.
-MAX_LIVE_PAIRS = 10
+MAX_LIVE_PAIRS = 5
 
 # TOTAL free-margin % for the whole position (entry + all DCA legs combined).
 # Live splits this evenly: e.g. 30% with 1 entry + 2 DCA → ~10% per fill.
