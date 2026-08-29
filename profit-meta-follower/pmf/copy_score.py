@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .qualify import Qualifier, _fill_closed_pnl, copy_rank_window, is_holder_tape
+from .snapshots import account_value_from_states, parse_positions
 from .types import QualifiedWallet, fnum
 
 
@@ -52,6 +53,7 @@ class CopyLeader:
     account_value: float
     recent: FillStats = field(default_factory=FillStats)
     history: FillStats = field(default_factory=FillStats)
+    n_open_positions: int = 0
     reasons: list[str] = field(default_factory=list)
 
 
@@ -149,7 +151,13 @@ def analyze_fills(
     n = len(times)
     times.sort()
     gaps = [(times[i] - times[i - 1]) / 1000.0 for i in range(1, n)]
-    median_gap = float(statistics.median(gaps)) if gaps else lookback_days * 86400.0
+    positive_gaps = [g for g in gaps if g >= 1.0]
+    if positive_gaps:
+        median_gap = float(statistics.median(positive_gaps))
+    elif gaps:
+        median_gap = max(1.0, float(statistics.median(gaps)))
+    else:
+        median_gap = lookback_days * 86400.0
     per_day = n / max(lookback_days, 0.25)
     closed_n = wins + losses
     win_rate = (wins / closed_n) if closed_n > 0 else 0.5
@@ -200,11 +208,12 @@ def _fmt_board(wallet: QualifiedWallet) -> str:
     )
 
 
-def _fmt_fills(recent: FillStats) -> str:
+def _fmt_fills(recent: FillStats, *, n_open: int = -1) -> str:
+    open_part = f" open={n_open}" if n_open >= 0 else ""
     return (
         f"fills={recent.n_fills} {recent.fills_per_day:.1f}/d gap={recent.median_gap_s:.1f}s "
         f"wr={recent.win_rate:.0%} tape_pnl=${recent.closed_pnl:.0f} "
-        f"flip={recent.fast_flip_ratio:.0%}"
+        f"flip={recent.fast_flip_ratio:.0%}{open_part}"
     )
 
 
@@ -346,12 +355,80 @@ def hard_disqualify_copy(
     cfg: Any,
     *,
     holder_reason: str = "",
+    n_open_positions: int = 0,
+    open_notional_usd: float = 0.0,
+    now_ms: int = 0,
 ) -> tuple[bool, str]:
-    """Minimal hard gate — only wallets with zero copyable tape are excluded."""
-    if holder_reason == "no_fills":
-        return False, f"holder:no_fills | {_fmt_board(wallet)}"
+    """Hard gate — must be actively trading with copyable open book."""
+    detail = f"{_fmt_board(wallet)} | {_fmt_fills(recent, n_open=n_open_positions)}"
+
+    if holder_reason:
+        return False, f"holder:{holder_reason} | {detail}"
     if recent.n_fills <= 0:
-        return False, f"no_trades fills=0 | {_fmt_fills(recent)}"
+        return False, f"no_trades fills=0 | {detail}"
+
+    min_vol = _cfg_float(cfg, "COPY_MIN_BOARD_VOLUME", 0.0)
+    vol = float(wallet.rank_volume or 0)
+    pnl = float(wallet.rank_pnl or 0)
+    if vol <= 0 or (min_vol > 0 and vol < min_vol):
+        return False, f"low_volume vol=${vol:,.0f} need>=${min_vol:,.0f} | {detail}"
+    if pnl <= 0:
+        return False, f"no_board_profit pnl=${pnl:,.0f} | {detail}"
+
+    min_yield = _cfg_float(cfg, "COPY_MIN_PNL_VOLUME_RATIO", 0.0)
+    if min_yield > 0 and vol > 0:
+        y = pnl / vol
+        if y < min_yield:
+            return False, (
+                f"low_pnl_yield yield={y * 100:.4f}% need>={min_yield * 100:.4f}% | {detail}"
+            )
+
+    min_f = max(0, _cfg_int(cfg, "COPY_MIN_FILLS", 12))
+    if min_f > 0 and recent.n_fills < min_f:
+        return False, f"too_few_fills={recent.n_fills} need>={min_f} | {detail}"
+
+    need_fpd = _cfg_float(cfg, "COPY_MIN_FILLS_PER_DAY", 10.0)
+    if need_fpd > 0 and recent.fills_per_day < need_fpd:
+        return False, (
+            f"idle_activity {recent.fills_per_day:.1f}/d need>={need_fpd:.1f}/d | {detail}"
+        )
+
+    max_fpd = _cfg_float(cfg, "COPY_MAX_FILLS_PER_DAY", 300.0)
+    if max_fpd > 0 and recent.fills_per_day > max_fpd:
+        return False, (
+            f"hyper_fpd {recent.fills_per_day:.0f}/d cap={max_fpd:.0f}/d | {detail}"
+        )
+
+    min_gap = max(60.0, _cfg_float(cfg, "COPY_MIN_MEDIAN_GAP_S", 90.0))
+    max_gap = _cfg_float(cfg, "COPY_MAX_MEDIAN_GAP_S", 2400.0)
+    if recent.n_fills >= 2 and recent.median_gap_s < min_gap:
+        return False, (
+            f"too_fast_scalp gap={recent.median_gap_s:.1f}s need>={min_gap:.0f}s | {detail}"
+        )
+    if max_gap > 0 and recent.n_fills >= 2 and recent.median_gap_s > max_gap:
+        return False, (
+            f"slow_holder gap={recent.median_gap_s:.0f}s max={max_gap:.0f}s | {detail}"
+        )
+
+    tape_need = _cfg_float(cfg, "COPY_MIN_RECENT_PNL", 1.0)
+    if tape_need > 0 and recent.closed_pnl < tape_need:
+        return False, f"tape_pnl=${recent.closed_pnl:.0f} need>=${tape_need:.0f} | {detail}"
+
+    max_last_h = _cfg_float(cfg, "COPY_MAX_LAST_FILL_H", 8.0)
+    if max_last_h > 0 and recent.last_fill_ms > 0 and now_ms > 0:
+        age_h = (now_ms - recent.last_fill_ms) / 3_600_000
+        if age_h > max_last_h:
+            return False, f"stale_last_fill age={age_h:.1f}h max={max_last_h:.0f}h | {detail}"
+
+    require_open = bool(getattr(cfg, "COPY_REQUIRE_OPEN_POSITIONS", True))
+    min_open_notional = _cfg_float(cfg, "COPY_MIN_OPEN_NOTIONAL_USD", 200.0)
+    if require_open and n_open_positions <= 0:
+        return False, f"flat_book open=0 | {detail}"
+    if min_open_notional > 0 and open_notional_usd < min_open_notional:
+        return False, (
+            f"tiny_book notional=${open_notional_usd:.0f} need>=${min_open_notional:.0f} | {detail}"
+        )
+
     return True, "ok"
 
 
@@ -362,111 +439,130 @@ def score_copy_wallet(
     cfg: Any,
     *,
     holder_reason: str = "",
+    n_open_positions: int = 0,
 ) -> float:
     """Higher = better for stable profitable decent-scalp copy targets."""
     lookback_d = max(0.25, float(getattr(cfg, "COPY_LOOKBACK_DAYS", 7.0) or 7.0))
-    ideal_tph = float(getattr(cfg, "COPY_IDEAL_TRADES_PER_HOUR", 4.0) or 4.0)
-    trips_per_day = (
-        recent.round_trips / lookback_d if recent.round_trips > 0 else recent.fills_per_day / 2.0
-    )
-    ideal_tpd = max(1.0, ideal_tph * 24.0)
-
-    # Stable profit: realized tape + board PnL (ROI is only a soft tilt).
-    roi = max(min(wallet.rank_roi, 5.0), 0.0) * 6.0
-    board_pnl = math.log10(max(wallet.rank_pnl, 1.0) + 10.0) * 10.0
-    recent_pnl = math.log10(max(recent.closed_pnl, 1.0) + 10.0) * 28.0
-    hist_pnl = math.log10(max(history.closed_pnl, 1.0) + 10.0) * 12.0
-    if recent.closed_pnl < 0:
-        recent_pnl -= 55.0
-    elif recent.closed_pnl > 0:
-        recent_pnl += 8.0
-    if history.closed_pnl < 0:
-        hist_pnl -= 25.0
-    if wallet.rank_pnl < 0:
-        board_pnl -= 30.0
-
-    wr = recent.win_rate * 40.0 + history.win_rate * 15.0
-    pf = min(recent.profit_factor, 4.0) * 12.0 + min(history.profit_factor, 4.0) * 4.0
-
-    # Decent scalp band: prefer ~3–10 min gaps, not sub-minute and not multi-hour holders.
-    ideal_gap = float(getattr(cfg, "COPY_IDEAL_GAP_S", 300.0) or 300.0)
+    ideal_gap = float(getattr(cfg, "COPY_IDEAL_GAP_S", 180.0) or 180.0)
     gap = max(recent.median_gap_s, 1.0)
-    gap_pen = abs(math.log(gap / max(ideal_gap, 30.0)))
-    activity = max(0.0, 28.0 - gap_pen * 9.0)
-    if 120.0 <= gap <= 1800.0:
-        activity += 14.0
-    elif 60.0 <= gap < 120.0 or 1800.0 < gap <= 3600.0:
-        activity += 4.0
-    else:
-        activity -= 12.0
-
-    tpd_pen = abs(math.log(max(trips_per_day, 0.1) / ideal_tpd))
-    activity += max(0.0, 16.0 - tpd_pen * 7.0)
     fpd = recent.fills_per_day
-    if 12.0 <= fpd <= 180.0:
-        activity += 12.0
-    elif 6.0 <= fpd < 12.0 or 180.0 < fpd <= 280.0:
-        activity += 3.0
-    else:
-        activity -= 10.0
 
-    bait_pen = recent.fast_flip_ratio * 35.0
+    # --- Profit quality (realized tape + board, not raw ROI hype) ---
+    roi = max(min(wallet.rank_roi, 3.0), 0.0) * 4.0
+    board_pnl = math.log10(max(wallet.rank_pnl, 1.0) + 10.0) * 8.0
+    recent_pnl = math.log10(max(recent.closed_pnl, 1.0) + 10.0) * 16.0
+    hist_pnl = math.log10(max(history.closed_pnl, 1.0) + 10.0) * 8.0
+    if recent.closed_pnl < 0:
+        recent_pnl -= 60.0
+    elif recent.closed_pnl > 0:
+        recent_pnl += 6.0
+    if history.closed_pnl < 0:
+        hist_pnl -= 20.0
+    if wallet.rank_pnl < 0:
+        board_pnl -= 25.0
+
+    wr = recent.win_rate * 45.0 + history.win_rate * 12.0
+    pf = min(recent.profit_factor, 3.5) * 10.0 + min(history.profit_factor, 3.5) * 4.0
+    if recent.losses > 0 and recent.wins == 0:
+        wr -= 30.0
+
+    # --- Scalp rhythm: sweet spot ~1–15 min between fills, not sub-minute HFT ---
+    rhythm = 0.0
+    if 60.0 <= gap <= 1200.0:
+        rhythm = 35.0 - abs(math.log(gap / max(ideal_gap, 60.0))) * 12.0
+    elif 1200.0 < gap <= 3600.0:
+        rhythm = 12.0
+    elif gap < 60.0:
+        rhythm = -80.0 - (60.0 - gap) * 1.5
+    else:
+        rhythm = max(-20.0, 8.0 - (gap - 3600.0) / 600.0)
+
+    # --- Activity pace: active scalper, not hyper churn ---
+    pace = 0.0
+    if 8.0 <= fpd <= 80.0:
+        pace = 20.0 - abs(math.log(max(fpd, 1.0) / 25.0)) * 7.0
+    elif 5.0 <= fpd < 8.0 or 80.0 < fpd <= 120.0:
+        pace = 6.0
+    elif fpd > 150.0:
+        pace = -35.0 - min(40.0, (fpd - 150.0) * 0.3)
+    else:
+        pace = -15.0
+
+    bait_pen = recent.fast_flip_ratio * 40.0
     max_flip = float(getattr(cfg, "COPY_MAX_FAST_FLIP_RATIO", 0.55) or 0.55)
     if max_flip > 0 and recent.fast_flip_ratio > max_flip:
-        bait_pen += 25.0
+        bait_pen += 30.0
 
     freshness = 0.0
     if recent.last_fill_ms > 0:
         age_h = max(0.0, (time.time() * 1000 - recent.last_fill_ms) / 3_600_000)
         if age_h <= 2:
-            freshness = 16.0
+            freshness = 14.0
         elif age_h <= 8:
-            freshness = 8.0
+            freshness = 7.0
         elif age_h <= 24:
             freshness = 2.0
         else:
-            freshness = -14.0
+            freshness = -12.0
     else:
-        freshness = -20.0
+        freshness = -18.0
+
+    # --- Open book: must have positions to copy right now ---
+    book = 0.0
+    if n_open_positions > 0:
+        book = 30.0 + min(15.0, n_open_positions * 4.0)
+    else:
+        book = -40.0
 
     soft_pen = 0.0
     if holder_reason:
-        soft_pen += 35.0
+        soft_pen += 30.0
         if holder_reason.startswith("fills="):
-            soft_pen += 20.0
+            soft_pen += 18.0
     min_vol = _cfg_float(cfg, "COPY_MIN_BOARD_VOLUME", 1.0)
     vol = float(wallet.rank_volume or 0)
     pnl = float(wallet.rank_pnl or 0)
     if vol <= 0 or (min_vol > 0 and vol < min_vol):
-        soft_pen += 28.0
+        soft_pen += 25.0
     if pnl <= 0:
-        soft_pen += 40.0
+        soft_pen += 35.0
     hard_min_gap = max(60.0, _cfg_float(cfg, "COPY_MIN_MEDIAN_GAP_S", 90.0))
     if recent.n_fills >= 2 and recent.median_gap_s < hard_min_gap:
-        soft_pen += min(140.0, 50.0 + (hard_min_gap - recent.median_gap_s) * 0.6)
+        soft_pen += min(120.0, 60.0 + (hard_min_gap - recent.median_gap_s) * 1.2)
     max_fpd = _cfg_float(cfg, "COPY_MAX_FILLS_PER_DAY", 300.0)
     if max_fpd > 0 and recent.fills_per_day > max_fpd:
-        soft_pen += min(90.0, 30.0 + (recent.fills_per_day - max_fpd) * 0.25)
+        soft_pen += min(80.0, 35.0 + (recent.fills_per_day - max_fpd) * 0.3)
     min_f = max(0, _cfg_int(cfg, "COPY_MIN_FILLS", 12))
     if min_f > 0 and recent.n_fills < min_f:
-        soft_pen += (min_f - recent.n_fills) * 2.5
+        soft_pen += (min_f - recent.n_fills) * 2.0
     need_fpd = _cfg_float(cfg, "COPY_MIN_FILLS_PER_DAY", 10.0)
     if need_fpd > 0 and recent.fills_per_day < need_fpd:
-        soft_pen += (need_fpd - recent.fills_per_day) * 3.0
+        soft_pen += (need_fpd - recent.fills_per_day) * 2.5
     gap_max = _cfg_float(cfg, "COPY_MAX_MEDIAN_GAP_S", 2700.0)
     if gap_max > 0 and recent.n_fills >= 2 and recent.median_gap_s > gap_max:
-        soft_pen += min(40.0, (recent.median_gap_s - gap_max) / 120.0)
+        soft_pen += min(35.0, (recent.median_gap_s - gap_max) / 150.0)
     min_yield = _cfg_float(cfg, "COPY_MIN_PNL_VOLUME_RATIO", 0.00005)
-    vol = max(float(wallet.rank_volume or 0), 1.0)
-    y = float(wallet.rank_pnl or 0) / vol
+    vol_d = max(float(wallet.rank_volume or 0), 1.0)
+    y = float(wallet.rank_pnl or 0) / vol_d
     if min_yield > 0 and y < min_yield:
-        soft_pen += min(30.0, (min_yield - y) / max(min_yield, 1e-9) * 12.0)
+        soft_pen += min(25.0, (min_yield - y) / max(min_yield, 1e-9) * 10.0)
     tape_need = _cfg_float(cfg, "COPY_MIN_RECENT_PNL", 1.0)
     if tape_need > 0 and recent.closed_pnl < tape_need:
-        soft_pen += min(35.0, (tape_need - recent.closed_pnl) * 0.05)
+        soft_pen += min(30.0, (tape_need - recent.closed_pnl) * 0.04)
 
     return (
-        wr + pf + recent_pnl + hist_pnl + board_pnl + roi + activity + freshness - bait_pen - soft_pen
+        wr
+        + pf
+        + recent_pnl
+        + hist_pnl
+        + board_pnl
+        + roi
+        + rhythm
+        + pace
+        + freshness
+        + book
+        - bait_pen
+        - soft_pen
     )
 
 
@@ -489,6 +585,7 @@ def pick_copy_leaders(
     keep: list[CopyLeader] | None = None,
     skip_addrs: set[str] | None = None,
     start_offset: int = 0,
+    snapper: Any | None = None,
 ) -> CopyScanResult:
     """One full pass over the ROI shortlist; pick top-N by copy-trade score."""
     log = logger or qualifier.log
@@ -567,19 +664,17 @@ def pick_copy_leaders(
         if exclude_holders:
             is_hold, hold_why = is_holder_tape(fills, now_ms, cfg)
             if is_hold:
-                holder_reason = hold_why
-                if hold_why == "no_fills":
-                    holder_n += 1
-                    rejects[addr] = f"holder:{hold_why} | {_fmt_board(w)}"
-                    if skip_logs < 15:
-                        log.info(
-                            "Copy skip [holder] %s — %s | %s",
-                            addr[:10],
-                            hold_why,
-                            _fmt_board(w),
-                        )
-                        skip_logs += 1
-                    continue
+                holder_n += 1
+                rejects[addr] = f"holder:{hold_why} | {_fmt_board(w)}"
+                if skip_logs < 15:
+                    log.info(
+                        "Copy skip [holder] %s — %s | %s",
+                        addr[:10],
+                        hold_why,
+                        _fmt_board(w),
+                    )
+                    skip_logs += 1
+                continue
 
         recent = analyze_fills(
             fills, now_ms=now_ms, lookback_days=recent_d, min_hold_s=min_hold
@@ -587,8 +682,28 @@ def pick_copy_leaders(
         history = analyze_fills(
             fills, now_ms=now_ms, lookback_days=hist_d, min_hold_s=min_hold
         )
+
+        n_open = 0
+        open_notional = 0.0
+        if snapper is not None:
+            try:
+                states = snapper.fetch_user_states(addr)
+                equity = account_value_from_states(states)
+                positions = parse_positions(states, equity or w.account_value or 1.0)
+                n_open = len(positions)
+                open_notional = sum(abs(float(p.notional or 0)) for p in positions)
+            except Exception as exc:
+                log.debug("Copy open-book fetch %s: %s", addr[:10], exc)
+
         ok, why = hard_disqualify_copy(
-            w, recent, history, cfg, holder_reason=holder_reason
+            w,
+            recent,
+            history,
+            cfg,
+            holder_reason=holder_reason,
+            n_open_positions=n_open,
+            open_notional_usd=open_notional,
+            now_ms=now_ms,
         )
         if not ok:
             hard_n += 1
@@ -598,7 +713,9 @@ def pick_copy_leaders(
                 skip_logs += 1
             continue
 
-        score = score_copy_wallet(w, recent, history, cfg, holder_reason=holder_reason)
+        score = score_copy_wallet(
+            w, recent, history, cfg, holder_reason=holder_reason, n_open_positions=n_open
+        )
         leader = CopyLeader(
             address=addr,
             score=score,
@@ -607,10 +724,12 @@ def pick_copy_leaders(
             account_value=w.account_value,
             recent=recent,
             history=history,
+            n_open_positions=n_open,
             reasons=[
                 f"score={score:.1f}",
                 _fmt_board(w),
-                _fmt_fills(recent),
+                _fmt_fills(recent, n_open=n_open),
+                f"book_notional=${open_notional:,.0f}",
             ],
         )
         scored_all.append(leader)
@@ -666,6 +785,7 @@ def leaders_to_state(leaders: list[CopyLeader]) -> list[dict[str, Any]]:
             "fills_per_day": ld.recent.fills_per_day,
             "profit_factor": ld.recent.profit_factor,
             "fast_flip_ratio": ld.recent.fast_flip_ratio,
+            "n_open_positions": ld.n_open_positions,
             "reasons": ld.reasons,
         }
         for ld in leaders
@@ -698,6 +818,7 @@ def leaders_from_state(raw: list[Any]) -> list[CopyLeader]:
                 rank_pnl=float(item.get("rank_pnl") or 0),
                 account_value=float(item.get("account_value") or 0),
                 recent=recent,
+                n_open_positions=int(item.get("n_open_positions") or 0),
                 reasons=list(item.get("reasons") or []),
             )
         )

@@ -130,6 +130,7 @@ def shortlist_copy_roi(
 ) -> list[QualifiedWallet]:
     """Top wallets by COPY_RANK_WINDOW ROI (HL leaderboard column)."""
     rank_n = copy_rank_window(cfg)
+    min_vol = float(getattr(cfg, "COPY_MIN_BOARD_VOLUME", 0) or 0)
     out: list[QualifiedWallet] = []
     for row in rows:
         w = _window(row, rank_n)
@@ -138,6 +139,10 @@ def shortlist_copy_roi(
         if min_equity > 0 and row.account_value < min_equity:
             continue
         if w.roi <= 0:
+            continue
+        if min_vol > 0 and w.volume < min_vol:
+            continue
+        if w.pnl <= 0:
             continue
         out.append(
             QualifiedWallet(

@@ -86,7 +86,7 @@ def _basket_to_state(wallets: list[QualifiedWallet]) -> list[dict]:
 def _copy_sig(cfg: Any) -> str:
     return "|".join(
         [
-            "copy-v21",
+            "copy-v23",
             str(getattr(cfg, "COPY_TOP_N", "")),
             str(getattr(cfg, "COPY_RANK_WINDOW", "")),
             str(getattr(cfg, "COPY_BOARD_SCAN", "")),
@@ -440,6 +440,7 @@ class ProfitMetaRunner:
             keep=keep,
             skip_addrs=skip,
             start_offset=0,
+            snapper=self.snapper,
         )
         self._merge_copy_rejects(result.rejects)
         self._merge_copy_scanned(result.scanned)
@@ -589,10 +590,30 @@ class ProfitMetaRunner:
             n,
             fresh,
             len(leaders),
-            ", ".join(f"{ld.address[:8]}({ld.recent.win_rate:.0%})" for ld in leaders),
+            ", ".join(
+                f"{ld.address[:8]}({ld.recent.win_rate:.0%},open={ld.n_open_positions})"
+                for ld in leaders
+            ),
             ", ".join(trade_keys) or "-",
             ", ".join(our_keys) or "-",
         )
+
+        if not trade_keys and fresh >= need:
+            last_flat = float(self.store.data.get("copy_flat_log_at") or 0)
+            if time.time() - last_flat >= 120.0:
+                for ld in leaders:
+                    snap = by_addr.get(ld.address.lower())
+                    pos_n = len(snap.positions) if snap else 0
+                    coins = [p.coin for p in (snap.positions if snap else [])]
+                    self.log.warning(
+                        "Copy leader %s has %s open positions in snapshot %s — "
+                        "no targets to mirror (leaders may be flat between scalps)",
+                        ld.address[:10],
+                        pos_n,
+                        coins[:6] or "[]",
+                    )
+                self.store.data["copy_flat_log_at"] = time.time()
+                self.store.save()
 
         if fresh < need:
             # Redeploy safety: still flatten orphaned live positions while warming up.
@@ -643,6 +664,19 @@ class ProfitMetaRunner:
             new_managed, attempted = managed, False
         else:
             new_managed, attempted = result
+
+        min_notional = float(getattr(self.cfg, "MIN_ORDER_NOTIONAL_USD", 10.0) or 10.0)
+        if self._last_equity < min_notional and targets:
+            last_eq = float(self.store.data.get("copy_low_equity_log_at") or 0)
+            if time.time() - last_eq >= 300.0:
+                self.log.error(
+                    "Copy account equity $%.2f is below min order $%.0f — "
+                    "targets exist but every open is skipped as dust. Fund the wallet.",
+                    self._last_equity,
+                    min_notional,
+                )
+                self.store.data["copy_low_equity_log_at"] = time.time()
+                self.store.save()
 
         if self.paper is None and targets:
             unfilled = {t.coin for t in targets} - new_managed

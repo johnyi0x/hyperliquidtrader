@@ -1476,12 +1476,14 @@ class CopyModeTests(unittest.TestCase):
             COPY_MIN_MEDIAN_GAP_S=90.0,
             COPY_MAX_MEDIAN_GAP_S=0.0,
             COPY_MIN_RECENT_PNL=-1e9,
+            COPY_REQUIRE_OPEN_POSITIONS=False,
+            COPY_MIN_OPEN_NOTIONAL_USD=0,
+            COPY_MAX_LAST_FILL_H=0,
             RANK_WINDOW="week",
         )
         result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set())
-        self.assertEqual(len(result.leaders), 2)
+        self.assertEqual(len(result.leaders), 1)
         self.assertEqual(result.leaders[0].address, pool[2].address.lower())
-        self.assertGreater(result.leaders[0].score, result.leaders[1].score)
 
     def test_copy_picks_top_roi_from_board(self) -> None:
         import time
@@ -1550,6 +1552,9 @@ class CopyModeTests(unittest.TestCase):
             COPY_MIN_MEDIAN_GAP_S=90.0,
             COPY_MAX_MEDIAN_GAP_S=0.0,
             COPY_MIN_RECENT_PNL=-1e9,
+            COPY_REQUIRE_OPEN_POSITIONS=False,
+            COPY_MIN_OPEN_NOTIONAL_USD=0,
+            COPY_MAX_LAST_FILL_H=0,
             RANK_WINDOW="week",
         )
         result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set())
@@ -1608,6 +1613,9 @@ class CopyModeTests(unittest.TestCase):
             COPY_MIN_MEDIAN_GAP_S=90.0,
             COPY_MAX_MEDIAN_GAP_S=0.0,
             COPY_MIN_RECENT_PNL=-1e9,
+            COPY_REQUIRE_OPEN_POSITIONS=False,
+            COPY_MIN_OPEN_NOTIONAL_USD=0,
+            COPY_MAX_LAST_FILL_H=0,
             RANK_WINDOW="week",
         )
         result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set(), start_offset=0)
@@ -1681,6 +1689,9 @@ class CopyModeTests(unittest.TestCase):
             COPY_MIN_MEDIAN_GAP_S=90.0,
             COPY_MAX_MEDIAN_GAP_S=0.0,
             COPY_MIN_RECENT_PNL=1.0,
+            COPY_REQUIRE_OPEN_POSITIONS=False,
+            COPY_MIN_OPEN_NOTIONAL_USD=0,
+            COPY_MAX_LAST_FILL_H=0,
             RANK_WINDOW="week",
         )
         result = pick_copy_leaders(pool, _Q(), cfg, keep=[], skip_addrs=set())
