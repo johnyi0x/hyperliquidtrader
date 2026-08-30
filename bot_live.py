@@ -616,7 +616,44 @@ def main() -> None:
         """Manage one open coin. Return True if it was closed this pass."""
         entry = find_watch_entry(watch, coin)
         if entry is None:
-            logger.warning("Position on %s outside watch — skipping manage", coin)
+            logger.warning(
+                "Position on %s outside watch — managing max-hold only",
+                coin,
+            )
+            client.configure_coin(str(coin))
+            side = str(getattr(position, "side", "") or "")
+            size = float(getattr(position, "size", 0) or 0)
+            entry_px = float(getattr(position, "entry_price", 0) or 0)
+            tracked = trade_store.get(client.coin) or trade_store.get(str(coin))
+            if tracked is None or tracked.side != side:
+                trade_store.soft_adopt(
+                    client.coin, side, entry_px, size, 0.01, 0.01
+                )
+            t = trade_store.get(client.coin)
+            hold_s = (
+                max(0.0, time.time() - t.opened_at)
+                if t and cfg.USE_MAX_HOLD
+                else 0.0
+            )
+            if hold_s >= cfg.MAX_POSITION_HOURS * 3600.0:
+                logger.warning(
+                    "Max hold %.1fh — closing %s",
+                    cfg.MAX_POSITION_HOURS,
+                    client.coin,
+                )
+                if not executor.execute_rsi_exit():
+                    executor.emergency_flatten("max_hold")
+                wait_until_flat(
+                    client,
+                    trade_store,
+                    logger,
+                    coin=client.coin,
+                    coin_names=frozenset(
+                        {client.coin, str(coin), client.market.symbol}
+                    ),
+                )
+                drop_local(client.coin)
+                return True
             return False
         activate_pair(client, entry)
         setup = resolve_setup_for_position(entry.api_coin, store, open_setup_mem)
@@ -904,7 +941,13 @@ def main() -> None:
                 continue
 
             closed_any = False
+            seen_manage: set[str] = set()
             for coin, position in list(open_positions):
+                entry = find_watch_entry(watch, coin)
+                key = entry.api_coin if entry else str(coin)
+                if key in seen_manage:
+                    continue
+                seen_manage.add(key)
                 if manage_one(coin, position):
                     closed_any = True
 
@@ -941,7 +984,9 @@ def main() -> None:
             candidates: list[tuple] = []
             parts: list[str] = []
             for entry in watch:
-                if entry.api_coin in occupied:
+                if entry.api_coin in occupied or occupied.intersection(
+                    entry.position_coin_names()
+                ):
                     parts.append(f"{entry.api_coin} in-pos")
                     continue
                 setups = store.setups_for(entry.api_coin)

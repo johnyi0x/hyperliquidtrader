@@ -34,6 +34,90 @@ from .ema import EmaSnapshot, build_snapshot
 from .rsi import RsiValues, compute_rsi, parse_closes, wilder_rsi_series
 
 
+# Keys that appear on a clearinghouseState blob and are not builder-dex names.
+_CLEARINGHOUSE_META_KEYS = {
+    "assetPositions",
+    "marginSummary",
+    "crossMarginSummary",
+    "withdrawable",
+    "time",
+    "agentAddress",
+    "cumLedger",
+    "perpDexStates",
+}
+
+
+def canonical_position_coin(coin: str, dex: str | None) -> str:
+    """HIP-3 books often return a bare ticker; keep the xyz:COIN form used live."""
+    raw = str(coin or "").strip()
+    if not raw:
+        return ""
+    if ":" in raw:
+        return raw
+    dex_s = str(dex or "").strip()
+    return f"{dex_s}:{raw}" if dex_s else raw
+
+
+def iter_clearinghouse_states(
+    raw: Any, *, default_dex: str = ""
+) -> list[tuple[str, dict[str, Any]]]:
+    """
+    Pull every (dex, state) out of a clearinghouseState payload.
+
+    ALL_DEXES is a nested dict or a list of [dex, state] pairs. A top-level
+    assetPositions key must not hide sibling HIP-3 books.
+    """
+    tagged: list[tuple[str, dict[str, Any]]] = []
+    seen: set[int] = set()
+
+    def add(dex: str, state: dict[str, Any]) -> None:
+        if "assetPositions" not in state:
+            return
+        sid = id(state)
+        if sid in seen:
+            return
+        seen.add(sid)
+        tagged.append((str(dex or ""), state))
+
+    def is_pair(obj: Any) -> bool:
+        return (
+            isinstance(obj, (list, tuple))
+            and len(obj) == 2
+            and isinstance(obj[0], str)
+            and isinstance(obj[1], dict)
+            and "assetPositions" in obj[1]
+        )
+
+    def walk(obj: Any, dex_hint: str) -> None:
+        if obj is None:
+            return
+        if is_pair(obj):
+            add(obj[0], obj[1])
+            return
+        if isinstance(obj, dict):
+            if "assetPositions" in obj:
+                add(dex_hint, obj)
+            for key, val in obj.items():
+                if key == "assetPositions":
+                    continue
+                next_dex = dex_hint
+                if (
+                    isinstance(key, str)
+                    and key not in _CLEARINGHOUSE_META_KEYS
+                    and isinstance(val, dict)
+                    and "assetPositions" in val
+                ):
+                    next_dex = key
+                walk(val, next_dex)
+            return
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                walk(item, dex_hint)
+
+    walk(raw, default_dex or "")
+    return tagged
+
+
 @dataclass
 class Position:
     side: str  # "long" | "short"
@@ -100,6 +184,7 @@ class HyperliquidClient:
         self.only_isolated = market.only_isolated
 
         sdk_perp_dexs = sdk_perp_dexs if sdk_perp_dexs is not None else perp_dexs_for_sdk(market.perp_dex)
+        self._sdk_perp_dexs: list[str] = list(sdk_perp_dexs) if sdk_perp_dexs else [""]
         self.info = ThrottledInfo(
             base_url,
             skip_ws=True,
@@ -407,28 +492,37 @@ class HyperliquidClient:
         return max(0.0, account_value - margin_used)
 
     def _matches_active_coin(self, coin: str) -> bool:
-        if coin == self.coin:
+        raw = str(coin or "")
+        if not raw:
+            return False
+        if raw == self.coin or raw == self.market.symbol:
             return True
-        if coin == self.market.symbol:
+        if self.perp_dex and raw == f"{self.perp_dex}:{self.market.symbol}":
             return True
-        if self.perp_dex and coin == f"{self.perp_dex}:{self.market.symbol}":
-            return True
-        return False
+        return canonical_position_coin(raw, self.perp_dex) == self.coin
 
     def _position_dexes_to_query(self) -> list[str]:
+        """Native book plus every HIP-3 dex this client was opened with."""
         dexes: list[str] = []
-        if self.perp_dex:
-            dexes.append(self.perp_dex)
-        if "" not in dexes:
-            dexes.append("")
+
+        def add(name: str | None) -> None:
+            key = name or ""
+            if key not in dexes:
+                dexes.append(key)
+
+        for name in self._sdk_perp_dexs:
+            add(name)
+        add(self.perp_dex)
+        add("")
         return dexes
 
-    def _iter_clearinghouse_states(self) -> list[dict[str, Any]]:
+    def _iter_tagged_clearinghouse_states(self) -> list[tuple[str, dict[str, Any]]]:
         """
-        HIP-3 positions may appear on the builder dex, main dex, or both.
-        Prefer ALL_DEXES when available, else query each dex in turn.
+        HIP-3 positions live on the builder dex. ALL_DEXES plus a per-dex
+        fill-in so a native-active client still sees xyz:NVDA.
         """
-        states: list[dict[str, Any]] = []
+        tagged: list[tuple[str, dict[str, Any]]] = []
+        seen_dexes: set[str] = set()
         try:
             raw = self.info.post(
                 "/info",
@@ -438,23 +532,31 @@ class HyperliquidClient:
                     "dex": "ALL_DEXES",
                 },
             )
-            if isinstance(raw, dict):
-                if "assetPositions" in raw:
-                    states.append(raw)
-                else:
-                    for state in raw.values():
-                        if isinstance(state, dict) and "assetPositions" in state:
-                            states.append(state)
+            for dex, state in iter_clearinghouse_states(raw):
+                tagged.append((dex, state))
+                seen_dexes.add(dex)
         except Exception as exc:
             self.logger.debug("ALL_DEXES clearinghouseState failed: %s", exc)
 
-        if not states:
-            for dex in self._position_dexes_to_query():
-                try:
-                    states.append(self.info.user_state(self.address, dex=dex))
-                except Exception as exc:
-                    self.logger.debug("clearinghouseState dex=%r failed: %s", dex, exc)
-        return states
+        for dex in self._position_dexes_to_query():
+            if dex in seen_dexes:
+                continue
+            try:
+                raw = self.info.user_state(self.address, dex=dex)
+            except Exception as exc:
+                self.logger.debug("clearinghouseState dex=%r failed: %s", dex, exc)
+                continue
+            extra = iter_clearinghouse_states(raw, default_dex=dex)
+            if extra:
+                tagged.extend(extra)
+                seen_dexes.add(dex)
+            elif isinstance(raw, dict) and "assetPositions" in raw:
+                tagged.append((dex, raw))
+                seen_dexes.add(dex)
+        return tagged
+
+    def _iter_clearinghouse_states(self) -> list[dict[str, Any]]:
+        return [state for _dex, state in self._iter_tagged_clearinghouse_states()]
 
     def _position_from_state(self, state: dict[str, Any]) -> Position | None:
         for ap in state.get("assetPositions", []):
@@ -732,15 +834,36 @@ class HyperliquidClient:
             raise ValueError(est.reason or "order size unavailable")
         return est.size, est.notional_usd
 
-    def _all_frontend_orders(self) -> list[dict]:
-        dex = self._clearinghouse_dex()
+    def _open_orders_on_dex(self, dex: str) -> list[dict]:
+        dex_s = dex or ""
         try:
-            return self.info.frontend_open_orders(self.address, dex=dex)
+            return self.info.frontend_open_orders(self.address, dex=dex_s)
         except Exception:
-            return self.info.open_orders(self.address, dex=dex)
+            try:
+                return self.info.open_orders(self.address, dex=dex_s)
+            except Exception:
+                return []
+
+    def _all_frontend_orders(self) -> list[dict]:
+        out: list[dict] = []
+        seen: set[Any] = set()
+        for dex in self._position_dexes_to_query():
+            for order in self._open_orders_on_dex(dex):
+                oid = order.get("oid")
+                key = oid if oid is not None else id(order)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(order)
+        return out
 
     def _frontend_orders_for_coin(self) -> list[dict]:
-        return [o for o in self._all_frontend_orders() if o.get("coin") == self.coin]
+        orders = self._open_orders_on_dex(self._clearinghouse_dex())
+        return [
+            o
+            for o in orders
+            if self._matches_active_coin(str(o.get("coin") or ""))
+        ]
 
     def _position_coins(self, *, force: bool = False) -> set[str]:
         ok, positions = self.fetch_open_positions(force=force)
@@ -767,47 +890,19 @@ class HyperliquidClient:
         if force:
             self.invalidate_user_state()
 
-        states: list[dict[str, Any]] = []
-        last_err: Exception | None = None
-        try:
-            raw = self.info.post(
-                "/info",
-                {
-                    "type": "clearinghouseState",
-                    "user": self.address,
-                    "dex": "ALL_DEXES",
-                },
-            )
-            if isinstance(raw, dict):
-                if "assetPositions" in raw:
-                    states.append(raw)
-                else:
-                    for state in raw.values():
-                        if isinstance(state, dict) and "assetPositions" in state:
-                            states.append(state)
-        except Exception as exc:
-            last_err = exc
-
-        if not states:
-            for dex in self._position_dexes_to_query():
-                try:
-                    states.append(self.info.user_state(self.address, dex=dex))
-                except Exception as exc:
-                    last_err = exc
-
-        if not states:
+        tagged = self._iter_tagged_clearinghouse_states()
+        if not tagged:
             self.logger.warning(
-                "Position query failed — treating as NOT flat: %s",
-                last_err or "empty clearinghouse response",
+                "Position query failed — treating as NOT flat: empty clearinghouse response"
             )
             return False, []
 
         positions: list[tuple[str, Position]] = []
         seen: set[str] = set()
-        for state in states:
+        for dex, state in tagged:
             for ap in state.get("assetPositions", []):
                 pos = ap.get("position", ap)
-                coin = str(pos.get("coin", ""))
+                coin = canonical_position_coin(str(pos.get("coin", "")), dex)
                 if not coin or coin in seen:
                     continue
                 szi = float(pos.get("szi", 0))
@@ -830,12 +925,17 @@ class HyperliquidClient:
         return True, positions
 
     def cancel_all_orders_for_coin_named(self, coin: str) -> None:
-        saved = self.coin
-        self.coin = coin
+        _symbol, dex = parse_coin_input(coin)
+        saved_coin = self.coin
+        saved_dex = self.perp_dex
         try:
+            self.coin = coin
+            if dex:
+                self.perp_dex = dex
             self.cancel_all_orders_for_coin()
         finally:
-            self.coin = saved
+            self.coin = saved_coin
+            self.perp_dex = saved_dex
 
     def sweep_orphan_orders(self) -> int:
         """Cancel open orders on coins that have no position (stale TP/SL)."""

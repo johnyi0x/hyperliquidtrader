@@ -128,7 +128,19 @@ def wait_until_flat(
             time.sleep(poll_seconds)
             continue
         if names is not None:
-            still = any(pcoin in names for pcoin, _ in positions)
+            aliases: set[str] = set()
+            for name in names:
+                aliases.add(name)
+                if ":" in name:
+                    aliases.add(name.split(":", 1)[1])
+            still = False
+            for pcoin, _ in positions:
+                if pcoin in aliases:
+                    still = True
+                    break
+                if ":" in pcoin and pcoin.split(":", 1)[1] in aliases:
+                    still = True
+                    break
             if not still:
                 cleanup_closed_coin(client, trade_store, coin or next(iter(names)))
                 logger.info("Flat on %s — orders canceled", coin or next(iter(names)))
