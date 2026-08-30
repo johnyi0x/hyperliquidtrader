@@ -72,8 +72,18 @@ def ensure_protected_position(
         tpsl_attach_retries,
     )
     executor.emergency_flatten("unprotected_position")
-    trade_store.clear()
+    trade_store.clear(client.coin)
     return False
+
+
+def cleanup_closed_coin(
+    client: HyperliquidClient,
+    trade_store: TradeStateStore,
+    coin: str,
+) -> None:
+    """One coin went flat: cancel its leftover orders, drop local trade state."""
+    client.cancel_all_orders_for_coin_named(coin)
+    trade_store.clear(coin)
 
 
 def cleanup_when_flat(
@@ -82,10 +92,8 @@ def cleanup_when_flat(
     *,
     extra_coins: list[str] | None = None,
 ) -> None:
-    """No position: cancel stray orders so nothing tangles on next entry."""
-    coins: list[str] = []
-    if trade_store.trade and trade_store.trade.coin:
-        coins.append(trade_store.trade.coin)
+    """No positions left: cancel stray orders so nothing tangles on next entry."""
+    coins: list[str] = list(trade_store.coins())
     if client.coin not in coins:
         coins.append(client.coin)
     if extra_coins:
@@ -103,12 +111,29 @@ def wait_until_flat(
     trade_store: TradeStateStore,
     logger: logging.Logger,
     *,
+    coin: str | None = None,
+    coin_names: frozenset[str] | None = None,
     poll_seconds: float = 2.0,
     max_wait: float = 45.0,
 ) -> bool:
+    """
+    Wait until `coin` is flat (or the whole account if coin is None), then
+    cancel leftover orders for that coin only.
+    """
+    names = coin_names or (frozenset({coin}) if coin else None)
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        if not client.has_any_open_position(force=True):
+        ok, positions = client.fetch_open_positions(force=True)
+        if not ok:
+            time.sleep(poll_seconds)
+            continue
+        if names is not None:
+            still = any(pcoin in names for pcoin, _ in positions)
+            if not still:
+                cleanup_closed_coin(client, trade_store, coin or next(iter(names)))
+                logger.info("Flat on %s — orders canceled", coin or next(iter(names)))
+                return True
+        elif not positions:
             cleanup_when_flat(client, trade_store)
             logger.info("Flat — all orders canceled")
             return True

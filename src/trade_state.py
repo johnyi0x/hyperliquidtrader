@@ -1,4 +1,4 @@
-"""Active trade TP/SL levels (persisted across restarts)."""
+"""Active trade TP/SL levels (persisted across restarts). Supports multiple coins."""
 
 from __future__ import annotations
 
@@ -38,37 +38,82 @@ class ActiveTrade:
         return None
 
 
+def _trade_to_dict(t: ActiveTrade) -> dict:
+    return {
+        "coin": t.coin,
+        "side": t.side,
+        "entry_price": t.entry_price,
+        "size": t.size,
+        "take_profit_price": t.take_profit_price,
+        "stop_loss_price": t.stop_loss_price,
+        "opened_at": t.opened_at,
+        "equity_at_entry": t.equity_at_entry,
+        "take_profit_pct": t.take_profit_pct,
+        "stop_loss_pct": t.stop_loss_pct,
+        "initial_size": t.initial_size,
+        "dca_adds": t.dca_adds,
+    }
+
+
+def _trade_from_dict(data: dict) -> ActiveTrade:
+    return ActiveTrade(
+        coin=str(data.get("coin", "")),
+        side=str(data["side"]),
+        entry_price=float(data["entry_price"]),
+        size=float(data["size"]),
+        take_profit_price=float(data["take_profit_price"]),
+        stop_loss_price=float(data["stop_loss_price"]),
+        opened_at=float(data.get("opened_at", time.time())),
+        equity_at_entry=float(data.get("equity_at_entry", 0.0)),
+        take_profit_pct=float(data.get("take_profit_pct", 0.0)),
+        stop_loss_pct=float(data.get("stop_loss_pct", 0.0)),
+        initial_size=float(data.get("initial_size", data.get("size", 0.0))),
+        dca_adds=int(data.get("dca_adds", 0)),
+    )
+
+
 class TradeStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.trade: ActiveTrade | None = None
+        self.trades: dict[str, ActiveTrade] = {}
         self._load()
 
+    @property
+    def trade(self) -> ActiveTrade | None:
+        """Oldest tracked trade (compat). Prefer get(coin)."""
+        if not self.trades:
+            return None
+        return next(iter(self.trades.values()))
+
+    def get(self, coin: str) -> ActiveTrade | None:
+        return self.trades.get(str(coin))
+
+    def coins(self) -> list[str]:
+        return list(self.trades.keys())
+
     def _load(self) -> None:
+        self.trades = {}
         if not self.path.exists():
             return
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
-            self.trade = ActiveTrade(
-                coin=str(data.get("coin", "")),
-                side=str(data["side"]),
-                entry_price=float(data["entry_price"]),
-                size=float(data["size"]),
-                take_profit_price=float(data["take_profit_price"]),
-                stop_loss_price=float(data["stop_loss_price"]),
-                opened_at=float(data.get("opened_at", time.time())),
-                equity_at_entry=float(data.get("equity_at_entry", 0.0)),
-                take_profit_pct=float(data.get("take_profit_pct", 0.0)),
-                stop_loss_pct=float(data.get("stop_loss_pct", 0.0)),
-                initial_size=float(data.get("initial_size", data.get("size", 0.0))),
-                dca_adds=int(data.get("dca_adds", 0)),
-            )
+            raw_trades = data.get("trades")
+            if isinstance(raw_trades, dict) and raw_trades:
+                for coin, row in raw_trades.items():
+                    if isinstance(row, dict) and "side" in row:
+                        row = dict(row)
+                        row.setdefault("coin", coin)
+                        self.trades[str(row.get("coin") or coin)] = _trade_from_dict(row)
+            elif "side" in data:
+                t = _trade_from_dict(data)
+                if t.coin:
+                    self.trades[t.coin] = t
         except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
-            self.trade = None
+            self.trades = {}
 
     def _save(self) -> None:
-        if self.trade is None:
+        if not self.trades:
             if self.path.exists():
                 try:
                     self.path.unlink()
@@ -76,20 +121,9 @@ class TradeStateStore:
                     pass
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        t = self.trade
         payload = {
-            "coin": t.coin,
-            "side": t.side,
-            "entry_price": t.entry_price,
-            "size": t.size,
-            "take_profit_price": t.take_profit_price,
-            "stop_loss_price": t.stop_loss_price,
-            "opened_at": t.opened_at,
-            "equity_at_entry": t.equity_at_entry,
-            "take_profit_pct": t.take_profit_pct,
-            "stop_loss_pct": t.stop_loss_pct,
-            "initial_size": t.initial_size,
-            "dca_adds": t.dca_adds,
+            "schema": 2,
+            "trades": {coin: _trade_to_dict(t) for coin, t in self.trades.items()},
         }
         tmp = self.path.with_suffix(".tmp")
         last_err: OSError | None = None
@@ -97,7 +131,6 @@ class TradeStateStore:
             try:
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2)
-                # Windows: replace can hit AccessDenied if AV/indexer locks the file.
                 os.replace(tmp, self.path)
                 return
             except OSError as exc:
@@ -131,7 +164,7 @@ class TradeStateStore:
         equity_at_entry: float = 0.0,
     ) -> ActiveTrade:
         tp, sl = self._tp_sl_prices(side, entry_price, take_profit_pct, stop_loss_pct)
-        self.trade = ActiveTrade(
+        t = ActiveTrade(
             coin=coin,
             side=side,
             entry_price=entry_price,
@@ -145,14 +178,15 @@ class TradeStateStore:
             initial_size=size,
             dca_adds=0,
         )
+        self.trades[str(coin)] = t
         self._save()
-        return self.trade
+        return t
 
-    def record_dca_add(self, new_avg_entry: float, new_size: float) -> None:
+    def record_dca_add(self, new_avg_entry: float, new_size: float, coin: str | None = None) -> None:
         """After a DCA fill: re-center TP/SL on the new average entry."""
-        if self.trade is None:
+        t = self.get(coin) if coin else self.trade
+        if t is None:
             return
-        t = self.trade
         tp, sl = self._tp_sl_prices(
             t.side, new_avg_entry, t.take_profit_pct, t.stop_loss_pct
         )
@@ -163,8 +197,11 @@ class TradeStateStore:
         t.dca_adds += 1
         self._save()
 
-    def clear(self) -> None:
-        self.trade = None
+    def clear(self, coin: str | None = None) -> None:
+        if coin is None:
+            self.trades = {}
+        else:
+            self.trades.pop(str(coin), None)
         self._save()
 
     def sync_from_exchange(
@@ -177,7 +214,8 @@ class TradeStateStore:
         stop_loss_pct: float,
     ) -> None:
         """Rebuild TP/SL from exchange position after restart."""
-        if self.trade is not None and self.trade.side == side and self.trade.coin == coin:
+        existing = self.get(coin)
+        if existing is not None and existing.side == side and existing.coin == coin:
             return
         self.open_trade(coin, side, entry_price, size, take_profit_pct, stop_loss_pct)
 
@@ -201,18 +239,15 @@ class TradeStateStore:
         preserved_equity = equity_at_entry
         preserved_initial = size
         preserved_dca = 0
-        if (
-            self.trade is not None
-            and self.trade.coin == coin
-            and self.trade.side == side
-        ):
-            preserved_opened = self.trade.opened_at
+        existing = self.get(coin)
+        if existing is not None and existing.side == side:
+            preserved_opened = existing.opened_at
             if preserved_equity <= 0:
-                preserved_equity = self.trade.equity_at_entry
-            preserved_initial = self.trade.initial_size or size
-            preserved_dca = self.trade.dca_adds
+                preserved_equity = existing.equity_at_entry
+            preserved_initial = existing.initial_size or size
+            preserved_dca = existing.dca_adds
         tp, sl = self._tp_sl_prices(side, entry_price, take_profit_pct, stop_loss_pct)
-        self.trade = ActiveTrade(
+        t = ActiveTrade(
             coin=coin,
             side=side,
             entry_price=entry_price,
@@ -226,5 +261,6 @@ class TradeStateStore:
             initial_size=preserved_initial,
             dca_adds=preserved_dca,
         )
+        self.trades[str(coin)] = t
         self._save()
-        return self.trade
+        return t

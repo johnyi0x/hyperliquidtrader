@@ -12,6 +12,8 @@ from eth_account.signers.local import LocalAccount
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
+from .candles import INTERVAL_MS
+from .candle_book import CandleBook
 from .hl_rate_limit import (
     RequestGuard,
     ThrottledInfo,
@@ -64,6 +66,8 @@ class HyperliquidClient:
         market: MarketSpec | None = None,
         sdk_perp_dexs: list[str] | None = None,
         api_timeout_s: float = 30.0,
+        request_guard: RequestGuard | None = None,
+        ip_weight_reserve: int | None = None,
     ) -> None:
         self.address = wallet_address
         self.logger = logger
@@ -78,16 +82,13 @@ class HyperliquidClient:
                 wallet_address,
             )
 
-        self._hl_guard = RequestGuard(
+        self._hl_guard = request_guard or RequestGuard(
             min_interval_s=0.12,
             max_429_retries=8,
             logger=logger,
-            shared_budget=default_shared_budget(),
+            shared_budget=default_shared_budget(reserve=ip_weight_reserve),
+            ip_reserve=ip_weight_reserve,
         )
-
-        self._candle_cache_interval: str | None = None
-        self._candle_cache_bucket: int | None = None
-        self._candle_cache_rows: list[dict] = []
         bootstrap_info = ThrottledInfo(
             base_url, skip_ws=True, guard=self._hl_guard, timeout=api_timeout_s
         )
@@ -127,6 +128,7 @@ class HyperliquidClient:
         # Headroom for fees/funding/open-order bookkeeping to avoid margin rejects.
         self._order_margin_buffer = 0.97
         self._user_abstraction: str | None = None
+        self.candle_book = CandleBook(self.info, logger)
         self._ensure_sdk_asset_maps()
 
     def _clearinghouse_dex(self) -> str:
@@ -272,9 +274,6 @@ class HyperliquidClient:
             self.perp_dex = market.perp_dex
             self.only_isolated = market.only_isolated
             self.invalidate_user_state()
-            self._candle_cache_interval = None
-            self._candle_cache_bucket = None
-            self._candle_cache_rows = []
         if sz_decimals is not None:
             self.sz_decimals = int(sz_decimals)
         else:
@@ -283,6 +282,23 @@ class HyperliquidClient:
             self.max_leverage = max(1, int(max_leverage))
         else:
             self.max_leverage = market.max_leverage
+        self._ensure_sdk_asset_maps()
+
+    def apply_market(self, market: MarketSpec) -> None:
+        """Switch active perp using a known MarketSpec (no meta round-trip)."""
+        if (
+            self.coin == market.api_coin
+            and self.market.sz_decimals == market.sz_decimals
+            and (self.perp_dex or "") == (market.perp_dex or "")
+        ):
+            return
+        self.market = market
+        self.coin = market.api_coin
+        self.perp_dex = market.perp_dex
+        self.only_isolated = market.only_isolated
+        self.sz_decimals = market.sz_decimals
+        self.max_leverage = market.max_leverage
+        self.invalidate_user_state()
         self._ensure_sdk_asset_maps()
 
     def set_leverage(self, leverage: int, is_cross: bool = True) -> None:
@@ -474,52 +490,19 @@ class HyperliquidClient:
 
     @staticmethod
     def _interval_ms(interval: str) -> int:
-        return {
-            "1m": 60_000,
-            "3m": 180_000,
-            "5m": 300_000,
-            "15m": 900_000,
-            "30m": 1_800_000,
-            "1h": 3_600_000,
-            "4h": 14_400_000,
-        }[interval]
+        return INTERVAL_MS[interval]
 
     def _fetch_candles(self, interval: str, bars: int) -> list[dict]:
-        interval_ms = self._interval_ms(interval)
-        end = int(time.time() * 1000)
-        start = end - interval_ms * (bars + 5)
-        raw = self.info.candles_snapshot(self.coin, interval, start, end)
-        if not raw:
-            return []
-        by_open_time: dict[int, dict] = {}
-        for candle in raw:
-            by_open_time[int(candle["t"])] = candle
-        return [by_open_time[k] for k in sorted(by_open_time)]
+        return self.candle_book._fetch_raw(self.coin, interval, bars)
 
     def get_closed_candles(self, interval: str, min_bars: int = 40) -> list[dict]:
-        """Only fully closed candles; one candleSnapshot per new closed bar."""
-        interval_ms = self._interval_ms(interval)
-        now_ms = int(time.time() * 1000)
-        bucket = now_ms // interval_ms
+        """Only fully closed candles; refetch a TF only when that TF has a new closed bar."""
+        return self.candle_book.get(self.coin, interval, min_bars)
 
-        if (
-            self._candle_cache_interval == interval
-            and self._candle_cache_bucket == bucket
-            and len(self._candle_cache_rows) >= min_bars
-        ):
-            return self._candle_cache_rows
-
-        candles = self._fetch_candles(interval, bars=min_bars + 5)
-        closed: list[dict] = []
-        for candle in candles:
-            close_ms = int(candle.get("T", int(candle["t"]) + interval_ms - 1))
-            if close_ms < now_ms:
-                closed.append(candle)
-
-        self._candle_cache_interval = interval
-        self._candle_cache_bucket = bucket
-        self._candle_cache_rows = closed
-        return closed
+    def get_closed_candles_for(
+        self, coin: str, interval: str, min_bars: int = 40
+    ) -> list[dict]:
+        return self.candle_book.get(coin, interval, min_bars)
 
     def get_rsi(
         self,
@@ -577,8 +560,14 @@ class HyperliquidClient:
         mark_price: float | None = None,
         min_notional_usd: float = 10.0,
         force_margin: bool = True,
+        margin_from: str = "available",
     ) -> OrderSizeEstimate:
-        """Size/notional for the active or explicit pair parameters."""
+        """Size/notional for the active or explicit pair parameters.
+
+        margin_from:
+          "available" — % of free collateral (legacy).
+          "equity" — % of account equity, then capped by free collateral.
+        """
         dec = self.sz_decimals if sz_decimals is None else int(sz_decimals)
         try:
             available = self.get_available_margin(force=force_margin)
@@ -618,7 +607,42 @@ class HyperliquidClient:
             )
 
         balance_pct = max(0.0, min(float(balance_pct), 95.0))
-        margin = available * (balance_pct / 100.0) * self._order_margin_buffer
+        if str(margin_from).strip().lower() == "equity":
+            try:
+                equity = self.get_account_value(force=force_margin)
+            except Exception:
+                equity = 0.0
+            if equity <= 0:
+                return OrderSizeEstimate(
+                    ok=False,
+                    size=0.0,
+                    notional_usd=0.0,
+                    available_margin=available,
+                    mark_price=mid,
+                    leverage=int(leverage),
+                    sz_decimals=dec,
+                    reason="account equity unavailable for equity-% sizing",
+                )
+            base = equity
+            base_label = f"equity ${equity:.2f}"
+        else:
+            base = available
+            base_label = f"free ${available:.2f}"
+        margin = base * (balance_pct / 100.0) * self._order_margin_buffer
+        if margin > available + 1e-9:
+            return OrderSizeEstimate(
+                ok=False,
+                size=0.0,
+                notional_usd=0.0,
+                available_margin=available,
+                mark_price=mid,
+                leverage=int(leverage),
+                sz_decimals=dec,
+                reason=(
+                    f"needs ${margin:.2f} margin ({balance_pct:.1f}% of {base_label}) "
+                    f"but only ${available:.2f} free"
+                ),
+            )
         notional_target = margin * max(1, int(leverage))
         raw_sz = notional_target / mid
         step = size_step(dec)

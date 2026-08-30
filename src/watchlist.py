@@ -84,19 +84,8 @@ def find_position_in_watchlist(
 
 
 def activate_pair(client: HyperliquidClient, entry: PairSetup) -> None:
-    # Skip resolve/meta round-trip when already on this market (fewer network calls).
-    if (
-        client.coin == entry.api_coin
-        and client.market.sz_decimals == entry.market.sz_decimals
-        and (client.perp_dex or "") == (entry.market.perp_dex or "")
-    ):
-        return
-    client.configure_coin(
-        entry.coin_input,
-        perp_dex=entry.market.perp_dex,
-        sz_decimals=entry.market.sz_decimals,
-        max_leverage=entry.market.max_leverage,
-    )
+    # Skip meta round-trip; watchlist already has MarketSpec.
+    client.apply_market(entry.market)
 
 
 def activate_pair_for_trade(client: HyperliquidClient, entry: PairSetup) -> None:

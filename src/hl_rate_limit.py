@@ -24,8 +24,19 @@ except ImportError:  # pragma: no cover
 
 # https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits
 IP_WEIGHT_PER_MINUTE = 1200
-# Stay under budget so browser + 2–3 bots on same IP can coexist
-IP_WEIGHT_RESERVE = 250
+# Default headroom when this process is the only HL client on the IP (Railway).
+# Raise toward 250 if a browser / extra bots share the same IP.
+IP_WEIGHT_RESERVE = 50
+
+
+def _reserve_from_env(default: int = IP_WEIGHT_RESERVE) -> int:
+    raw = os.environ.get("HL_IP_WEIGHT_RESERVE")
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -102,8 +113,9 @@ def info_request_weight(req_type: str, response_item_count: int = 0) -> int:
 class SharedIpBudget:
     """Optional cross-process budget file (same PC + IP = shared 1200/min)."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, reserve: int | None = None) -> None:
         self.path = path
+        self.reserve = int(reserve) if reserve is not None else _reserve_from_env()
         self._lock = threading.Lock()
 
     def _read(self) -> tuple[int, int]:
@@ -128,7 +140,7 @@ class SharedIpBudget:
                 stored_minute, used = self._read()
                 if stored_minute != minute_bucket:
                     used = 0
-                cap = IP_WEIGHT_PER_MINUTE - IP_WEIGHT_RESERVE
+                cap = IP_WEIGHT_PER_MINUTE - self.reserve
                 if used + weight <= cap:
                     self._write(minute_bucket, used + weight)
                     return
@@ -149,11 +161,14 @@ class RequestGuard:
         max_429_retries: int = 8,
         logger: logging.Logger | None = None,
         shared_budget: SharedIpBudget | None = None,
+        *,
+        ip_reserve: int | None = None,
     ) -> None:
         self.min_interval_s = min_interval_s
         self.max_429_retries = max_429_retries
         self.log = logger or logging.getLogger(__name__)
         self.shared = shared_budget
+        self.ip_reserve = int(ip_reserve) if ip_reserve is not None else _reserve_from_env()
         self._lock = threading.Lock()
         self._last_send = 0.0
         self._local_minute = 0
@@ -168,7 +183,7 @@ class RequestGuard:
             if minute_bucket != self._local_minute:
                 self._local_minute = minute_bucket
                 self._local_used = 0
-            cap = IP_WEIGHT_PER_MINUTE - IP_WEIGHT_RESERVE
+            cap = IP_WEIGHT_PER_MINUTE - self.ip_reserve
             while self._local_used + weight > cap:
                 wait_s = 60 - (time.time() % 60) + 0.05
                 self.log.warning(
@@ -298,10 +313,12 @@ def bind_throttled_exchange_post(exchange: Exchange, guard: RequestGuard) -> Non
     )
 
 
-def default_shared_budget() -> SharedIpBudget:
+def default_shared_budget(reserve: int | None = None) -> SharedIpBudget:
     env_path = os.environ.get("HL_RATE_BUDGET_FILE")
+    use_reserve = int(reserve) if reserve is not None else _reserve_from_env()
     if env_path:
-        return SharedIpBudget(Path(env_path))
+        return SharedIpBudget(Path(env_path), reserve=use_reserve)
     return SharedIpBudget(
-        Path(os.environ.get("TEMP", ".")) / "hyperliquid_rsi_bot_ip_budget.json"
+        Path(os.environ.get("TEMP", ".")) / "hyperliquid_rsi_bot_ip_budget.json",
+        reserve=use_reserve,
     )

@@ -8,14 +8,14 @@ are computed on live prices exactly like production. Only the account side is
 simulated:
 
   - a persisted cash balance (USD)
-  - at most one open position at a time (the bot enforces this)
+  - one or more open paper positions (same-side DCA on a coin still stacks)
   - exchange-style market fills at the live mid price
   - simulated exchange TP/SL that auto-closes when the live mark crosses a level
   - taker fees on entry and exit (mirrors the backtest: 0.045% x2 by default)
 
 State is persisted so a restart behaves like reconnecting to an exchange:
-  data/ema_dev_paper_account.json   balance + open position
-  data/ema_dev_paper_trades.jsonl   one JSON line per closed trade
+  data/paper_account.json   balance + open positions
+  data/paper_trades.jsonl   one JSON line per closed trade
 
 Nothing here touches real funds. Prices are read from mainnet for realism even
 if the live bot is configured for testnet.
@@ -57,10 +57,9 @@ class PaperHyperliquidClient(HyperliquidClient):
         self._start_balance = max(0.0, float(paper_start_balance))
         self._paper_leverage = max(1, int(self.max_leverage))
         self.balance: float = self._start_balance
-        # Open position dict or None:
-        #   {coin, symbol, perp_dex, side, size, entry_px, leverage,
-        #    tp_px, sl_px, entry_fee, opened_at}
-        self.position: dict[str, Any] | None = None
+        # coin -> {coin, symbol, perp_dex, side, size, entry_px, leverage,
+        #          tp_px, sl_px, entry_fee, opened_at}
+        self.positions: dict[str, dict[str, Any]] = {}
         self._load_account()
         self.logger.info(
             "PAPER TRADING active — no real orders. balance=$%.2f fee=%.3f%%x2 "
@@ -81,23 +80,45 @@ class PaperHyperliquidClient(HyperliquidClient):
         try:
             data = json.loads(self._account_path.read_text(encoding="utf-8"))
             self.balance = float(data.get("balance", self._start_balance))
-            pos = data.get("position")
-            self.position = pos if isinstance(pos, dict) and pos else None
+            self.positions = {}
+            raw_many = data.get("positions")
+            if isinstance(raw_many, dict) and raw_many:
+                for coin, pos in raw_many.items():
+                    if isinstance(pos, dict) and pos.get("side"):
+                        pos = dict(pos)
+                        pos.setdefault("coin", coin)
+                        self.positions[str(pos.get("coin") or coin)] = pos
+            else:
+                pos = data.get("position")
+                if isinstance(pos, dict) and pos.get("side"):
+                    self.positions[str(pos.get("coin") or self.coin)] = pos
         except (json.JSONDecodeError, OSError, ValueError, TypeError):
             self.logger.warning("Paper account file unreadable — starting fresh")
             self.balance = self._start_balance
-            self.position = None
+            self.positions = {}
 
     def _save_account(self) -> None:
         payload = {
             "balance": round(self.balance, 8),
             "updated_at": time.time(),
             "updated_at_iso": datetime.now(timezone.utc).isoformat(),
-            "position": self.position,
+            "positions": self.positions,
+            "position": self.positions.get(self.coin),
         }
         tmp = self._account_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self._account_path)
+
+    @property
+    def position(self) -> dict[str, Any] | None:
+        return self.positions.get(self.coin)
+
+    def _pos_obj(self, pos: dict[str, Any]) -> Position:
+        return Position(
+            side=pos["side"],
+            size=float(pos["size"]),
+            entry_price=float(pos["entry_px"]),
+        )
 
     def _record_trade(self, row: dict[str, Any]) -> None:
         try:
@@ -147,24 +168,27 @@ class PaperHyperliquidClient(HyperliquidClient):
         return None
 
     def _settle(self) -> None:
-        """Mark-to-market the open paper position; auto-close on TP/SL cross."""
-        pos = self.position
-        if not pos:
+        """Mark-to-market every paper position; auto-close on TP/SL cross."""
+        if not self.positions:
             return
-        if pos.get("tp_px") is None and pos.get("sl_px") is None:
-            return
-        mark = self._paper_mark_for(pos["coin"], pos["symbol"], pos.get("perp_dex", ""))
-        if mark is None or mark <= 0:
-            return
-        reason = self._exit_reason_for(pos, mark)
-        if reason is None:
-            return
-        # Fill the trigger exactly at its stored level (like an exchange trigger).
-        fill_px = pos["tp_px"] if reason == "take_profit" else pos["sl_px"]
-        self._close_position(float(fill_px), reason)
+        for coin in list(self.positions.keys()):
+            pos = self.positions.get(coin)
+            if not pos:
+                continue
+            if pos.get("tp_px") is None and pos.get("sl_px") is None:
+                continue
+            mark = self._paper_mark_for(pos["coin"], pos["symbol"], pos.get("perp_dex", ""))
+            if mark is None or mark <= 0:
+                continue
+            reason = self._exit_reason_for(pos, mark)
+            if reason is None:
+                continue
+            fill_px = pos["tp_px"] if reason == "take_profit" else pos["sl_px"]
+            self._close_position(float(fill_px), reason, coin=coin)
 
-    def _close_position(self, exit_px: float, reason: str) -> None:
-        pos = self.position
+    def _close_position(self, exit_px: float, reason: str, coin: str | None = None) -> None:
+        key = coin or self.coin
+        pos = self.positions.get(key)
         if not pos:
             return
         side = pos["side"]
@@ -194,7 +218,7 @@ class PaperHyperliquidClient(HyperliquidClient):
             "hold_seconds": round(max(0.0, now - opened_at), 1),
             "balance_after": round(self.balance, 6),
         }
-        self.position = None
+        self.positions.pop(key, None)
         self._save_account()
         self._record_trade(row)
         self.logger.info(
@@ -217,22 +241,22 @@ class PaperHyperliquidClient(HyperliquidClient):
         return False
 
     def _unrealized_gross(self) -> float:
-        pos = self.position
-        if not pos:
-            return 0.0
-        mark = self._paper_mark_for(pos["coin"], pos["symbol"], pos.get("perp_dex", ""))
-        if mark is None or mark <= 0:
-            return 0.0
-        direction = 1.0 if pos["side"] == "long" else -1.0
-        return (mark - float(pos["entry_px"])) * float(pos["size"]) * direction
+        total = 0.0
+        for pos in self.positions.values():
+            mark = self._paper_mark_for(pos["coin"], pos["symbol"], pos.get("perp_dex", ""))
+            if mark is None or mark <= 0:
+                continue
+            direction = 1.0 if pos["side"] == "long" else -1.0
+            total += (mark - float(pos["entry_px"])) * float(pos["size"]) * direction
+        return total
 
     def _margin_used(self) -> float:
-        pos = self.position
-        if not pos:
-            return 0.0
-        notional = float(pos["entry_px"]) * float(pos["size"])
-        lev = max(1, int(pos.get("leverage", self._paper_leverage)))
-        return notional / lev
+        used = 0.0
+        for pos in self.positions.values():
+            notional = float(pos["entry_px"]) * float(pos["size"])
+            lev = max(1, int(pos.get("leverage", self._paper_leverage)))
+            used += notional / lev
+        return used
 
     def get_account_value(self, *, force: bool = False) -> float:
         self._settle()
@@ -249,56 +273,48 @@ class PaperHyperliquidClient(HyperliquidClient):
         return
 
     def _paper_position_obj(self) -> Position | None:
-        pos = self.position
+        pos = self.positions.get(self.coin)
         if not pos:
             return None
-        return Position(
-            side=pos["side"],
-            size=float(pos["size"]),
-            entry_price=float(pos["entry_px"]),
-        )
+        return self._pos_obj(pos)
 
     def _iter_clearinghouse_states(self) -> list[dict[str, Any]]:
         self._settle()
-        pos = self.position
-        if not pos:
-            return [{"assetPositions": []}]
-        szi = float(pos["size"]) * (1.0 if pos["side"] == "long" else -1.0)
-        return [
-            {
-                "assetPositions": [
-                    {
-                        "position": {
-                            "coin": pos["coin"],
-                            "szi": szi,
-                            "entryPx": float(pos["entry_px"]),
-                        }
+        assets = []
+        for pos in self.positions.values():
+            szi = float(pos["size"]) * (1.0 if pos["side"] == "long" else -1.0)
+            assets.append(
+                {
+                    "position": {
+                        "coin": pos["coin"],
+                        "szi": szi,
+                        "entryPx": float(pos["entry_px"]),
                     }
-                ]
-            }
-        ]
+                }
+            )
+        return [{"assetPositions": assets}]
 
     def get_position(self, *, force: bool = False) -> Position | None:
         self._settle()
-        pos = self.position
+        pos = self.positions.get(self.coin)
         if not pos:
             return None
         if not self._matches_active_coin(pos["coin"]):
             return None
-        return self._paper_position_obj()
+        return self._pos_obj(pos)
 
     def fetch_open_positions(
         self, *, force: bool = False
     ) -> tuple[bool, list[tuple[str, Position]]]:
         self._settle()
-        pos = self.position
-        if not pos:
-            return True, []
-        return True, [(pos["coin"], self._paper_position_obj())]
+        out: list[tuple[str, Position]] = []
+        for pos in self.positions.values():
+            out.append((pos["coin"], self._pos_obj(pos)))
+        return True, out
 
     def has_any_open_position(self, *, force: bool = False) -> bool:
         self._settle()
-        return self.position is not None
+        return bool(self.positions)
 
     # ------------------------------------------------------------------ #
     # Leverage / orders (overrides — never hit the real exchange)
@@ -330,12 +346,14 @@ class PaperHyperliquidClient(HyperliquidClient):
         if mark <= 0:
             return {"status": "err", "response": "no mark price"}
         side = "long" if is_buy else "short"
+        existing = self.positions.get(self.coin)
         # Same-side add = DCA (matches live place_market_open stacking).
-        if self.position is not None:
-            pos = self.position
+        if existing is not None:
+            pos = existing
             if pos["side"] != side:
                 self.logger.warning(
-                    "PAPER open refused — opposite-side position already open"
+                    "PAPER open refused — opposite-side position already open on %s",
+                    self.coin,
                 )
                 return {"status": "err", "response": "opposite position exists"}
             old_sz = float(pos["size"])
@@ -347,7 +365,6 @@ class PaperHyperliquidClient(HyperliquidClient):
             pos["size"] = new_sz
             pos["entry_px"] = float(avg_px)
             pos["entry_fee"] = float(pos.get("entry_fee", 0.0)) + float(entry_fee)
-            # Invalidate old TP/SL until attach_position_tpsl re-centers.
             pos["tp_px"] = None
             pos["sl_px"] = None
             self._save_account()
@@ -365,7 +382,7 @@ class PaperHyperliquidClient(HyperliquidClient):
 
         entry_fee = mark * sz * self._fee_frac
         self.balance -= entry_fee
-        self.position = {
+        self.positions[self.coin] = {
             "coin": self.coin,
             "symbol": self.market.symbol,
             "perp_dex": self.perp_dex or "",
@@ -391,15 +408,14 @@ class PaperHyperliquidClient(HyperliquidClient):
         return self._fill_result(sz, mark)
 
     def place_market_close(self, sz: float | None = None) -> dict[str, Any]:
-        pos = self.position
+        pos = self.positions.get(self.coin)
         if not pos:
             return {"status": "ok", "response": {"data": {"statuses": []}}}
         mark = self._paper_mark_for(pos["coin"], pos["symbol"], pos.get("perp_dex", ""))
         if mark is None or mark <= 0:
             mark = self.get_mark_price()
         close_sz = float(pos["size"]) if sz is None else min(float(sz), float(pos["size"]))
-        # Paper positions are single-lot; treat any close as a full close.
-        self._close_position(float(mark), "manual_close")
+        self._close_position(float(mark), "manual_close", coin=self.coin)
         return self._fill_result(close_sz, mark)
 
     def place_limit(
@@ -414,15 +430,15 @@ class PaperHyperliquidClient(HyperliquidClient):
         if sz <= 0:
             return {"status": "err", "response": "zero size"}
         if reduce_only:
-            if self.position is not None:
-                self._close_position(float(limit_px), "manual_close")
+            if self.coin in self.positions:
+                self._close_position(float(limit_px), "manual_close", coin=self.coin)
             return self._fill_result(sz, limit_px)
-        if self.position is not None:
+        if self.coin in self.positions:
             return {"status": "err", "response": "position exists"}
         side = "long" if is_buy else "short"
         entry_fee = float(limit_px) * sz * self._fee_frac
         self.balance -= entry_fee
-        self.position = {
+        self.positions[self.coin] = {
             "coin": self.coin,
             "symbol": self.market.symbol,
             "perp_dex": self.perp_dex or "",
@@ -449,7 +465,7 @@ class PaperHyperliquidClient(HyperliquidClient):
         *,
         max_attempts: int = 3,
     ) -> bool:
-        pos = self.position
+        pos = self.positions.get(self.coin)
         if not pos:
             self.logger.warning("PAPER attach_tpsl skipped — no open position")
             return False
@@ -473,7 +489,7 @@ class PaperHyperliquidClient(HyperliquidClient):
         return True
 
     def has_exchange_tpsl(self) -> bool:
-        pos = self.position
+        pos = self.positions.get(self.coin)
         return bool(pos and pos.get("tp_px") is not None and pos.get("sl_px") is not None)
 
     def has_open_entry_orders(self) -> bool:

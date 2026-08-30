@@ -17,7 +17,7 @@ PAIR_SELECTION_MODE = "top_volume"
 
 # --- top_volume mode only ---
 # How many highest-volume perps to backtest each tune (before MAX_LIVE_PAIRS cut).
-TOP_VOLUME_COUNT = 15
+TOP_VOLUME_COUNT = 27
 # Skip markets whose exchange max leverage is below this (e.g. 3x/5x memes).
 # 0 = no filter. 10 = only pairs with maxLev ≥ 10, then take top TOP_VOLUME_COUNT
 # by volume among those (still fills N if ≥N qualifying markets exist).
@@ -122,11 +122,10 @@ MIN_TRADES_ABS = 5
 # for live scanning (saves Hyperliquid IP weight). ≤N winners → keep all.
 # IMPORTANT: 1 starves live to a single coin (often silent for days).
 # Example ratios: manual 14→5, top_volume 50→15.
-MAX_LIVE_PAIRS = 5
+MAX_LIVE_PAIRS = 9
 
-# TOTAL free-margin % for the whole position (entry + all DCA legs combined).
-# Live splits this evenly: e.g. 30% with 1 entry + 2 DCA → ~10% per fill.
-# Values >95 are capped to 95. Ranking is size-normalized so max % does not auto-win.
+# Tuner-only: which margin % to simulate when ranking setups. Live sizing ignores
+# this — see TOTAL_BALANCE_PCT / BALANCE_SPLIT_POSITIONS below.
 BALANCE_PCT_GRID: tuple[float, ...] = (
     10.0,
     15.0,
@@ -134,9 +133,6 @@ BALANCE_PCT_GRID: tuple[float, ...] = (
     25.0,
     30.0,
     40.0,
-    # 50.0,
-    # 60.0,
-    # 75.0,
 )
 
 # Staged search: screen entries cheaply, then refine top-N with exits/DCA/balance.
@@ -157,9 +153,10 @@ TAKE_PROFIT_PCT = 1.0
 STOP_LOSS_PCT = 1.0
 
 # =============================================================================
-# DCA (mandatory when True + USE_TP_SL; equal-size legs from total balance_pct)
+# DCA
 # =============================================================================
-ALLOW_DCA = True
+# False = never add to an open position (live and future tunes).
+ALLOW_DCA = False
 
 
 # =============================================================================
@@ -175,7 +172,22 @@ MARKET_ORDER_SLIPPAGE = 0.05
 POSITION_POLL_SECONDS = 5
 USE_TESTNET = False
 MIN_ORDER_NOTIONAL_USD = 10.0
-MIN_FREE_MARGIN_FRAC = 0.35
+# Skip a NEW entry when free margin is below this fraction of equity.
+MIN_FREE_MARGIN_FRAC = 0.04
+# True: keep scanning for new coins while others are open.
+ALLOW_CONCURRENT_POSITIONS = True
+# Live/paper sizing (ignores the tuner's saved balance_pct):
+#   TOTAL_BALANCE_PCT = max combined margin vs account equity (leave a little free).
+#   BALANCE_SPLIT_POSITIONS = how many equal slices that 95% is split into.
+# Example $1000 equity: budget $950, each trade uses $316.67 margin (then × leverage
+# for notional). Three open trades ≈ 95%. A 4th is blocked. Same $ amount on trade 1
+# and trade 3 (of current equity), not a shrinking leftover of free margin.
+TOTAL_BALANCE_PCT = 95.0
+BALANCE_SPLIT_POSITIONS = 3
+MAX_CONCURRENT_POSITIONS = 3
+# IP-weight headroom (Hyperliquid 1200/min). 50 is for a dedicated Railway IP.
+# Raise to 250 if a browser or extra bots share the same IP.
+IP_WEIGHT_RESERVE = 50
 
 # Live/paper only: reverse every order vs the backtested signal.
 # True  → same entry bars as the tuned mask, but buy↔sell flipped at order time.
