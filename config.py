@@ -147,7 +147,7 @@ USE_TP_SL = True  # exchange TP/SL when live; backtest grids distances
 USE_EXIT_SIGNAL = True  # indicator / math exit on closed bar
 USE_MAX_HOLD = True  # timeout safety
 
-MAX_POSITION_HOURS = 4.0  # hard time stop when USE_MAX_HOLD
+MAX_POSITION_HOURS = 2.0  # hard time stop when USE_MAX_HOLD
 # Fallback TP/SL spot % before first tune (live only).
 TAKE_PROFIT_PCT = 1.0
 STOP_LOSS_PCT = 1.0

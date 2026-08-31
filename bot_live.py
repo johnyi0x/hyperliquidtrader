@@ -586,12 +586,13 @@ def main() -> None:
         wait = seconds_until_next_candle(wake_iv)
         if cfg.USE_MAX_HOLD and trade_store.trades:
             now = time.time()
-            lefts = [
+            upcoming = [
                 cfg.MAX_POSITION_HOURS * 3600.0 - (now - t.opened_at)
                 for t in trade_store.trades.values()
             ]
-            if lefts:
-                wait = min(wait, max(0.4, min(lefts)))
+            upcoming = [left for left in upcoming if left > 0]
+            if upcoming:
+                wait = min(wait, max(1.0, min(upcoming)))
         return wait
 
     def drop_local(api_coin: str) -> None:
