@@ -182,7 +182,7 @@ ALLOW_CONCURRENT_POSITIONS = True
 # Example $1000 equity: budget $950, each trade uses $316.67 margin (then × leverage
 # for notional). Three open trades ≈ 95%. A 4th is blocked. Same $ amount on trade 1
 # and trade 3 (of current equity), not a shrinking leftover of free margin.
-TOTAL_BALANCE_PCT = 95.0
+TOTAL_BALANCE_PCT = 98.0
 BALANCE_SPLIT_POSITIONS = 5
 MAX_CONCURRENT_POSITIONS = 5
 # IP-weight headroom (Hyperliquid 1200/min). 50 is for a dedicated Railway IP.
