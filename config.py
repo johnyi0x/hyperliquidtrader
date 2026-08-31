@@ -115,7 +115,7 @@ BACKTEST_REFRESH_HOURS = 24.0  # live retune period (change freely)
 MIN_WIN_RATE_PCT = 52.0
 # Soft frequency target for ranking (not a hard per-day quota).
 # Higher values (e.g. 12) make MTF winners rarer / harder to pass the screen.
-TARGET_TRADES_PER_DAY = 5.0
+TARGET_TRADES_PER_DAY = 8.0
 MIN_TRADES_ABS = 5
 
 # If more than this many pairs produce a winner, keep only the top-N by rank_score
@@ -183,8 +183,8 @@ ALLOW_CONCURRENT_POSITIONS = True
 # for notional). Three open trades ≈ 95%. A 4th is blocked. Same $ amount on trade 1
 # and trade 3 (of current equity), not a shrinking leftover of free margin.
 TOTAL_BALANCE_PCT = 95.0
-BALANCE_SPLIT_POSITIONS = 3
-MAX_CONCURRENT_POSITIONS = 3
+BALANCE_SPLIT_POSITIONS = 4
+MAX_CONCURRENT_POSITIONS = 4
 # IP-weight headroom (Hyperliquid 1200/min). 50 is for a dedicated Railway IP.
 # Raise to 250 if a browser or extra bots share the same IP.
 IP_WEIGHT_RESERVE = 50
