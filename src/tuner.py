@@ -124,6 +124,7 @@ def tune_coin_interval(
     allow_dca: bool,
     screen_top_n: int,
     refine_profile: str = "full",
+    dca_max_adds: int = 1,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any] | None:
     log = logger or logging.getLogger("hl-multi")
@@ -222,6 +223,7 @@ def tune_coin_interval(
         allow_dca=allow_dca,
         balance_grid=balance_grid,
         profile=refine_profile,
+        dca_max_adds=dca_max_adds,
     )
     log.info(
         "%s %s: refining top %s entries × %s exit/DCA/bal combos [%s]",
@@ -376,6 +378,7 @@ def tune_coin_mtf(
     screen_top_n: int,
     refine_profile: str = "full",
     mtf_profile: str = "full",
+    dca_max_adds: int = 1,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -554,6 +557,7 @@ def tune_coin_mtf(
         allow_dca=allow_dca,
         balance_grid=balance_grid,
         profile=refine_profile,
+        dca_max_adds=dca_max_adds,
     )
     mtf_grid = mtf_param_grid(usable, profile=mtf_profile)
     log.info(
@@ -715,6 +719,7 @@ def run_full_tune(
     use_max_hold: bool = True,
     max_position_hours: float = 4.0,
     allow_dca: bool = True,
+    dca_max_adds: int = 1,
     screen_top_n: int = 12,
     keep_best_per_interval: bool = False,
     strategy_mode: str = "mtf",
@@ -818,6 +823,7 @@ def run_full_tune(
                     use_max_hold=use_max_hold,
                     max_position_hours=max_position_hours,
                     allow_dca=allow_dca,
+                    dca_max_adds=dca_max_adds,
                     screen_top_n=screen_top_n,
                     refine_profile=refine_profile,
                     mtf_profile=mtf_profile,
@@ -856,6 +862,7 @@ def run_full_tune(
                     use_max_hold=use_max_hold,
                     max_position_hours=max_position_hours,
                     allow_dca=allow_dca,
+                    dca_max_adds=dca_max_adds,
                     screen_top_n=screen_top_n,
                     refine_profile=refine_profile,
                     logger=log,

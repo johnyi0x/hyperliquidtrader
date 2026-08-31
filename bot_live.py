@@ -34,9 +34,8 @@ from src.engine import (
     dca_should_add,
     entry_signal,
     exit_signal,
-    position_leg_count,
+    live_dca_leg_count,
     setup_to_dict,
-    total_balance_pct,
 )
 from src.exchange_client import HyperliquidClient
 from src.hl_rate_limit import (
@@ -225,15 +224,38 @@ def find_watch_entry(watch: list, coin: str):
     return next((e for e in watch if coin in e.position_coin_names()), None)
 
 
-def live_margin_pcts(_setup: object | None = None) -> tuple[float, float, int]:
-    """Live size: (total_budget_pct, per_position_pct, split_count).
+def live_margin_pcts(_setup: object | None = None) -> tuple[float, float, int, int]:
+    """Live size: (total_budget_pct, per_fill_pct, split_count, legs).
 
-    Per trade uses TOTAL_BALANCE_PCT / BALANCE_SPLIT_POSITIONS of *equity*,
-    not leftover free margin. DCA is off; one fill per position.
+    Per pair uses TOTAL_BALANCE_PCT / BALANCE_SPLIT_POSITIONS of *equity*.
+    That pair slice is split equally across entry + DCA_MAX_ADDS extra fills.
     """
     total = min(95.0, max(1.0, float(getattr(cfg, "TOTAL_BALANCE_PCT", 95.0) or 95.0)))
     n = max(1, int(getattr(cfg, "BALANCE_SPLIT_POSITIONS", 3) or 3))
-    return total, total / float(n), n
+    pair_pct = total / float(n)
+    extra = int(getattr(cfg, "DCA_MAX_ADDS", 1) or 0)
+    legs = live_dca_leg_count(
+        allow_dca=bool(getattr(cfg, "ALLOW_DCA", False)),
+        extra_adds=extra,
+    )
+    return total, pair_pct / float(legs), n, legs
+
+
+def live_dca_policy(setup: object | None) -> object | None:
+    """Live DCA overlay: config leg count, trigger from tune or 1.2% default."""
+    extra = int(getattr(cfg, "DCA_MAX_ADDS", 1) or 0)
+    if not bool(getattr(cfg, "ALLOW_DCA", False)) or extra <= 0:
+        return None
+    trigger = 1.2
+    if setup is not None:
+        tuned = float(getattr(setup, "dca_trigger_pct", 0) or 0)
+        if tuned > 0:
+            trigger = tuned
+    return type("DcaPolicy", (), {
+        "dca_enabled": True,
+        "dca_max_adds": extra,
+        "dca_trigger_pct": trigger,
+    })()
 
 
 def pos_side_int(side: str) -> int:
@@ -416,6 +438,7 @@ def main() -> None:
             use_max_hold=cfg.USE_MAX_HOLD,
             max_position_hours=cfg.MAX_POSITION_HOURS,
             allow_dca=cfg.ALLOW_DCA,
+            dca_max_adds=int(getattr(cfg, "DCA_MAX_ADDS", 1) or 1),
             screen_top_n=cfg.SCREEN_TOP_N,
             keep_best_per_interval=cfg.KEEP_BEST_PER_INTERVAL,
             strategy_mode=getattr(cfg, "STRATEGY_MODE", "mtf"),
@@ -476,7 +499,7 @@ def main() -> None:
     logger.info(
         "Starting MULTI [%s] mode=%s | pair_mode=%s | pairs=%s | intervals=%s | exec=%s | "
         "lev_default=%sx | refresh=%.0fh | target≈%.1f/d | max_live=%s | TP/SL=%s signal=%s "
-        "hold=%s | dca=%s | reverse=%s",
+        "hold=%s | dca=%s extra=%s | reverse=%s",
         mode,
         strat_mode,
         pair_mode,
@@ -491,6 +514,7 @@ def main() -> None:
         cfg.USE_EXIT_SIGNAL,
         cfg.USE_MAX_HOLD,
         cfg.ALLOW_DCA,
+        int(getattr(cfg, "DCA_MAX_ADDS", 1) or 0),
         cfg.reverse_orders_enabled(),
     )
     concurrent = bool(getattr(cfg, "ALLOW_CONCURRENT_POSITIONS", True))
@@ -511,12 +535,14 @@ def main() -> None:
         budget["hour_max_pairs"],
         budget["steady_max_pairs"],
     )
-    live_total, live_per, live_splits = live_margin_pcts()
+    live_total, live_per, live_splits, live_legs = live_margin_pcts()
     logger.info(
-        "Sizing: %.0f%% of equity budget ÷ %s positions = %.2f%% of equity per trade "
-        "(no DCA; equal slices, not leftover free margin)",
+        "Sizing: %.0f%% of equity budget ÷ %s positions = %.2f%% per pair, "
+        "%s equal fill(s) → %.2f%% of equity each (not leftover free margin)",
         live_total,
         live_splits,
+        live_total / float(live_splits),
+        live_legs,
         live_per,
     )
     if pair_mode in ("top_volume", "volume", "auto_volume"):
@@ -736,23 +762,17 @@ def main() -> None:
             last_manage_bar[entry.api_coin] = bar_t
             close_px = float(candles[-1]["c"])
             t = trade_store.get(entry.api_coin)
-            if (
-                setup
-                and setup.dca_enabled
-                and cfg.ALLOW_DCA
-                and use_tpsl
-                and t is not None
-            ):
+            dca_pol = live_dca_policy(setup)
+            if dca_pol is not None and use_tpsl and t is not None:
                 if dca_should_add(
-                    setup,
+                    dca_pol,
                     avg_entry_px=float(t.entry_price),
                     mark_or_close=close_px,
                     position_side=t.side,
                     dca_adds_done=int(t.dca_adds),
                 ):
                     add_sz = float(t.initial_size or t.size)
-                    legs = position_leg_count(setup)
-                    total_bal, _, _ = live_margin_pcts(setup)
+                    total_bal, _, _, legs = live_margin_pcts()
                     logger.info(
                         "DCA add %s on closed bar +size≈%s (equal leg %s/%s, "
                         "total bal=%.0f%%%s)",
@@ -833,7 +853,7 @@ def main() -> None:
                 "LONG" if signal_side > 0 else "SHORT",
                 "LONG" if side > 0 else "SHORT",
             )
-        total_bal, bal, slices = live_margin_pcts()
+        total_bal, bal, slices, legs = live_margin_pcts()
         activate_pair_for_trade(client, entry)
         est = client.estimate_order_size(
             bal,
@@ -861,7 +881,8 @@ def main() -> None:
         use_tpsl = bool(setup.use_tpsl and cfg.USE_TP_SL and setup.tp_pct > 0)
         logger.info(
             "Entry %s %s via %s@%s size=%s notional=$%.2f "
-            "margin=%.2f%% of equity (1/%s of %.0f%% budget) tpsl=%s [%s%s]",
+            "margin=%.2f%% of equity (equal leg 1/%s, pair 1/%s of %.0f%%) "
+            "tpsl=%s [%s%s]",
             entry.api_coin,
             "LONG" if is_buy else "SHORT",
             setup.name,
@@ -869,6 +890,7 @@ def main() -> None:
             est.size,
             est.notional_usd,
             bal,
+            legs,
             slices,
             total_bal,
             f"{setup.tp_pct:.2f}%" if use_tpsl else "OFF",

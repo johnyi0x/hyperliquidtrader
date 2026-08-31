@@ -26,6 +26,13 @@ def candles_to_feats(candles: list[dict]) -> dict[str, np.ndarray] | None:
     return build_features(closes, highs, lows, vols)
 
 
+def live_dca_leg_count(*, allow_dca: bool, extra_adds: int) -> int:
+    """Fills planned per pair: 1 entry + extra_adds when DCA is on."""
+    if not allow_dca:
+        return 1
+    return 1 + max(0, int(extra_adds or 0))
+
+
 def position_leg_count(setup: Any) -> int:
     """Total fills planned: 1 entry + dca_max_adds (when DCA on)."""
     if bool(getattr(setup, "dca_enabled", False)) and int(

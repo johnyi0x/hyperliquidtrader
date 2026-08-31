@@ -40,6 +40,8 @@ STRATEGIES: list[StratDef] = [
     StratDef(13, "atr_break_short", -1, "close breaks below prior - k*ATR → short"),
     StratDef(14, "dump_bounce", 1, "fast dump → long fade"),
     StratDef(15, "pump_fade", -1, "fast pump → short fade"),
+    StratDef(16, "dump_rsi_long", 1, "fast dump + RSI oversold → long"),
+    StratDef(17, "pump_rsi_short", -1, "fast pump + RSI overbought → short"),
 ]
 
 STRATEGY_BY_ID = {s.sid: s for s in STRATEGIES}
@@ -138,6 +140,14 @@ def build_entry_mask(
     elif sid == 15:
         ret = feats["ret5"]
         mask = _finite(ret) & (ret >= p0)
+    elif sid == 16:
+        rsi = feats["rsi14"] if int(aux) != 7 else feats["rsi7"]
+        ret = feats["ret5"]
+        mask = _finite(ret) & _finite(rsi) & (ret <= -p0) & (rsi <= p1)
+    elif sid == 17:
+        rsi = feats["rsi14"] if int(aux) != 7 else feats["rsi7"]
+        ret = feats["ret5"]
+        mask = _finite(ret) & _finite(rsi) & (ret >= p0) & (rsi >= p1)
 
     warmup = 40
     if n > warmup:
@@ -165,6 +175,18 @@ ENTRY_GRIDS: dict[int, list[tuple[float, float, float, float]]] = {
     13: [(k, 0, 0, 0) for k in (0.8, 1.2, 1.8)],
     14: [(d, 0, 0, 0) for d in (0.8, 1.2, 2.0, 3.0)],
     15: [(d, 0, 0, 0) for d in (0.8, 1.2, 2.0, 3.0)],
+    16: [
+        (d, r, 0, p)
+        for p in (14, 7)
+        for d in (0.8, 1.2, 2.0)
+        for r in (30.0, 35.0)
+    ],
+    17: [
+        (d, r, 0, p)
+        for p in (14, 7)
+        for d in (0.8, 1.2, 2.0)
+        for r in (65.0, 70.0)
+    ],
 }
 
 # Exit signal ids for closed-bar exits
@@ -190,21 +212,26 @@ EXIT_SIGNAL_GRIDS_FAST: list[dict[str, Any]] = [
     {"exit_eid": 2, "exit_name": "profit_snap", "ex_p0": 1.0, "ex_aux": 0.0},
 ]
 
-DCA_GRID_FAST: list[dict[str, Any]] = [
-    {"dca_enabled": True, "dca_trigger_pct": 0.8, "dca_max_adds": 1, "dca_size_mult": 1.0},
-    {"dca_enabled": True, "dca_trigger_pct": 1.5, "dca_max_adds": 2, "dca_size_mult": 1.0},
-    {"dca_enabled": True, "dca_trigger_pct": 2.5, "dca_max_adds": 3, "dca_size_mult": 1.0},
-]
+def dca_refine_grid(*, fast: bool, max_adds: int) -> list[dict[str, Any]]:
+    """Equal-size extra fills after entry. max_adds=1 → two legs total."""
+    n = max(1, int(max_adds))
+    triggers = (0.8, 1.5, 2.5) if fast else (0.8, 1.2, 1.5, 2.0, 2.5)
+    return [
+        {
+            "dca_enabled": True,
+            "dca_trigger_pct": float(t),
+            "dca_max_adds": n,
+            "dca_size_mult": 1.0,
+        }
+        for t in triggers
+    ]
+
+
+DCA_GRID_FAST: list[dict[str, Any]] = dca_refine_grid(fast=True, max_adds=1)
 
 # DCA: always-on variants when ALLOW_DCA (equal-size legs; size_mult kept at 1).
 # balance_pct is TOTAL margin budget for entry + all DCA adds combined.
-DCA_GRID: list[dict[str, Any]] = [
-    {"dca_enabled": True, "dca_trigger_pct": 0.8, "dca_max_adds": 1, "dca_size_mult": 1.0},
-    {"dca_enabled": True, "dca_trigger_pct": 1.2, "dca_max_adds": 1, "dca_size_mult": 1.0},
-    {"dca_enabled": True, "dca_trigger_pct": 1.5, "dca_max_adds": 2, "dca_size_mult": 1.0},
-    {"dca_enabled": True, "dca_trigger_pct": 2.0, "dca_max_adds": 2, "dca_size_mult": 1.0},
-    {"dca_enabled": True, "dca_trigger_pct": 2.5, "dca_max_adds": 3, "dca_size_mult": 1.0},
-]
+DCA_GRID: list[dict[str, Any]] = dca_refine_grid(fast=False, max_adds=1)
 
 DCA_OFF: dict[str, Any] = {
     "dca_enabled": False,
@@ -308,6 +335,7 @@ def iter_refine_combos(
     allow_dca: bool,
     balance_grid: tuple[float, ...],
     profile: str = "full",
+    dca_max_adds: int = 1,
 ) -> list[dict[str, Any]]:
     """Stage-2 exit/DCA/balance variants (applied to top screened entries)."""
     fast = str(profile or "full").strip().lower() == "fast"
@@ -320,7 +348,7 @@ def iter_refine_combos(
         ]
     # DCA is mandatory when allowed (+ TP/SL for live protect re-center).
     if allow_dca and use_tpsl:
-        dcas = DCA_GRID_FAST if fast else DCA_GRID
+        dcas = dca_refine_grid(fast=fast, max_adds=dca_max_adds)
     else:
         dcas = [DCA_OFF]
     bals = balance_grid or (30.0,)

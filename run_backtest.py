@@ -123,6 +123,7 @@ def main() -> None:
         use_max_hold=cfg.USE_MAX_HOLD,
         max_position_hours=cfg.MAX_POSITION_HOURS,
         allow_dca=cfg.ALLOW_DCA,
+        dca_max_adds=int(getattr(cfg, "DCA_MAX_ADDS", 1) or 1),
         screen_top_n=cfg.SCREEN_TOP_N,
         keep_best_per_interval=cfg.KEEP_BEST_PER_INTERVAL,
         strategy_mode=getattr(cfg, "STRATEGY_MODE", "mtf"),

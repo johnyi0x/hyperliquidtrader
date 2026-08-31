@@ -155,8 +155,11 @@ STOP_LOSS_PCT = 1.0
 # =============================================================================
 # DCA
 # =============================================================================
-# False = never add to an open position (live and future tunes).
-ALLOW_DCA = False
+# True = add one extra same-size fill when price moves against the position.
+# Pair budget (TOTAL_BALANCE_PCT / BALANCE_SPLIT_POSITIONS) is split equally
+# across entry + DCA_MAX_ADDS extra fills. 1 extra add = two equal legs.
+ALLOW_DCA = True
+DCA_MAX_ADDS = 1
 
 
 # =============================================================================
@@ -179,9 +182,9 @@ ALLOW_CONCURRENT_POSITIONS = True
 # Live/paper sizing (ignores the tuner's saved balance_pct):
 #   TOTAL_BALANCE_PCT = max combined margin vs account equity (leave a little free).
 #   BALANCE_SPLIT_POSITIONS = how many equal slices that 95% is split into.
-# Example $1000 equity: budget $950, each trade uses $316.67 margin (then × leverage
-# for notional). Three open trades ≈ 95%. A 4th is blocked. Same $ amount on trade 1
-# and trade 3 (of current equity), not a shrinking leftover of free margin.
+# Example $1000 equity: budget $950 (capped 95% in live sizing), 5 pairs.
+# Each pair gets 19% of equity total; with DCA_MAX_ADDS=1 that is two equal
+# ~9.5% fills (entry + one add). A 6th coin is blocked.
 TOTAL_BALANCE_PCT = 98.0
 BALANCE_SPLIT_POSITIONS = 5
 MAX_CONCURRENT_POSITIONS = 5
