@@ -158,7 +158,7 @@ STOP_LOSS_PCT = 1.0
 # True = add one extra same-size fill when price moves against the position.
 # Pair budget (TOTAL_BALANCE_PCT / BALANCE_SPLIT_POSITIONS) is split equally
 # across entry + DCA_MAX_ADDS extra fills. 1 extra add = two equal legs.
-ALLOW_DCA = True
+ALLOW_DCA = False
 DCA_MAX_ADDS = 1
 
 
@@ -197,8 +197,8 @@ IP_WEIGHT_RESERVE = 50
 #         Frequency matches the original; DCA/TP/SL follow the real position.
 # False → orders match the backtest side.
 # Backtest/tune is NEVER reversed — only live/paper execution.
-REVERSE_STRATEGY = False
-FLIP_EXECUTION = False # legacy alias; either True enables reverse
+REVERSE_STRATEGY = True
+FLIP_EXECUTION = True # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:
