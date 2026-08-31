@@ -185,7 +185,7 @@ ALLOW_CONCURRENT_POSITIONS = True
 # Example $1000 equity: budget $950 (capped 95% in live sizing), 5 pairs.
 # Each pair gets 19% of equity total; with DCA_MAX_ADDS=1 that is two equal
 # ~9.5% fills (entry + one add). A 6th coin is blocked.
-TOTAL_BALANCE_PCT = 98.0
+TOTAL_BALANCE_PCT = 55.0
 BALANCE_SPLIT_POSITIONS = 5
 MAX_CONCURRENT_POSITIONS = 5
 # IP-weight headroom (Hyperliquid 1200/min). 50 is for a dedicated Railway IP.
