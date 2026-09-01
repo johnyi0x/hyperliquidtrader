@@ -1,14 +1,15 @@
 """
-Discover Hyperliquid perp pairs by 24h notional volume (dayNtlVlm).
+Discover Hyperliquid perp pairs by 24h notional volume or 24h % movers.
 
-Used by PAIR_SELECTION_MODE = "top_volume". Manual PAIRS mode does not use this.
+Used by PAIR_SELECTION_MODE = "top_volume" / "top_movers".
+Manual PAIRS mode does not use this.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Iterable
 
 from .market_resolver import (
     _max_leverage_from_asset,
@@ -16,6 +17,35 @@ from .market_resolver import (
     list_perp_dex_names,
     parse_coin_input,
 )
+
+VOLUME_MODES = frozenset({"top_volume", "volume", "auto_volume"})
+MOVER_MODES = frozenset(
+    {
+        "top_movers",
+        "movers",
+        "gainers_losers",
+        "top_gainer_loser",
+        "top_gainer_losers",
+        "gainer_loser",
+        "gainer_losers",
+    }
+)
+
+
+def is_volume_mode(mode: str | None) -> bool:
+    return str(mode or "").strip().lower() in VOLUME_MODES
+
+
+def is_mover_mode(mode: str | None) -> bool:
+    return str(mode or "").strip().lower() in MOVER_MODES
+
+
+def is_auto_pair_mode(mode: str | None) -> bool:
+    return is_volume_mode(mode) or is_mover_mode(mode)
+
+
+def valid_pair_modes() -> tuple[str, ...]:
+    return ("manual", *sorted(VOLUME_MODES | MOVER_MODES))
 
 
 @dataclass(frozen=True)
@@ -27,6 +57,53 @@ class VolumePair:
     day_ntl_vlm: float
     sz_decimals: int
     only_isolated: bool
+    day_chg_pct: float = 0.0
+    mark_px: float = 0.0
+    prev_day_px: float = 0.0
+
+
+@dataclass
+class PairUniverse:
+    """[(api_coin_or_input, leverage), ...] plus optional 24h gainer/loser tags."""
+
+    pairs: list[tuple[str, int]]
+    buckets: dict[str, str] = field(default_factory=dict)
+
+    def __iter__(self):
+        return iter(self.pairs)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+
+def fade_tune_side(bucket: str, reverse: bool) -> int:
+    """
+    Live fade: short 24h gainers, long 24h losers.
+
+    Backtest/tune is never reversed. If live reverse is on, constrain tune to
+    the opposite side so the order-time flip still yields that fade.
+    """
+    live = -1 if str(bucket or "").strip().lower() == "gainer" else 1
+    return -live if reverse else live
+
+
+def allowed_sides_for_movers(
+    buckets: dict[str, str] | None,
+    reverse: bool,
+) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for coin, bucket in (buckets or {}).items():
+        b = str(bucket or "").strip().lower()
+        if b not in ("gainer", "loser"):
+            continue
+        out[str(coin)] = fade_tune_side(b, reverse)
+    return out
+
+
+def mover_half_counts(n: int) -> tuple[int, int]:
+    """(gainers, losers). Odd leftover goes to gainers."""
+    total = max(1, int(n))
+    return (total + 1) // 2, total // 2
 
 
 def _as_float(raw: Any, default: float = 0.0) -> float:
@@ -81,6 +158,9 @@ def _pairs_from_meta_ctxs(
         vol = _as_float(ctx.get("dayNtlVlm"), 0.0)
         if vol <= 0:
             continue
+        mark = _as_float(ctx.get("markPx") or ctx.get("midPx") or ctx.get("oraclePx"), 0.0)
+        prev = _as_float(ctx.get("prevDayPx"), 0.0)
+        chg = ((mark - prev) / prev * 100.0) if prev > 0 and mark > 0 else 0.0
         only_iso = bool(
             asset.get("onlyIsolated") or asset.get("marginMode") == "strictIsolated"
         )
@@ -93,8 +173,155 @@ def _pairs_from_meta_ctxs(
                 day_ntl_vlm=vol,
                 sz_decimals=int(asset.get("szDecimals", 4) or 4),
                 only_isolated=only_iso,
+                day_chg_pct=chg,
+                mark_px=mark,
+                prev_day_px=prev,
             )
         )
+    return out
+
+
+def _normalize_xyz_mode(xyz_mode: str, include_xyz: bool) -> str:
+    mode = str(xyz_mode or "").strip().lower()
+    if mode in ("xyz", "hip3", "hip-3", "only_xyz"):
+        return "xyz_only"
+    if mode in ("both", "all"):
+        return "include"
+    if mode in ("main", "hl"):
+        return "native"
+    if mode in ("native", "include", "xyz_only"):
+        return mode
+    return "include" if include_xyz else "native"
+
+
+def _collect_perp_pairs(
+    info: Any,
+    *,
+    xyz_mode: str,
+    include_xyz: bool,
+    logger: logging.Logger,
+    scan_label: str,
+) -> tuple[list[VolumePair], str]:
+    mode = _normalize_xyz_mode(xyz_mode, include_xyz)
+    collected: list[VolumePair] = []
+
+    if mode in ("native", "include"):
+        meta, ctxs = _fetch_meta_and_ctxs(info, "")
+        native = _pairs_from_meta_ctxs(meta, ctxs, perp_dex=None)
+        collected.extend(native)
+        logger.info("%s scan native: %s markets with dayNtlVlm>0", scan_label, len(native))
+
+    if mode in ("include", "xyz_only"):
+        try:
+            dex_names = list_perp_dex_names(info)
+        except Exception as exc:
+            logger.warning("Could not list perp dexes for HIP-3 %s scan: %s", scan_label, exc)
+            dex_names = []
+        hip_total = 0
+        for dex in dex_names:
+            dex_s = str(dex or "").strip()
+            if not dex_s:
+                continue
+            try:
+                m, c = _fetch_meta_and_ctxs(info, dex_s)
+                hip = _pairs_from_meta_ctxs(m, c, perp_dex=dex_s)
+                collected.extend(hip)
+                hip_total += len(hip)
+                logger.info("%s scan %s: %s markets with dayNtlVlm>0", scan_label, dex_s, len(hip))
+            except Exception as exc:
+                logger.warning("%s scan failed for dex %s: %s", scan_label, dex_s, exc)
+        if mode == "xyz_only" and hip_total == 0:
+            logger.warning("XYZ_PAIR_MODE=xyz_only found no HIP-3 markets")
+
+    logger.info("%s scan scope=%s collected=%s", scan_label, mode, len(collected))
+    return collected, mode
+
+
+def _dedupe_by_api_coin(collected: Iterable[VolumePair]) -> list[VolumePair]:
+    best: dict[str, VolumePair] = {}
+    for p in collected:
+        key = p.api_coin.upper()
+        prev = best.get(key)
+        if prev is None or p.day_ntl_vlm > prev.day_ntl_vlm:
+            best[key] = p
+    return list(best.values())
+
+
+def _filter_by_leverage(
+    ranked: list[VolumePair],
+    *,
+    min_lev: int,
+    max_lev_cap: int,
+    logger: logging.Logger,
+) -> list[VolumePair]:
+    if min_lev > 0:
+        skipped = [p for p in ranked if int(p.max_leverage) < min_lev]
+        ranked = [p for p in ranked if int(p.max_leverage) >= min_lev]
+        if skipped:
+            sample = ", ".join(f"{p.api_coin}({p.max_leverage}x)" for p in skipped[:8])
+            extra = "" if len(skipped) <= 8 else f" +{len(skipped) - 8} more"
+            logger.info(
+                "Min maxLev ≥%sx: dropped %s low-lev markets (%s%s)",
+                min_lev,
+                len(skipped),
+                sample,
+                extra,
+            )
+    if max_lev_cap > 0:
+        skipped_hi = [p for p in ranked if int(p.max_leverage) > max_lev_cap]
+        ranked = [p for p in ranked if int(p.max_leverage) <= max_lev_cap]
+        if skipped_hi:
+            sample = ", ".join(f"{p.api_coin}({p.max_leverage}x)" for p in skipped_hi[:8])
+            extra = "" if len(skipped_hi) <= 8 else f" +{len(skipped_hi) - 8} more"
+            logger.info(
+                "Max maxLev ≤%sx: dropped %s high-lev markets (%s%s)",
+                max_lev_cap,
+                len(skipped_hi),
+                sample,
+                extra,
+            )
+    return ranked
+
+
+def _lev_label(min_lev: int, max_lev_cap: int) -> str:
+    lev_lo = min_lev if min_lev > 0 else 1
+    lev_hi = max_lev_cap if max_lev_cap > 0 else None
+    return f"{lev_lo}–{lev_hi}x" if lev_hi is not None else f"≥{lev_lo}x"
+
+
+def _assign_discovered_leverage(
+    discovered: list[VolumePair],
+    *,
+    use_max_leverage: bool,
+    leverage_overrides: dict[str, int],
+    requested_leverage_for,
+) -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    for p in discovered:
+        if use_max_leverage:
+            lev = max(1, int(p.max_leverage))
+            ov = None
+            for key in (p.api_coin, p.symbol, f"{p.perp_dex}:{p.symbol}" if p.perp_dex else ""):
+                if key and key in leverage_overrides:
+                    ov = int(leverage_overrides[key])
+                    break
+                for ok, ov_v in leverage_overrides.items():
+                    if str(ok).strip().upper() == str(key).upper():
+                        ov = int(ov_v)
+                        break
+                if ov is not None:
+                    break
+            if ov is not None:
+                lev = max(1, min(int(ov), int(p.max_leverage)))
+        else:
+            lev = max(
+                1,
+                min(
+                    int(requested_leverage_for(p.api_coin, p.symbol)),
+                    int(p.max_leverage),
+                ),
+            )
+        out.append((p.api_coin, lev))
     return out
 
 
@@ -131,91 +358,20 @@ def discover_top_volume_pairs(
             max_lev_cap,
             min_lev,
         )
-    mode = str(xyz_mode or "").strip().lower()
-    if mode in ("xyz", "hip3", "hip-3", "only_xyz"):
-        mode = "xyz_only"
-    elif mode in ("both", "all"):
-        mode = "include"
-    elif mode in ("main", "hl"):
-        mode = "native"
-    if mode not in ("native", "include", "xyz_only"):
-        mode = "include" if include_xyz else "native"
 
-    collected: list[VolumePair] = []
-
-    if mode in ("native", "include"):
-        meta, ctxs = _fetch_meta_and_ctxs(info, "")
-        native = _pairs_from_meta_ctxs(meta, ctxs, perp_dex=None)
-        collected.extend(native)
-        log.info("Volume scan native: %s markets with dayNtlVlm>0", len(native))
-
-    if mode in ("include", "xyz_only"):
-        try:
-            dex_names = list_perp_dex_names(info)
-        except Exception as exc:
-            log.warning("Could not list perp dexes for HIP-3 volume scan: %s", exc)
-            dex_names = []
-        hip_total = 0
-        for dex in dex_names:
-            dex_s = str(dex or "").strip()
-            if not dex_s:
-                continue
-            try:
-                m, c = _fetch_meta_and_ctxs(info, dex_s)
-                hip = _pairs_from_meta_ctxs(m, c, perp_dex=dex_s)
-                collected.extend(hip)
-                hip_total += len(hip)
-                log.info("Volume scan %s: %s markets with dayNtlVlm>0", dex_s, len(hip))
-            except Exception as exc:
-                log.warning("Volume scan failed for dex %s: %s", dex_s, exc)
-        if mode == "xyz_only" and hip_total == 0:
-            log.warning("XYZ_PAIR_MODE=xyz_only found no HIP-3 markets")
-
-    log.info("Volume scan scope=%s collected=%s", mode, len(collected))
-
-    # De-dupe by api_coin (keep highest volume if duplicates).
-    best: dict[str, VolumePair] = {}
-    for p in collected:
-        key = p.api_coin.upper()
-        prev = best.get(key)
-        if prev is None or p.day_ntl_vlm > prev.day_ntl_vlm:
-            best[key] = p
-
-    ranked = sorted(best.values(), key=lambda p: p.day_ntl_vlm, reverse=True)
-    if min_lev > 0:
-        skipped = [p for p in ranked if int(p.max_leverage) < min_lev]
-        ranked = [p for p in ranked if int(p.max_leverage) >= min_lev]
-        if skipped:
-            sample = ", ".join(
-                f"{p.api_coin}({p.max_leverage}x)" for p in skipped[:8]
-            )
-            extra = "" if len(skipped) <= 8 else f" +{len(skipped) - 8} more"
-            log.info(
-                "Min maxLev ≥%sx: dropped %s low-lev markets (%s%s)",
-                min_lev,
-                len(skipped),
-                sample,
-                extra,
-            )
-    if max_lev_cap > 0:
-        skipped_hi = [p for p in ranked if int(p.max_leverage) > max_lev_cap]
-        ranked = [p for p in ranked if int(p.max_leverage) <= max_lev_cap]
-        if skipped_hi:
-            sample = ", ".join(
-                f"{p.api_coin}({p.max_leverage}x)" for p in skipped_hi[:8]
-            )
-            extra = "" if len(skipped_hi) <= 8 else f" +{len(skipped_hi) - 8} more"
-            log.info(
-                "Max maxLev ≤%sx: dropped %s high-lev markets (%s%s)",
-                max_lev_cap,
-                len(skipped_hi),
-                sample,
-                extra,
-            )
+    collected, mode = _collect_perp_pairs(
+        info,
+        xyz_mode=xyz_mode,
+        include_xyz=include_xyz,
+        logger=log,
+        scan_label="Volume",
+    )
+    ranked = sorted(_dedupe_by_api_coin(collected), key=lambda p: p.day_ntl_vlm, reverse=True)
+    ranked = _filter_by_leverage(
+        ranked, min_lev=min_lev, max_lev_cap=max_lev_cap, logger=log
+    )
     top = ranked[:n]
-    lev_lo = min_lev if min_lev > 0 else 1
-    lev_hi = max_lev_cap if max_lev_cap > 0 else None
-    lev_label = f"{lev_lo}–{lev_hi}x" if lev_hi is not None else f"≥{lev_lo}x"
+    lev_label = _lev_label(min_lev, max_lev_cap)
     if top:
         if len(top) < n:
             log.warning(
@@ -248,6 +404,116 @@ def discover_top_volume_pairs(
     return top
 
 
+def discover_top_mover_pairs(
+    info: Any,
+    top_n: int,
+    *,
+    include_xyz: bool = False,
+    xyz_mode: str = "native",
+    min_max_leverage: int = 0,
+    max_max_leverage: int = 0,
+    logger: logging.Logger | None = None,
+) -> tuple[list[VolumePair], dict[str, str]]:
+    """
+    Rank perps by 24h % change vs prevDayPx.
+
+    Returns (pairs, buckets) where buckets maps api_coin → "gainer"|"loser".
+    Half the look-set are the strongest gainers, half the weakest losers
+    (odd leftover goes to gainers). No coin is in both buckets.
+    """
+    log = logger or logging.getLogger("hl-multi")
+    n = max(1, int(top_n))
+    n_gain, n_lose = mover_half_counts(n)
+    min_lev = max(0, int(min_max_leverage or 0))
+    max_lev_cap = max(0, int(max_max_leverage or 0))
+    if max_lev_cap > 0 and min_lev > 0 and max_lev_cap < min_lev:
+        log.warning(
+            "MAX_MAX_LEVERAGE (%s) < MIN_MAX_LEVERAGE (%s) — no markets can qualify",
+            max_lev_cap,
+            min_lev,
+        )
+
+    collected, mode = _collect_perp_pairs(
+        info,
+        xyz_mode=xyz_mode,
+        include_xyz=include_xyz,
+        logger=log,
+        scan_label="Mover",
+    )
+    ranked = _filter_by_leverage(
+        _dedupe_by_api_coin(collected),
+        min_lev=min_lev,
+        max_lev_cap=max_lev_cap,
+        logger=log,
+    )
+    eligible = [p for p in ranked if p.prev_day_px > 0 and p.mark_px > 0]
+    skipped_px = len(ranked) - len(eligible)
+    if skipped_px:
+        log.info("Mover scan: skipped %s markets without prevDayPx/markPx", skipped_px)
+
+    by_chg = sorted(eligible, key=lambda p: p.day_chg_pct, reverse=True)
+    gainers = by_chg[:n_gain]
+    gainer_keys = {p.api_coin.upper() for p in gainers}
+    losers_pool = [p for p in by_chg if p.api_coin.upper() not in gainer_keys]
+    losers_pool.sort(key=lambda p: p.day_chg_pct)
+    losers = losers_pool[:n_lose]
+
+    # If one side is short (tiny universe), fill leftover slots from the other.
+    leftover = n - len(gainers) - len(losers)
+    if leftover > 0:
+        used = {p.api_coin.upper() for p in gainers} | {p.api_coin.upper() for p in losers}
+        rest = [p for p in by_chg if p.api_coin.upper() not in used]
+        if len(gainers) < n_gain:
+            extra = rest[:leftover]
+            gainers.extend(extra)
+        else:
+            rest_lose = sorted(rest, key=lambda p: p.day_chg_pct)
+            losers.extend(rest_lose[:leftover])
+
+    buckets: dict[str, str] = {}
+    for p in gainers:
+        buckets[p.api_coin] = "gainer"
+    for p in losers:
+        buckets[p.api_coin] = "loser"
+
+    # Gainers (hottest first) then losers (weakest first) so logs read clearly.
+    top = list(gainers) + list(losers)
+    lev_label = _lev_label(min_lev, max_lev_cap)
+    if top:
+        g_txt = ", ".join(f"{p.api_coin}({p.day_chg_pct:+.1f}%)" for p in gainers[:7])
+        l_txt = ", ".join(f"{p.api_coin}({p.day_chg_pct:+.1f}%)" for p in losers[:7])
+        extra_g = f" +{len(gainers) - 7}" if len(gainers) > 7 else ""
+        extra_l = f" +{len(losers) - 7}" if len(losers) > 7 else ""
+        log.info(
+            "Top movers %s (scope=%s maxLev %s) | %s gainers + %s losers of %s with 24h %%",
+            len(top),
+            mode,
+            lev_label,
+            len(gainers),
+            len(losers),
+            len(eligible),
+        )
+        if gainers:
+            log.info("24h gainers: %s%s", g_txt, extra_g)
+        if losers:
+            log.info("24h losers: %s%s", l_txt, extra_l)
+        if len(top) < n:
+            log.warning(
+                "Only %s/%s qualifying mover markets (scope=%s maxLev %s)",
+                len(top),
+                n,
+                mode,
+                lev_label,
+            )
+    else:
+        log.warning(
+            "Top mover scan returned no markets (scope=%s maxLev %s)",
+            mode,
+            lev_label,
+        )
+    return top, buckets
+
+
 def resolve_pair_universe(
     info: Any,
     *,
@@ -262,14 +528,16 @@ def resolve_pair_universe(
     min_max_leverage: int = 0,
     max_max_leverage: int = 0,
     xyz_mode: str | None = None,
+    top_mover_count: int | None = None,
     logger: logging.Logger | None = None,
-) -> list[tuple[str, int]]:
+) -> PairUniverse:
     """
-    Returns [(api_coin_or_input, leverage), ...] for tune + watch.
+    Returns PairUniverse for tune + watch.
 
     mode:
       - "manual": use manual_pairs + PAIR_LEVERAGE / LEVERAGE
-      - "top_volume": discover by dayNtlVlm; leverage = exchange max (unless override)
+      - "top_volume": discover by dayNtlVlm
+      - "top_movers": half 24h gainers + half 24h losers
     """
     log = logger or logging.getLogger("hl-multi")
     mode_s = (mode or "manual").strip().lower()
@@ -278,7 +546,7 @@ def resolve_pair_universe(
     if not scope:
         scope = "include" if include_xyz else "native"
 
-    if mode_s in ("top_volume", "volume", "auto_volume"):
+    if is_volume_mode(mode_s):
         discovered = discover_top_volume_pairs(
             info,
             top_volume_count,
@@ -293,42 +561,44 @@ def resolve_pair_universe(
                 "PAIR_SELECTION_MODE=top_volume found no markets — check "
                 "XYZ_PAIR_MODE / INCLUDE_XYZ_PAIRS / MIN_MAX_LEVERAGE / MAX_MAX_LEVERAGE"
             )
-        out: list[tuple[str, int]] = []
-        for p in discovered:
-            # Prefer exchange max; allow rare manual overrides by api/symbol.
-            if use_max_leverage:
-                lev = max(1, int(p.max_leverage))
-                # Optional overrides still win if present.
-                ov = None
-                for key in (p.api_coin, p.symbol, f"{p.perp_dex}:{p.symbol}" if p.perp_dex else ""):
-                    if key and key in overrides:
-                        ov = int(overrides[key])
-                        break
-                    for ok, ov_v in overrides.items():
-                        if str(ok).strip().upper() == str(key).upper():
-                            ov = int(ov_v)
-                            break
-                    if ov is not None:
-                        break
-                if ov is not None:
-                    lev = max(1, min(int(ov), int(p.max_leverage)))
-            else:
-                lev = max(
-                    1,
-                    min(
-                        int(requested_leverage_for(p.api_coin, p.symbol)),
-                        int(p.max_leverage),
-                    ),
-                )
-            out.append((p.api_coin, lev))
-        return out
+        pairs = _assign_discovered_leverage(
+            discovered,
+            use_max_leverage=use_max_leverage,
+            leverage_overrides=overrides,
+            requested_leverage_for=requested_leverage_for,
+        )
+        return PairUniverse(pairs=pairs)
+
+    if is_mover_mode(mode_s):
+        n = int(top_mover_count) if top_mover_count is not None else int(top_volume_count)
+        discovered, buckets = discover_top_mover_pairs(
+            info,
+            n,
+            include_xyz=bool(include_xyz),
+            xyz_mode=scope,
+            min_max_leverage=int(min_max_leverage or 0),
+            max_max_leverage=int(max_max_leverage or 0),
+            logger=log,
+        )
+        if not discovered:
+            raise RuntimeError(
+                "PAIR_SELECTION_MODE=top_movers found no markets — check "
+                "XYZ_PAIR_MODE / INCLUDE_XYZ_PAIRS / MIN_MAX_LEVERAGE / MAX_MAX_LEVERAGE"
+            )
+        pairs = _assign_discovered_leverage(
+            discovered,
+            use_max_leverage=use_max_leverage,
+            leverage_overrides=overrides,
+            requested_leverage_for=requested_leverage_for,
+        )
+        return PairUniverse(pairs=pairs, buckets=buckets)
 
     # Manual selection (existing behavior)
-    pairs = [str(x).strip() for x in manual_pairs if str(x).strip()]
-    if not pairs:
+    pair_list = [str(x).strip() for x in manual_pairs if str(x).strip()]
+    if not pair_list:
         raise ValueError("PAIRS must list at least one pair in manual mode")
-    out = []
-    for raw in pairs:
+    out: list[tuple[str, int]] = []
+    for raw in pair_list:
         sym, dex = parse_coin_input(raw)
         api = f"{dex}:{sym}" if dex else sym
         lev = max(1, int(requested_leverage_for(raw, api, sym)))
@@ -339,4 +609,4 @@ def resolve_pair_universe(
         default_leverage,
         len(overrides),
     )
-    return out
+    return PairUniverse(pairs=out)

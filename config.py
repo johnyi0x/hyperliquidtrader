@@ -9,23 +9,29 @@ from __future__ import annotations
 # =============================================================================
 # PAIR SELECTION
 # =============================================================================
-# "manual"     = use PAIRS (+ PAIR_LEVERAGE) exactly as listed (current behavior).
-# "top_volume" = auto-pick the highest 24h notional-volume perps, then tune all,
-#                then keep only MAX_LIVE_PAIRS winners for live (same ratio idea
-#                as 14→5, but e.g. 50→15 for more frequent trades).
-PAIR_SELECTION_MODE = "top_volume"
+# "manual"      = use PAIRS (+ PAIR_LEVERAGE) exactly as listed.
+# "top_volume"  = auto-pick the highest 24h notional-volume perps, then tune all,
+#                 then keep only MAX_LIVE_PAIRS winners for live.
+# "top_movers"  = auto-pick 24h % gainers + 24h % losers (half each), then tune.
+#                 Live fade: short gainers / long losers. With REVERSE_STRATEGY
+#                 the tuner searches the un-reversed side so the live flip still
+#                 fades (backtest itself is never reversed).
+PAIR_SELECTION_MODE = "top_movers"
 
 # --- top_volume mode only ---
 # How many highest-volume perps to backtest each tune (before MAX_LIVE_PAIRS cut).
 TOP_VOLUME_COUNT = 27
+# --- top_movers mode only ---
+# Look-set size. Half are 24h gainers, half are 24h losers (odd extra → gainers).
+# Example 14 → 7 gainers + 7 losers, then MAX_LIVE_PAIRS keeps the best of those.
+TOP_MOVER_COUNT = 14
 # Skip markets whose exchange max leverage is below this (e.g. 3x/5x memes).
-# 0 = no filter. 10 = only pairs with maxLev ≥ 10, then take top TOP_VOLUME_COUNT
-# by volume among those (still fills N if ≥N qualifying markets exist).
+# 0 = no filter. 10 = only pairs with maxLev ≥ 10, then take top N among those.
 MIN_MAX_LEVERAGE = 10
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # 0 = no ceiling. 20 = only pairs with maxLev ≤ 20 (after the min filter).
 MAX_MAX_LEVERAGE = 20
-# Which books to rank by volume:
+# Which books to scan (volume or 24h movers):
 #   "native"   = Hyperliquid main perps only (no HIP-3)
 #   "include"  = native + HIP-3 (xyz:...)
 #   "xyz_only" = HIP-3 builder dexes only (e.g. xyz:SKHY)
@@ -38,7 +44,7 @@ USE_MAX_LEVERAGE = True
 
 
 def xyz_pair_mode() -> str:
-    """Resolve volume-scan book scope for top_volume mode."""
+    """Resolve book scope for top_volume / top_movers scans."""
     raw = str(globals().get("XYZ_PAIR_MODE", "") or "").strip().lower()
     aliases = {
         "native": "native",
@@ -60,7 +66,7 @@ def xyz_pair_mode() -> str:
     except NameError:
         return "native"
 
-# --- manual mode (kept; ignored for coin list when PAIR_SELECTION_MODE=top_volume) ---
+# --- manual mode (kept; ignored for coin list when PAIR_SELECTION_MODE is auto) ---
 # Examples:
 #   ("BTC",)                    # main book
 #   ("CASHCAT",)                # main book meme
@@ -71,7 +77,7 @@ def xyz_pair_mode() -> str:
 PAIRS: tuple[str, ...] = ("BTC","ETH","SOL","HYPE","ZEC", "UNI", "PUMP", "AAVE", "BNB","DOGE","NEAR","ONDO","WLD","SUI")
 
 # Default leverage for any pair not listed in PAIR_LEVERAGE (manual mode).
-# In top_volume + USE_MAX_LEVERAGE, exchange max is used instead (overrides still apply).
+# In top_volume / top_movers + USE_MAX_LEVERAGE, exchange max is used instead (overrides still apply).
 LEVERAGE = 10
 # Optional per-pair overrides (keys: same as PAIRS, or api name like "BTC").
 # Example: {"BTC": 40, "ETH": 25, "UNI": 10}
@@ -121,7 +127,7 @@ MIN_TRADES_ABS = 5
 # If more than this many pairs produce a winner, keep only the top-N by rank_score
 # for live scanning (saves Hyperliquid IP weight). ≤N winners → keep all.
 # IMPORTANT: 1 starves live to a single coin (often silent for days).
-# Example ratios: manual 14→5, top_volume 50→15.
+# Example ratios: manual 14→5, top_volume 50→15, top_movers 14→9 (half/half).
 MAX_LIVE_PAIRS = 9
 
 # Tuner-only: which margin % to simulate when ranking setups. Live sizing ignores
@@ -197,8 +203,10 @@ IP_WEIGHT_RESERVE = 50
 #         Frequency matches the original; DCA/TP/SL follow the real position.
 # False → orders match the backtest side.
 # Backtest/tune is NEVER reversed — only live/paper execution.
-REVERSE_STRATEGY = False
-FLIP_EXECUTION = False # legacy alias; either True enables reverse
+# top_movers: live still shorts 24h gainers / longs 24h losers either way —
+# the tuner locks the opposite side when this is True so the flip fades.
+REVERSE_STRATEGY = True
+FLIP_EXECUTION = True # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:

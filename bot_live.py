@@ -48,7 +48,14 @@ from src.logger import setup_logger
 from src.market_resolver import parse_coin_input, sdk_perp_dexs_for_dexes
 from src.mtf import mtf_consensus_snapshot
 from src.order_executor import OrderExecutor
-from src.pair_universe import resolve_pair_universe
+from src.pair_universe import (
+    allowed_sides_for_movers,
+    fade_tune_side,
+    is_auto_pair_mode,
+    is_mover_mode,
+    is_volume_mode,
+    resolve_pair_universe,
+)
 from src.paper_broker import PaperHyperliquidClient
 from src.position_guard import (
     cleanup_closed_coin,
@@ -266,17 +273,25 @@ def main() -> None:
     if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
         raise ValueError("Enable at least one of USE_TP_SL, USE_EXIT_SIGNAL, USE_MAX_HOLD")
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
-    if pair_mode not in ("manual", "top_volume", "volume", "auto_volume"):
+    if pair_mode != "manual" and not is_auto_pair_mode(pair_mode):
         raise ValueError(
-            f"PAIR_SELECTION_MODE must be 'manual' or 'top_volume' (got {pair_mode!r})"
+            "PAIR_SELECTION_MODE must be 'manual', 'top_volume', or 'top_movers' "
+            f"(got {pair_mode!r})"
         )
     if pair_mode == "manual":
         pairs = tuple(cfg.PAIRS) if not isinstance(cfg.PAIRS, str) else (cfg.PAIRS,)
         if not pairs:
             raise ValueError("PAIRS must list at least one pair")
     else:
-        if int(getattr(cfg, "TOP_VOLUME_COUNT", 0) or 0) < 1:
+        if is_volume_mode(pair_mode) and int(getattr(cfg, "TOP_VOLUME_COUNT", 0) or 0) < 1:
             raise ValueError("TOP_VOLUME_COUNT must be >= 1 for top_volume mode")
+        mover_n = int(
+            getattr(cfg, "TOP_MOVER_COUNT", 0)
+            or getattr(cfg, "TOP_VOLUME_COUNT", 0)
+            or 0
+        )
+        if is_mover_mode(pair_mode) and mover_n < 1:
+            raise ValueError("TOP_MOVER_COUNT must be >= 1 for top_movers mode")
         if int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0) < 0:
             raise ValueError("MIN_MAX_LEVERAGE must be >= 0")
         if int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) < 0:
@@ -324,6 +339,9 @@ def main() -> None:
         mode=pair_mode,
         manual_pairs=tuple(cfg.PAIRS) if not isinstance(cfg.PAIRS, str) else (cfg.PAIRS,),
         top_volume_count=int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
+        top_mover_count=int(
+            getattr(cfg, "TOP_MOVER_COUNT", 0) or getattr(cfg, "TOP_VOLUME_COUNT", 14) or 14
+        ),
         include_xyz=bool(getattr(cfg, "INCLUDE_XYZ_PAIRS", False)),
         use_max_leverage=bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
         default_leverage=int(cfg.LEVERAGE),
@@ -334,7 +352,7 @@ def main() -> None:
         xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
         logger=logger,
     )
-    pair_inputs = [c for c, _ in universe]
+    pair_inputs = [c for c, _ in universe.pairs]
     markets = resolve_watchlist(bootstrap, pair_inputs, None)
     sdk_dexes = sdk_perp_dexs_for_dexes({m.perp_dex for m in markets})
 
@@ -363,12 +381,13 @@ def main() -> None:
     else:
         client = HyperliquidClient(**client_kwargs)
 
-    watch = init_pairs(client, universe, logger)
+    watch = init_pairs(client, universe.pairs, logger)
     cleanup_coins = [e.api_coin for e in watch]
     # Default tune leverage; per-coin overrides come from each PairSetup.
     tune_leverage = watch[0].leverage if watch else cfg.LEVERAGE
     leverage_by_coin = build_leverage_map(watch)
     universe_built_at = time.time()
+    mover_buckets: dict[str, str] = dict(universe.buckets)
 
     executor = OrderExecutor(
         client,
@@ -380,20 +399,34 @@ def main() -> None:
     )
 
     def refresh_universe_if_needed() -> None:
-        """Re-rank volume leaders before each tune in top_volume mode."""
-        nonlocal watch, cleanup_coins, tune_leverage, leverage_by_coin, universe_built_at
-        if pair_mode not in ("top_volume", "volume", "auto_volume"):
+        """Re-rank volume/mover leaders before each tune in auto pair modes."""
+        nonlocal watch, cleanup_coins, tune_leverage, leverage_by_coin
+        nonlocal universe_built_at, mover_buckets
+        if not is_auto_pair_mode(pair_mode):
             return
-        # Startup already ranked volume — skip duplicate refresh on first tune.
+        # Startup already ranked — skip duplicate refresh on first tune.
         if time.time() - universe_built_at < 90.0:
             return
-        logger.info(
-            "Refreshing top-volume universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s)",
-            int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
-            cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
-            int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
-            int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
-        )
+        if is_mover_mode(pair_mode):
+            logger.info(
+                "Refreshing top-mover universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s)",
+                int(
+                    getattr(cfg, "TOP_MOVER_COUNT", 0)
+                    or getattr(cfg, "TOP_VOLUME_COUNT", 14)
+                    or 14
+                ),
+                cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
+                int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
+                int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+            )
+        else:
+            logger.info(
+                "Refreshing top-volume universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s)",
+                int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
+                cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
+                int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
+                int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+            )
         fresh = resolve_pair_universe(
             client.info,
             mode=pair_mode,
@@ -401,6 +434,11 @@ def main() -> None:
             if not isinstance(cfg.PAIRS, str)
             else (cfg.PAIRS,),
             top_volume_count=int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
+            top_mover_count=int(
+                getattr(cfg, "TOP_MOVER_COUNT", 0)
+                or getattr(cfg, "TOP_VOLUME_COUNT", 14)
+                or 14
+            ),
             include_xyz=bool(getattr(cfg, "INCLUDE_XYZ_PAIRS", False)),
             use_max_leverage=bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
             default_leverage=int(cfg.LEVERAGE),
@@ -411,15 +449,32 @@ def main() -> None:
             xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
             logger=logger,
         )
-        watch = init_pairs(client, fresh, logger)
+        watch = init_pairs(client, fresh.pairs, logger)
         cleanup_coins = [e.api_coin for e in watch]
         tune_leverage = watch[0].leverage if watch else cfg.LEVERAGE
         leverage_by_coin = build_leverage_map(watch)
+        mover_buckets = dict(fresh.buckets)
         universe_built_at = time.time()
 
     def run_tune() -> None:
         nonlocal watch, cleanup_coins, tune_leverage, leverage_by_coin
         refresh_universe_if_needed()
+        reverse_live = bool(cfg.reverse_orders_enabled())
+        side_map = (
+            allowed_sides_for_movers(mover_buckets, reverse_live)
+            if is_mover_mode(pair_mode)
+            else None
+        )
+        if side_map:
+            gainer_side = fade_tune_side("gainer", reverse_live)
+            loser_side = fade_tune_side("loser", reverse_live)
+            logger.info(
+                "Mover fade tune: reverse=%s | gainers tune %s → live SHORT | "
+                "losers tune %s → live LONG",
+                reverse_live,
+                "LONG" if gainer_side > 0 else "SHORT",
+                "LONG" if loser_side > 0 else "SHORT",
+            )
         results = run_full_tune(
             client.info,
             [e.api_coin for e in watch],
@@ -444,14 +499,25 @@ def main() -> None:
             strategy_mode=getattr(cfg, "STRATEGY_MODE", "mtf"),
             mtf_exec_interval=getattr(cfg, "MTF_EXEC_INTERVAL", "1m"),
             tune_profile=getattr(cfg, "TUNE_PROFILE", "fast"),
+            allowed_side_by_coin=side_map,
             logger=logger,
         )
         if results:
             max_live = int(getattr(cfg, "MAX_LIVE_PAIRS", 5) or 5)
-            results = select_top_live_pairs(results, max_live, logger=logger)
-            store.save_results(results, leverage=tune_leverage)
-            # In top_volume mode, live-scan only kept winners (full set rebuilt on retune).
-            if pair_mode in ("top_volume", "volume", "auto_volume"):
+            results = select_top_live_pairs(
+                results,
+                max_live,
+                buckets=mover_buckets if is_mover_mode(pair_mode) else None,
+                logger=logger,
+            )
+            store.save_results(
+                results,
+                leverage=tune_leverage,
+                pair_selection_mode=pair_mode,
+                reverse_orders=reverse_live,
+            )
+            # Auto pair modes: live-scan only kept winners (full set rebuilt on retune).
+            if is_auto_pair_mode(pair_mode):
                 winners = set(results.keys())
                 kept = [e for e in watch if e.api_coin in winners]
                 if kept:
@@ -475,6 +541,25 @@ def main() -> None:
 
     def maybe_tune(*, force: bool = False) -> None:
         # Empty setups: never hammer retune — honor cooldown after a failed attempt.
+        mismatch = store.config_mismatch(pair_mode, cfg.reverse_orders_enabled())
+        if mismatch:
+            cooled = (
+                store._last_attempt_ts <= 0
+                or time.time() - store._last_attempt_ts >= store._retry_cooldown_s
+            )
+            if cooled:
+                logger.warning("Saved setups stale (%s) — retuning", mismatch)
+                run_tune()
+            else:
+                left = store._retry_cooldown_s - (
+                    time.time() - store._last_attempt_ts
+                )
+                logger.info(
+                    "Saved setups stale (%s) — next tune in ~%.0fs",
+                    mismatch,
+                    max(0.0, left),
+                )
+            return
         if not store.setups():
             cooled = (
                 store._last_attempt_ts <= 0
@@ -545,7 +630,7 @@ def main() -> None:
         live_legs,
         live_per,
     )
-    if pair_mode in ("top_volume", "volume", "auto_volume"):
+    if is_volume_mode(pair_mode):
         logger.info(
             "Top-volume settings: count=%s xyz_mode=%s use_max_lev=%s min_maxLev≥%s max_maxLev≤%s",
             int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
@@ -554,6 +639,38 @@ def main() -> None:
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
         )
+    if is_mover_mode(pair_mode):
+        reverse_live = bool(cfg.reverse_orders_enabled())
+        gainer_side = fade_tune_side("gainer", reverse_live)
+        loser_side = fade_tune_side("loser", reverse_live)
+        gainers = [c for c, b in mover_buckets.items() if b == "gainer"]
+        losers = [c for c, b in mover_buckets.items() if b == "loser"]
+        logger.info(
+            "Top-mover settings: count=%s (%s gainers + %s losers) xyz_mode=%s "
+            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s",
+            int(
+                getattr(cfg, "TOP_MOVER_COUNT", 0)
+                or getattr(cfg, "TOP_VOLUME_COUNT", 14)
+                or 14
+            ),
+            len(gainers),
+            len(losers),
+            cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
+            bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
+            int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
+            int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+        )
+        logger.info(
+            "Fade: live SHORT gainers / LONG losers | reverse=%s so tune "
+            "gainers=%s losers=%s",
+            reverse_live,
+            "LONG" if gainer_side > 0 else "SHORT",
+            "LONG" if loser_side > 0 else "SHORT",
+        )
+        if gainers:
+            logger.info("24h gainers: %s", ",".join(gainers))
+        if losers:
+            logger.info("24h losers: %s", ",".join(losers))
     if getattr(cfg, "PAIR_LEVERAGE", None):
         logger.info(
             "Per-pair leverage: %s",
@@ -575,6 +692,12 @@ def main() -> None:
         signal.signal(signal.SIGTERM, _stop)
 
     pos_ok, open_positions = client.fetch_open_positions(force=True)
+    mismatch0 = store.config_mismatch(pair_mode, cfg.reverse_orders_enabled())
+    if mismatch0 and pos_ok and open_positions:
+        logger.warning(
+            "Saved setups stale (%s) but positions are open — will retune once flat",
+            mismatch0,
+        )
     if pos_ok and not open_positions:
         logger.info("Flat — auto-tune if no params or refresh due")
         maybe_tune(force=not store.setups())

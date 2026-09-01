@@ -14,7 +14,13 @@ from src.data_files import housekeep_data_dir
 from src.hl_rate_limit import RequestGuard, ThrottledInfo, default_shared_budget
 from src.logger import setup_logger
 from src.market_resolver import parse_coin_input
-from src.pair_universe import resolve_pair_universe
+from src.pair_universe import (
+    allowed_sides_for_movers,
+    fade_tune_side,
+    is_mover_mode,
+    is_volume_mode,
+    resolve_pair_universe,
+)
 from src.store import SetupStore
 from src.tuner import run_full_tune, select_top_live_pairs
 
@@ -36,9 +42,10 @@ def main() -> None:
         raise ValueError(f"Unknown INTERVALS {bad}")
 
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
-    if pair_mode not in ("manual", "top_volume", "volume", "auto_volume"):
+    if pair_mode != "manual" and not (is_volume_mode(pair_mode) or is_mover_mode(pair_mode)):
         raise ValueError(
-            f"PAIR_SELECTION_MODE must be 'manual' or 'top_volume' (got {pair_mode!r})"
+            "PAIR_SELECTION_MODE must be 'manual', 'top_volume', or 'top_movers' "
+            f"(got {pair_mode!r})"
         )
 
     logger = setup_logger("hl-multi-backtest", PROJECT / "logs")
@@ -61,6 +68,9 @@ def main() -> None:
         mode=pair_mode,
         manual_pairs=tuple(cfg.PAIRS) if not isinstance(cfg.PAIRS, str) else (cfg.PAIRS,),
         top_volume_count=int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
+        top_mover_count=int(
+            getattr(cfg, "TOP_MOVER_COUNT", 0) or getattr(cfg, "TOP_VOLUME_COUNT", 14) or 14
+        ),
         include_xyz=bool(getattr(cfg, "INCLUDE_XYZ_PAIRS", False)),
         use_max_leverage=bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
         default_leverage=int(cfg.LEVERAGE),
@@ -73,7 +83,7 @@ def main() -> None:
     )
     coins = []
     leverage_by_coin: dict[str, int] = {}
-    for raw, lev in universe:
+    for raw, lev in universe.pairs:
         sym, dex = parse_coin_input(raw)
         api = f"{dex}:{sym}" if dex else sym
         coins.append(api)
@@ -94,7 +104,7 @@ def main() -> None:
         int(getattr(cfg, "MAX_LIVE_PAIRS", 5) or 5),
         cfg.LEVERAGE,
     )
-    if pair_mode in ("top_volume", "volume", "auto_volume"):
+    if is_volume_mode(pair_mode):
         logger.info(
             "Top-volume: count=%s xyz_mode=%s use_max_lev=%s min_maxLev≥%s max_maxLev≤%s",
             int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
@@ -102,6 +112,35 @@ def main() -> None:
             bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+        )
+    mover_buckets = dict(universe.buckets)
+    reverse_live = bool(cfg.reverse_orders_enabled()) if hasattr(cfg, "reverse_orders_enabled") else False
+    side_map = (
+        allowed_sides_for_movers(mover_buckets, reverse_live)
+        if is_mover_mode(pair_mode)
+        else None
+    )
+    if is_mover_mode(pair_mode):
+        gainer_side = fade_tune_side("gainer", reverse_live)
+        loser_side = fade_tune_side("loser", reverse_live)
+        logger.info(
+            "Top-movers: count=%s (%s gainers + %s losers) xyz_mode=%s "
+            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s | reverse=%s "
+            "tune gainers=%s losers=%s (live fade SHORT gainers / LONG losers)",
+            int(
+                getattr(cfg, "TOP_MOVER_COUNT", 0)
+                or getattr(cfg, "TOP_VOLUME_COUNT", 14)
+                or 14
+            ),
+            sum(1 for b in mover_buckets.values() if b == "gainer"),
+            sum(1 for b in mover_buckets.values() if b == "loser"),
+            cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
+            bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
+            int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
+            int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+            reverse_live,
+            "LONG" if gainer_side > 0 else "SHORT",
+            "LONG" if loser_side > 0 else "SHORT",
         )
     if getattr(cfg, "PAIR_LEVERAGE", None):
         logger.info("Per-pair leverage overrides: %s", cfg.PAIR_LEVERAGE)
@@ -129,12 +168,23 @@ def main() -> None:
         strategy_mode=getattr(cfg, "STRATEGY_MODE", "mtf"),
         mtf_exec_interval=getattr(cfg, "MTF_EXEC_INTERVAL", "1m"),
         tune_profile=getattr(cfg, "TUNE_PROFILE", "fast"),
+        allowed_side_by_coin=side_map,
         logger=logger,
     )
     if results:
         max_live = int(getattr(cfg, "MAX_LIVE_PAIRS", 5) or 5)
-        results = select_top_live_pairs(results, max_live, logger=logger)
-        store.save_results(results, leverage=cfg.LEVERAGE)
+        results = select_top_live_pairs(
+            results,
+            max_live,
+            buckets=mover_buckets if is_mover_mode(pair_mode) else None,
+            logger=logger,
+        )
+        store.save_results(
+            results,
+            leverage=cfg.LEVERAGE,
+            pair_selection_mode=pair_mode,
+            reverse_orders=reverse_live,
+        )
         logger.info("Done: %s", store.describe())
     else:
         logger.warning("No winners found")

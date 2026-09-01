@@ -36,7 +36,50 @@ from .registry import (
     screen_exit_bundle,
 )
 from .sim_numba import TAKER_FEE_PCT, simulate
+from .pair_universe import mover_half_counts
 from .tune_profile import resolve_tune_profile
+
+
+def _filter_entry_combos(allowed_side: int | None) -> list[dict[str, Any]]:
+    entries = iter_entry_combos()
+    if allowed_side is None:
+        return entries
+    want = 1 if int(allowed_side) > 0 else -1
+    return [e for e in entries if int(e.get("side", 0) or 0) == want]
+
+
+def _allowed_side_for(coin: str, mapping: dict[str, int] | None) -> int | None:
+    if not mapping:
+        return None
+    if coin in mapping:
+        return int(mapping[coin])
+    bare = coin.split(":", 1)[-1] if ":" in coin else coin
+    if bare in mapping:
+        return int(mapping[bare])
+    coin_u = str(coin).upper()
+    bare_u = str(bare).upper()
+    for k, v in mapping.items():
+        ku = str(k).upper()
+        kb = ku.split(":", 1)[-1]
+        if ku == coin_u or ku == bare_u or kb == bare_u:
+            return int(v)
+    return None
+
+
+def _bucket_of(coin: str, buckets: dict[str, str] | None) -> str:
+    if not buckets:
+        return ""
+    if coin in buckets:
+        return str(buckets[coin]).strip().lower()
+    bare = coin.split(":", 1)[-1] if ":" in coin else coin
+    coin_u = str(coin).upper()
+    bare_u = str(bare).upper()
+    for k, v in buckets.items():
+        ku = str(k).upper()
+        kb = ku.split(":", 1)[-1]
+        if ku == coin_u or ku == bare_u or kb == bare_u:
+            return str(v).strip().lower()
+    return ""
 
 
 def _arrays(candles: list[dict]) -> tuple[np.ndarray, ...]:
@@ -125,6 +168,7 @@ def tune_coin_interval(
     screen_top_n: int,
     refine_profile: str = "full",
     dca_max_adds: int = 1,
+    allowed_side: int | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any] | None:
     log = logger or logging.getLogger("hl-multi")
@@ -148,11 +192,24 @@ def tune_coin_interval(
     min_trades = max(min_trades_abs, int(target_trades_per_day * days * 0.3))
     min_tpd = max(0.4, target_trades_per_day * 0.45)
 
-    entries = iter_entry_combos()
+    entries = _filter_entry_combos(allowed_side)
+    if allowed_side is not None and not entries:
+        log.warning(
+            "%s %s: no entry combos for locked side %s — skip",
+            coin,
+            interval,
+            "LONG" if int(allowed_side) > 0 else "SHORT",
+        )
+        return None
     baseline = screen_exit_bundle(use_tpsl=use_tpsl, use_max_hold=use_max_hold)
+    side_note = (
+        f" | side-lock={'LONG' if int(allowed_side) > 0 else 'SHORT'}"
+        if allowed_side is not None
+        else ""
+    )
     log.info(
         "Tune %s @ %s: %s bars (%.1fd) | screen %s entries | hold=%sbars | "
-        "min_trades=%s min_wr=%.0f target_tpd=%.1f",
+        "min_trades=%s min_wr=%.0f target_tpd=%.1f%s",
         coin,
         interval,
         len(closes),
@@ -162,6 +219,7 @@ def tune_coin_interval(
         min_trades,
         min_win_rate,
         target_trades_per_day,
+        side_note,
     )
 
     entry_cache: dict[tuple, np.ndarray] = {}
@@ -379,6 +437,7 @@ def tune_coin_mtf(
     refine_profile: str = "full",
     mtf_profile: str = "full",
     dca_max_adds: int = 1,
+    allowed_side: int | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -434,11 +493,23 @@ def tune_coin_mtf(
     # Stage-1 screen uses a slightly softer WR so refine can still harden later.
     screen_wr = max(50.0, float(min_win_rate) - 2.0)
 
-    entries = iter_entry_combos()
+    entries = _filter_entry_combos(allowed_side)
+    if allowed_side is not None and not entries:
+        log.warning(
+            "%s MTF: no entry combos for locked side %s — skip",
+            coin,
+            "LONG" if int(allowed_side) > 0 else "SHORT",
+        )
+        return None
     baseline = screen_exit_bundle(use_tpsl=use_tpsl, use_max_hold=use_max_hold)
+    side_note = (
+        f" | side-lock={'LONG' if int(allowed_side) > 0 else 'SHORT'}"
+        if allowed_side is not None
+        else ""
+    )
     log.info(
         "Tune %s MTF exec=%s using %s | %s bars (%.1fd) | screen %s triggers | "
-        "consensus≥%s score≥%.2f | hold=%sbars min_trades=%s | profile=%s/%s",
+        "consensus≥%s score≥%.2f | hold=%sbars min_trades=%s | profile=%s/%s%s",
         coin,
         exec_interval,
         ",".join(ivs),
@@ -451,6 +522,7 @@ def tune_coin_mtf(
         min_trades,
         refine_profile,
         mtf_profile,
+        side_note,
     )
 
     entry_cache: dict[tuple, np.ndarray] = {}
@@ -726,6 +798,7 @@ def run_full_tune(
     mtf_exec_interval: str = "1m",
     leverage_by_coin: dict[str, int] | None = None,
     tune_profile: str = "fast",
+    allowed_side_by_coin: dict[str, int] | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """
@@ -740,6 +813,7 @@ def run_full_tune(
       - "full": original thorough grids
 
     leverage_by_coin: optional map api_coin/symbol → leverage; falls back to `leverage`.
+    allowed_side_by_coin: optional map api_coin → +1 (LONG only) or -1 (SHORT only).
     """
     log = logger or logging.getLogger("hl-multi")
     data_dir = Path(data_dir)
@@ -803,6 +877,7 @@ def run_full_tune(
         )
         for coin in coins:
             coin_lev = _lev_for(coin)
+            side_lock = _allowed_side_for(coin, allowed_side_by_coin)
             try:
                 winner = tune_coin_mtf(
                     info,
@@ -827,6 +902,7 @@ def run_full_tune(
                     screen_top_n=screen_top_n,
                     refine_profile=refine_profile,
                     mtf_profile=mtf_profile,
+                    allowed_side=side_lock,
                     logger=log,
                 )
             except Exception as exc:
@@ -834,6 +910,8 @@ def run_full_tune(
                 continue
             if winner:
                 winner["leverage"] = coin_lev
+                if side_lock is not None:
+                    winner["tune_side_lock"] = int(side_lock)
                 results[coin] = [winner]
                 _append_detail(winner)
         return results
@@ -841,6 +919,7 @@ def run_full_tune(
     # ----- legacy: independent per-interval -----
     for coin in coins:
         coin_lev = _lev_for(coin)
+        side_lock = _allowed_side_for(coin, allowed_side_by_coin)
         per_iv: list[dict[str, Any]] = []
         for interval in intervals:
             try:
@@ -865,6 +944,7 @@ def run_full_tune(
                     dca_max_adds=dca_max_adds,
                     screen_top_n=screen_top_n,
                     refine_profile=refine_profile,
+                    allowed_side=side_lock,
                     logger=log,
                 )
             except Exception as exc:
@@ -873,6 +953,8 @@ def run_full_tune(
             if winner:
                 winner.setdefault("mode", "legacy")
                 winner["leverage"] = coin_lev
+                if side_lock is not None:
+                    winner["tune_side_lock"] = int(side_lock)
                 per_iv.append(winner)
                 _append_detail(winner)
 
@@ -890,11 +972,13 @@ def select_top_live_pairs(
     results: dict[str, list[dict[str, Any]]],
     max_pairs: int,
     *,
+    buckets: dict[str, str] | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """
     If more than max_pairs coins have winners, keep the top max_pairs by
-    best rank_score. Otherwise return results unchanged.
+    best rank_score. With mover buckets, keep ~half gainers and ~half losers
+    (leftover slots fill from the other side so the cap is still used).
     """
     log = logger or logging.getLogger("hl-multi")
     if max_pairs <= 0 or len(results) <= max_pairs:
@@ -908,14 +992,64 @@ def select_top_live_pairs(
         ranked.append((float(best.get("rank_score", 0.0) or 0.0), coin, rows))
     ranked.sort(key=lambda t: t[0], reverse=True)
 
-    kept = ranked[:max_pairs]
-    dropped = ranked[max_pairs:]
-    out = {coin: rows for _, coin, rows in kept}
+    if not buckets:
+        kept = ranked[:max_pairs]
+        dropped = ranked[max_pairs:]
+        out = {coin: rows for _, coin, rows in kept}
+        log.info(
+            "Pair cap: kept top %s/%s by rank → %s",
+            max_pairs,
+            len(results),
+            ", ".join(f"{c}({r:.1f})" for r, c, _ in kept),
+        )
+        if dropped:
+            log.info(
+                "Pair cap: dropped %s",
+                ", ".join(f"{c}({r:.1f})" for r, c, _ in dropped),
+            )
+        return out
+
+    n_g, n_l = mover_half_counts(max_pairs)
+    gainer_ranked = [t for t in ranked if _bucket_of(t[1], buckets) == "gainer"]
+    loser_ranked = [t for t in ranked if _bucket_of(t[1], buckets) == "loser"]
+    kept_rows = gainer_ranked[:n_g] + loser_ranked[:n_l]
+    kept_coins = {c for _, c, _ in kept_rows}
+    leftover = max_pairs - len(kept_rows)
+    if leftover > 0:
+        remaining = [t for t in ranked if t[1] not in kept_coins]
+        g_left = [t for t in remaining if _bucket_of(t[1], buckets) == "gainer"]
+        l_left = [t for t in remaining if _bucket_of(t[1], buckets) == "loser"]
+        o_left = [
+            t
+            for t in remaining
+            if _bucket_of(t[1], buckets) not in ("gainer", "loser")
+        ]
+        gainer_short = len(gainer_ranked[:n_g]) < n_g
+        fill_order = (g_left + l_left if gainer_short else l_left + g_left) + o_left
+        seen = set(kept_coins)
+        for row in fill_order:
+            if leftover <= 0:
+                break
+            if row[1] in seen:
+                continue
+            kept_rows.append(row)
+            seen.add(row[1])
+            leftover -= 1
+    kept_rows.sort(key=lambda t: t[0], reverse=True)
+    kept_coins = {c for _, c, _ in kept_rows}
+    dropped = [t for t in ranked if t[1] not in kept_coins]
+    out = {coin: rows for _, coin, rows in kept_rows}
+    n_kept_g = sum(1 for _, c, _ in kept_rows if _bucket_of(c, buckets) == "gainer")
+    n_kept_l = sum(1 for _, c, _ in kept_rows if _bucket_of(c, buckets) == "loser")
     log.info(
-        "Pair cap: kept top %s/%s by rank → %s",
-        max_pairs,
+        "Pair cap (movers): kept %s gainer + %s loser (%s/%s) → %s",
+        n_kept_g,
+        n_kept_l,
+        len(kept_rows),
         len(results),
-        ", ".join(f"{c}({r:.1f})" for r, c, _ in kept),
+        ", ".join(
+            f"{c}[{_bucket_of(c, buckets) or '?'}]({r:.1f})" for r, c, _ in kept_rows
+        ),
     )
     if dropped:
         log.info(
