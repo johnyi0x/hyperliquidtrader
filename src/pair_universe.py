@@ -76,27 +76,36 @@ class PairUniverse:
         return len(self.pairs)
 
 
-def fade_tune_side(bucket: str, reverse: bool) -> int:
-    """
-    Live fade: short 24h gainers, long 24h losers.
+# Stamp on saved params. Tune WITH the 24h move so MTF consensus can fire.
+# Live reverse is a separate order-time flip (REVERSE_STRATEGY only).
+MOVER_TUNE_LOCK = "with_trend"
 
-    Backtest/tune is never reversed. If live reverse is on, constrain tune to
-    the opposite side so the order-time flip still yields that fade.
+
+def mover_tune_side(bucket: str) -> int:
     """
-    live = -1 if str(bucket or "").strip().lower() == "gainer" else 1
-    return -live if reverse else live
+    Backtest/tune side for a 24h mover (never reversed).
+
+    Gainers → LONG, losers → SHORT. That matches HTF consensus on a pump/dump
+    so MTF can actually trigger. Live only flips if REVERSE_STRATEGY is on.
+    """
+    return 1 if str(bucket or "").strip().lower() == "gainer" else -1
+
+
+def fade_tune_side(bucket: str, reverse: bool = False) -> int:
+    """Alias of mover_tune_side. `reverse` is ignored (live flip is separate)."""
+    return mover_tune_side(bucket)
 
 
 def allowed_sides_for_movers(
     buckets: dict[str, str] | None,
-    reverse: bool,
+    reverse: bool = False,
 ) -> dict[str, int]:
     out: dict[str, int] = {}
     for coin, bucket in (buckets or {}).items():
         b = str(bucket or "").strip().lower()
         if b not in ("gainer", "loser"):
             continue
-        out[str(coin)] = fade_tune_side(b, reverse)
+        out[str(coin)] = mover_tune_side(b)
     return out
 
 

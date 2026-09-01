@@ -49,11 +49,12 @@ from src.market_resolver import parse_coin_input, sdk_perp_dexs_for_dexes
 from src.mtf import mtf_consensus_snapshot
 from src.order_executor import OrderExecutor
 from src.pair_universe import (
+    MOVER_TUNE_LOCK,
     allowed_sides_for_movers,
-    fade_tune_side,
     is_auto_pair_mode,
     is_mover_mode,
     is_volume_mode,
+    mover_tune_side,
     resolve_pair_universe,
 )
 from src.paper_broker import PaperHyperliquidClient
@@ -309,6 +310,8 @@ def main() -> None:
             raise ValueError(f"PAIR_LEVERAGE[{k!r}] must be >= 1")
     if cfg.TARGET_TRADES_PER_DAY <= 0:
         raise ValueError("TARGET_TRADES_PER_DAY must be > 0")
+    # Reverse only when REVERSE_STRATEGY is on — never implied by top_movers.
+    flip_live = bool(cfg.reverse_orders_enabled())
 
     logger = setup_logger("hl-multi-bot", LOG_DIR)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -461,19 +464,16 @@ def main() -> None:
         refresh_universe_if_needed()
         reverse_live = bool(cfg.reverse_orders_enabled())
         side_map = (
-            allowed_sides_for_movers(mover_buckets, reverse_live)
+            allowed_sides_for_movers(mover_buckets)
             if is_mover_mode(pair_mode)
             else None
         )
         if side_map:
-            gainer_side = fade_tune_side("gainer", reverse_live)
-            loser_side = fade_tune_side("loser", reverse_live)
             logger.info(
-                "Mover fade tune: reverse=%s | gainers tune %s → live SHORT | "
-                "losers tune %s → live LONG",
+                "Movers: tune WITH 24h move (gainers LONG, losers SHORT). "
+                "Live reverse=%s → orders %s",
                 reverse_live,
-                "LONG" if gainer_side > 0 else "SHORT",
-                "LONG" if loser_side > 0 else "SHORT",
+                "flipped" if reverse_live else "match backtest",
             )
         results = run_full_tune(
             client.info,
@@ -515,6 +515,7 @@ def main() -> None:
                 leverage=tune_leverage,
                 pair_selection_mode=pair_mode,
                 reverse_orders=reverse_live,
+                mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
             )
             # Auto pair modes: live-scan only kept winners (full set rebuilt on retune).
             if is_auto_pair_mode(pair_mode):
@@ -541,7 +542,11 @@ def main() -> None:
 
     def maybe_tune(*, force: bool = False) -> None:
         # Empty setups: never hammer retune — honor cooldown after a failed attempt.
-        mismatch = store.config_mismatch(pair_mode, cfg.reverse_orders_enabled())
+        mismatch = store.config_mismatch(
+            pair_mode,
+            cfg.reverse_orders_enabled(),
+            mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
+        )
         if mismatch:
             cooled = (
                 store._last_attempt_ts <= 0
@@ -600,7 +605,7 @@ def main() -> None:
         cfg.USE_MAX_HOLD,
         cfg.ALLOW_DCA,
         int(getattr(cfg, "DCA_MAX_ADDS", 1) or 0),
-        cfg.reverse_orders_enabled(),
+        flip_live,
     )
     concurrent = bool(getattr(cfg, "ALLOW_CONCURRENT_POSITIONS", True))
     max_concurrent = int(getattr(cfg, "MAX_CONCURRENT_POSITIONS", 0) or 0)
@@ -640,9 +645,8 @@ def main() -> None:
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
         )
     if is_mover_mode(pair_mode):
-        reverse_live = bool(cfg.reverse_orders_enabled())
-        gainer_side = fade_tune_side("gainer", reverse_live)
-        loser_side = fade_tune_side("loser", reverse_live)
+        gainer_side = mover_tune_side("gainer")
+        loser_side = mover_tune_side("loser")
         gainers = [c for c, b in mover_buckets.items() if b == "gainer"]
         losers = [c for c, b in mover_buckets.items() if b == "loser"]
         logger.info(
@@ -661,11 +665,14 @@ def main() -> None:
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
         )
         logger.info(
-            "Fade: live SHORT gainers / LONG losers | reverse=%s so tune "
-            "gainers=%s losers=%s",
-            reverse_live,
+            "Movers: tune with-trend gainers=%s losers=%s | live reverse=%s "
+            "so orders %s",
             "LONG" if gainer_side > 0 else "SHORT",
             "LONG" if loser_side > 0 else "SHORT",
+            flip_live,
+            "flipped (SHORT gainers / LONG losers)"
+            if flip_live
+            else "same as tune (LONG gainers / SHORT losers)",
         )
         if gainers:
             logger.info("24h gainers: %s", ",".join(gainers))
@@ -676,7 +683,7 @@ def main() -> None:
             "Per-pair leverage: %s",
             ", ".join(f"{e.api_coin}={e.leverage}x" for e in watch),
         )
-    if cfg.reverse_orders_enabled():
+    if flip_live:
         logger.warning(
             "REVERSE_STRATEGY on — same signal bars as backtest, opposite order "
             "(LONG→SHORT / SHORT→LONG); DCA/TP/SL follow the real position"
@@ -692,7 +699,11 @@ def main() -> None:
         signal.signal(signal.SIGTERM, _stop)
 
     pos_ok, open_positions = client.fetch_open_positions(force=True)
-    mismatch0 = store.config_mismatch(pair_mode, cfg.reverse_orders_enabled())
+    mismatch0 = store.config_mismatch(
+        pair_mode,
+        cfg.reverse_orders_enabled(),
+        mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
+    )
     if mismatch0 and pos_ok and open_positions:
         logger.warning(
             "Saved setups stale (%s) but positions are open — will retune once flat",
@@ -904,7 +915,7 @@ def main() -> None:
                         int(t.dca_adds) + 2,
                         legs,
                         total_bal,
-                        " REVERSE" if cfg.reverse_orders_enabled() else "",
+                        " REVERSE" if flip_live else "",
                     )
                     new_pos = executor.execute_dca_add(
                         add_sz,
@@ -963,7 +974,7 @@ def main() -> None:
         return False
 
     def try_open(entry: PairSetup, setup: LiveSetup, bar_t: int, confirm, confirm_multi) -> bool:
-        rev = cfg.reverse_orders_enabled()
+        rev = flip_live
         confirm_sig = entry_signal(setup, confirm, multi_candles=confirm_multi)
         if confirm_sig == 0:
             logger.info("Skip %s — signal gone on re-check", entry.api_coin)
@@ -1126,7 +1137,7 @@ def main() -> None:
             if not can_scan:
                 continue
 
-            rev = cfg.reverse_orders_enabled()
+            rev = flip_live
             candidates: list[tuple] = []
             parts: list[str] = []
             for entry in watch:

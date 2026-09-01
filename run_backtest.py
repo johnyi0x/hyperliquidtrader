@@ -15,10 +15,11 @@ from src.hl_rate_limit import RequestGuard, ThrottledInfo, default_shared_budget
 from src.logger import setup_logger
 from src.market_resolver import parse_coin_input
 from src.pair_universe import (
+    MOVER_TUNE_LOCK,
     allowed_sides_for_movers,
-    fade_tune_side,
     is_mover_mode,
     is_volume_mode,
+    mover_tune_side,
     resolve_pair_universe,
 )
 from src.store import SetupStore
@@ -114,19 +115,18 @@ def main() -> None:
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
         )
     mover_buckets = dict(universe.buckets)
-    reverse_live = bool(cfg.reverse_orders_enabled()) if hasattr(cfg, "reverse_orders_enabled") else False
     side_map = (
-        allowed_sides_for_movers(mover_buckets, reverse_live)
+        allowed_sides_for_movers(mover_buckets)
         if is_mover_mode(pair_mode)
         else None
     )
     if is_mover_mode(pair_mode):
-        gainer_side = fade_tune_side("gainer", reverse_live)
-        loser_side = fade_tune_side("loser", reverse_live)
+        gainer_side = mover_tune_side("gainer")
+        loser_side = mover_tune_side("loser")
         logger.info(
             "Top-movers: count=%s (%s gainers + %s losers) xyz_mode=%s "
-            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s | reverse=%s "
-            "tune gainers=%s losers=%s (live fade SHORT gainers / LONG losers)",
+            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s | tune with-trend "
+            "gainers=%s losers=%s | live reverse off → same side as tune",
             int(
                 getattr(cfg, "TOP_MOVER_COUNT", 0)
                 or getattr(cfg, "TOP_VOLUME_COUNT", 14)
@@ -138,7 +138,6 @@ def main() -> None:
             bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
-            reverse_live,
             "LONG" if gainer_side > 0 else "SHORT",
             "LONG" if loser_side > 0 else "SHORT",
         )
@@ -183,7 +182,10 @@ def main() -> None:
             results,
             leverage=cfg.LEVERAGE,
             pair_selection_mode=pair_mode,
-            reverse_orders=reverse_live,
+            reverse_orders=bool(cfg.reverse_orders_enabled())
+            if hasattr(cfg, "reverse_orders_enabled")
+            else False,
+            mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
         )
         logger.info("Done: %s", store.describe())
     else:

@@ -12,10 +12,11 @@ from __future__ import annotations
 # "manual"      = use PAIRS (+ PAIR_LEVERAGE) exactly as listed.
 # "top_volume"  = auto-pick the highest 24h notional-volume perps, then tune all,
 #                 then keep only MAX_LIVE_PAIRS winners for live.
-# "top_movers"  = auto-pick 24h % gainers + 24h % losers (half each), then tune.
-#                 Live fade: short gainers / long losers. With REVERSE_STRATEGY
-#                 the tuner searches the un-reversed side so the live flip still
-#                 fades (backtest itself is never reversed).
+# "top_movers"  = auto-pick 24h % gainers + 24h % losers (half each), then tune
+#                 WITH the 24h move (LONG gainers / SHORT losers) so MTF can fire.
+#                 REVERSE_STRATEGY off → live matches that (long pumps / short dumps).
+#                 REVERSE_STRATEGY on  → live flips (short pumps / long dumps).
+#                 Backtest itself is never reversed.
 PAIR_SELECTION_MODE = "top_movers"
 
 # --- top_volume mode only ---
@@ -203,8 +204,8 @@ IP_WEIGHT_RESERVE = 50
 #         Frequency matches the original; DCA/TP/SL follow the real position.
 # False → orders match the backtest side.
 # Backtest/tune is NEVER reversed — only live/paper execution.
-# top_movers: live still shorts 24h gainers / longs 24h losers either way —
-# the tuner locks the opposite side when this is True so the flip fades.
+# top_movers: tuner searches WITH the 24h move so MTF can fire. This flag
+# still controls whether live orders are flipped. Off = same side as tune.
 REVERSE_STRATEGY = False
 FLIP_EXECUTION = False # legacy alias; either True enables reverse
 

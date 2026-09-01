@@ -174,12 +174,23 @@ class SetupStore:
         """Record a tune attempt even when no winners (starts retry cooldown)."""
         self._last_attempt_ts = time.time()
 
-    def config_mismatch(self, pair_mode: str, reverse_orders: bool) -> str | None:
+    def config_mismatch(
+        self,
+        pair_mode: str,
+        reverse_orders: bool,
+        *,
+        mover_tune: str | None = None,
+    ) -> str | None:
         """Why saved setups don't match current pair-selection / reverse flags."""
         saved_mode = str(self._state.get("pair_selection_mode") or "").strip().lower()
         want_mode = str(pair_mode or "").strip().lower()
         if saved_mode != want_mode:
             return f"pair_mode {saved_mode or 'unset'} → {want_mode}"
+        if mover_tune:
+            saved_lock = str(self._state.get("mover_tune") or "")
+            if saved_lock != str(mover_tune):
+                return f"mover_tune {saved_lock or 'unset'} → {mover_tune}"
+            return None
         if "reverse_orders" not in self._state:
             return "reverse stamp missing"
         if bool(self._state.get("reverse_orders")) != bool(reverse_orders):
@@ -241,6 +252,7 @@ class SetupStore:
         leverage: int,
         pair_selection_mode: str | None = None,
         reverse_orders: bool | None = None,
+        mover_tune: str | None = None,
     ) -> None:
         self._last_attempt_ts = time.time()
         now = time.time()
@@ -266,6 +278,8 @@ class SetupStore:
             self._state["pair_selection_mode"] = str(pair_selection_mode)
         if reverse_orders is not None:
             self._state["reverse_orders"] = bool(reverse_orders)
+        if mover_tune is not None:
+            self._state["mover_tune"] = str(mover_tune)
         self._save()
         self.log.info("Setups saved: %s", ", ".join(per_coin.keys()))
 
