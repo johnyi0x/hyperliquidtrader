@@ -34,6 +34,13 @@ def main() -> None:
     if sibling.exists():
         load_dotenv(sibling, override=False)
 
+    if getattr(cfg, "ema_dev_strategy_enabled", lambda: False)():
+        logger_early = setup_logger("hl-multi-backtest", PROJECT / "logs")
+        logger_early.info(
+            "USE_EMA_DEV_STRATEGY is on — this mode has no backtest/tune. "
+            "Run python bot_live.py instead."
+        )
+        return
     if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
         raise ValueError("Enable at least one exit layer in config.py")
     from src.candles import INTERVAL_MS

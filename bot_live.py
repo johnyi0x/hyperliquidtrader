@@ -30,6 +30,17 @@ import config as cfg
 from src.candles import INTERVAL_MS
 from src.data_files import housekeep_data_dir
 from src.candle_book import snapshot_weight_budget
+from src.ema_dev import (
+    EmaDevStore,
+    EmaDevTrade,
+    adverse_pct,
+    fill_pcts as ema_dev_fill_pcts,
+    pick_farthest,
+    protect_pcts as ema_dev_protect_pcts,
+    signed_dev_pct,
+    snap_from_candles,
+    should_tp as ema_dev_should_tp,
+)
 from src.engine import (
     dca_should_add,
     entry_signal,
@@ -271,8 +282,28 @@ def pos_side_int(side: str) -> int:
 
 
 def main() -> None:
-    if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
-        raise ValueError("Enable at least one of USE_TP_SL, USE_EXIT_SIGNAL, USE_MAX_HOLD")
+    ema_dev_on = bool(cfg.ema_dev_strategy_enabled())
+    if not ema_dev_on:
+        if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
+            raise ValueError("Enable at least one of USE_TP_SL, USE_EXIT_SIGNAL, USE_MAX_HOLD")
+    else:
+        ema_iv = str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m")
+        if ema_iv not in INTERVAL_MS:
+            raise ValueError(
+                f"Unknown EMA_DEV_INTERVAL {ema_iv!r}; known={list(INTERVAL_MS)}"
+            )
+        if int(getattr(cfg, "EMA_DEV_PERIOD", 0) or 0) < 2:
+            raise ValueError("EMA_DEV_PERIOD must be >= 2")
+        entry_pct = float(getattr(cfg, "EMA_DEV_ENTRY_PCT", 0) or 0)
+        total_pct = float(getattr(cfg, "EMA_DEV_TOTAL_PCT", 0) or 0)
+        if entry_pct <= 0 or entry_pct > 99:
+            raise ValueError("EMA_DEV_ENTRY_PCT must be in (0, 99]")
+        if total_pct <= 0 or total_pct > 99:
+            raise ValueError("EMA_DEV_TOTAL_PCT must be in (0, 99]")
+        if bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False)) and total_pct <= entry_pct:
+            raise ValueError(
+                "EMA_DEV_TOTAL_PCT must be > EMA_DEV_ENTRY_PCT when EMA_DEV_ALLOW_DCA is on"
+            )
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
     if pair_mode != "manual" and not is_auto_pair_mode(pair_mode):
         raise ValueError(
@@ -319,6 +350,7 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     housekeep_data_dir(DATA_DIR, logger=logger)
     trade_store = TradeStateStore(DATA_DIR / "trade_state.json")
+    ema_store = EmaDevStore(DATA_DIR / "ema_dev_state.json")
     store = SetupStore(DATA_DIR, logger, refresh_hours=cfg.BACKTEST_REFRESH_HOURS)
 
     wallet, private_key = load_secrets()
@@ -404,14 +436,14 @@ def main() -> None:
         market_slippage=cfg.MARKET_ORDER_SLIPPAGE,
     )
 
-    def refresh_universe_if_needed() -> None:
+    def refresh_universe_if_needed(*, force: bool = False) -> None:
         """Re-rank volume/mover leaders before each tune in auto pair modes."""
         nonlocal watch, cleanup_coins, tune_leverage, leverage_by_coin
         nonlocal universe_built_at, mover_buckets
         if not is_auto_pair_mode(pair_mode):
             return
         # Startup already ranked — skip duplicate refresh on first tune.
-        if time.time() - universe_built_at < 90.0:
+        if not force and time.time() - universe_built_at < 90.0:
             return
         if is_mover_mode(pair_mode):
             logger.info(
@@ -615,6 +647,9 @@ def main() -> None:
     )
     concurrent = bool(getattr(cfg, "ALLOW_CONCURRENT_POSITIONS", True))
     max_concurrent = int(getattr(cfg, "MAX_CONCURRENT_POSITIONS", 0) or 0)
+    if ema_dev_on:
+        concurrent = False
+        max_concurrent = 1
     n_iv = len(cfg.INTERVALS)
     n_pairs = max(1, int(getattr(cfg, "MAX_LIVE_PAIRS", 5) or 5))
     budget = snapshot_weight_budget(n_pairs, n_iv, reserve=ip_reserve)
@@ -641,6 +676,27 @@ def main() -> None:
         live_legs,
         live_per,
     )
+    if ema_dev_on:
+        entry_pct, dca_pct = ema_dev_fill_pcts(
+            float(cfg.EMA_DEV_ENTRY_PCT),
+            float(cfg.EMA_DEV_TOTAL_PCT),
+            dca_on=bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False)),
+        )
+        logger.info(
+            "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% equity "
+            "dca=%s add=%.1f%% (cap Y=%.1f%%) | one pair at a time",
+            str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
+            int(getattr(cfg, "EMA_DEV_PERIOD", 200) or 200),
+            entry_pct,
+            "on" if dca_pct > 0 else "off",
+            dca_pct,
+            min(99.0, float(getattr(cfg, "EMA_DEV_TOTAL_PCT", 0) or 0)),
+        )
+        if flip_live:
+            logger.warning(
+                "REVERSE_STRATEGY is on but EMA-dev ignores it — "
+                "TP at EMA only works as mean-reversion (long below / short above)"
+            )
     if is_volume_mode(pair_mode):
         logger.info(
             "Top-volume settings: count=%s xyz_mode=%s use_max_lev=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s",
@@ -712,14 +768,17 @@ def main() -> None:
         cfg.reverse_orders_enabled(),
         mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
     )
-    if mismatch0 and pos_ok and open_positions:
+    if not ema_dev_on and mismatch0 and pos_ok and open_positions:
         logger.warning(
             "Saved setups stale (%s) but positions are open — will retune once flat",
             mismatch0,
         )
     if pos_ok and not open_positions:
-        logger.info("Flat — auto-tune if no params or refresh due")
-        maybe_tune(force=not store.setups())
+        if ema_dev_on:
+            logger.info("Flat — EMA-dev will scan the pair list (no tune)")
+        else:
+            logger.info("Flat — auto-tune if no params or refresh due")
+            maybe_tune(force=not store.setups())
     elif pos_ok and open_positions:
         logger.info(
             "Open position(s) at start (%s) — manage + keep scanning if concurrent",
@@ -741,6 +800,13 @@ def main() -> None:
         return out
 
     def wake_seconds() -> float:
+        if ema_dev_on:
+            wait = seconds_until_next_candle(
+                str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m")
+            )
+            if trade_store.trades:
+                wait = min(wait, max(1.0, float(cfg.POSITION_POLL_SECONDS)))
+            return wait
         intervals = {
             s.interval for c in store.watch_coins() for s in store.setups_for(c)
         }
@@ -1092,6 +1158,454 @@ def main() -> None:
         )
         return True
 
+    def _ema_iv() -> str:
+        return str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m")
+
+    def _ema_period() -> int:
+        return int(getattr(cfg, "EMA_DEV_PERIOD", 200) or 200)
+
+    def _ema_bars_need() -> int:
+        return max(40, _ema_period() + 30)
+
+    def _ema_dca_on() -> bool:
+        return bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False))
+
+    def force_attach_tpsl(tp_pct: float, sl_pct: float) -> bool:
+        client.cancel_all_orders_for_coin()
+        client.invalidate_user_state()
+        pos = client.get_position(force=True)
+        if pos is None:
+            return False
+        return client.attach_position_tpsl(
+            pos, tp_pct, sl_pct, max_attempts=3
+        )
+
+    def flatten_ema(entry: PairSetup, reason: str) -> bool:
+        activate_pair_for_trade(client, entry)
+        logger.info("EMA-dev close %s (%s)", entry.api_coin, reason)
+        if not executor.execute_rsi_exit():
+            executor.emergency_flatten(reason)
+        bar_t = 0
+        candles = client.get_closed_candles_for(
+            entry.api_coin, _ema_iv(), min_bars=_ema_bars_need()
+        )
+        if candles:
+            bar_t = int(candles[-1]["t"])
+        finish_close(entry)
+        ema_store.close(coin=entry.api_coin, bar_t=bar_t)
+        protected_coins.discard(entry.api_coin)
+        return True
+
+    def hydrate_ema_trade(entry: PairSetup, position) -> EmaDevTrade:
+        existing = ema_store.active()
+        side = str(getattr(position, "side", "") or "")
+        fill = float(getattr(position, "entry_price", 0) or 0) or client.get_mark_price()
+        if (
+            existing is not None
+            and existing.coin == entry.api_coin
+            and existing.side == side
+        ):
+            return existing
+        candles = client.get_closed_candles_for(
+            entry.api_coin, _ema_iv(), min_bars=_ema_bars_need()
+        )
+        snap = snap_from_candles(entry.api_coin, candles, _ema_period())
+        ema = float(snap.ema) if snap else fill
+        bar_t = int(snap.bar_t) if snap else 0
+        d = abs(signed_dev_pct(fill, ema)) if ema else 1.0
+        trade = EmaDevTrade(
+            coin=entry.api_coin,
+            side=side,
+            dev_pct=max(0.0, d),
+            entry_px=fill,
+            last_fill_px=fill,
+            dca_done=False,
+            entry_ema=ema,
+            opened_bar_t=bar_t,
+        )
+        ema_store.open_trade(trade)
+        logger.warning(
+            "EMA-dev rehydrated %s %s @ %s (D≈%.2f%%)",
+            entry.api_coin,
+            side,
+            fill,
+            trade.dev_pct,
+        )
+        return trade
+
+    def refresh_protect(entry: PairSetup, trade: EmaDevTrade, avg_entry: float, ema: float) -> bool:
+        pcts = ema_dev_protect_pcts(
+            trade, avg_entry, ema, dca_on=_ema_dca_on()
+        )
+        if pcts is None:
+            return flatten_ema(entry, "tp_ema")
+        tp_pct, sl_pct = pcts
+        tracked = trade_store.get(entry.api_coin)
+        same = (
+            tracked is not None
+            and abs(tracked.take_profit_pct - tp_pct) < 0.08
+            and abs(tracked.stop_loss_pct - sl_pct) < 0.08
+            and client.has_exchange_tpsl()
+        )
+        if same:
+            return False
+        if not force_attach_tpsl(tp_pct, sl_pct):
+            return flatten_ema(entry, "tpsl_attach_failed")
+        pos = client.get_position(force=True)
+        fill = float(pos.entry_price or avg_entry) if pos else avg_entry
+        size = float(pos.size) if pos else 0.0
+        if trade_store.get(entry.api_coin) is None:
+            trade_store.open_trade(
+                entry.api_coin,
+                trade.side,
+                fill,
+                size,
+                tp_pct,
+                sl_pct,
+                equity_at_entry=client.get_account_value(force=True),
+            )
+        else:
+            t = trade_store.get(entry.api_coin)
+            t.take_profit_pct = tp_pct
+            t.stop_loss_pct = sl_pct
+            tp_px, sl_px = TradeStateStore._tp_sl_prices(
+                t.side, t.entry_price, tp_pct, sl_pct
+            )
+            t.take_profit_price = tp_px
+            t.stop_loss_price = sl_px
+            trade_store._save()
+        protected_coins.add(entry.api_coin)
+        return False
+
+    def manage_ema_one(entry: PairSetup, position) -> bool:
+        activate_pair(client, entry)
+        trade = hydrate_ema_trade(entry, position)
+        candles = client.get_closed_candles_for(
+            entry.api_coin, _ema_iv(), min_bars=_ema_bars_need()
+        )
+        snap = snap_from_candles(entry.api_coin, candles, _ema_period())
+        mark = client.get_mark_price()
+        ema = float(snap.ema) if snap else float(trade.entry_ema or 0)
+        bar_t = int(snap.bar_t) if snap else int(trade.opened_bar_t)
+        avg = float(getattr(position, "entry_price", 0) or 0) or mark
+        if ema > 0 and ema_dev_should_tp(trade.side, mark, ema):
+            return flatten_ema(
+                entry,
+                f"tp_ema ema={ema:.6g} mark={mark:.6g}",
+            )
+        dca_on = _ema_dca_on()
+        if dca_on and not trade.dca_done:
+            adv = adverse_pct(trade.side, trade.entry_px, mark)
+            # Gapped through entry-D and the post-DCA D in one move — SL, don't add.
+            if adv + 1e-12 >= 2.0 * trade.dev_pct:
+                return flatten_ema(
+                    entry,
+                    f"stop_loss D×2={2.0 * trade.dev_pct:.2f}% from {trade.entry_px:.6g}",
+                )
+            if adv + 1e-12 >= trade.dev_pct:
+                _entry_pct, dca_pct = ema_dev_fill_pcts(
+                    float(cfg.EMA_DEV_ENTRY_PCT),
+                    float(cfg.EMA_DEV_TOTAL_PCT),
+                    dca_on=True,
+                )
+                if dca_pct <= 0:
+                    return flatten_ema(entry, "sl_dca_size_zero")
+                activate_pair_for_trade(client, entry)
+                est = client.estimate_order_size(
+                    dca_pct,
+                    entry.leverage,
+                    sz_decimals=entry.market.sz_decimals,
+                    min_notional_usd=cfg.MIN_ORDER_NOTIONAL_USD,
+                    margin_from="equity",
+                )
+                if not est.ok:
+                    logger.warning(
+                        "EMA-dev DCA skipped %s — %s (SL instead)",
+                        entry.api_coin,
+                        est.reason,
+                    )
+                    return flatten_ema(entry, "sl_dca_failed")
+                guess = ema_dev_protect_pcts(
+                    EmaDevTrade(
+                        coin=trade.coin,
+                        side=trade.side,
+                        dev_pct=trade.dev_pct,
+                        entry_px=trade.entry_px,
+                        last_fill_px=mark,
+                        dca_done=True,
+                        entry_ema=trade.entry_ema,
+                        opened_bar_t=trade.opened_bar_t,
+                    ),
+                    avg,
+                    ema,
+                    dca_on=True,
+                )
+                tp_g, sl_g = guess if guess else (max(0.05, trade.dev_pct), trade.dev_pct)
+                logger.info(
+                    "EMA-dev DCA %s +%.2f%% equity size=%s (D=%.2f%% against entry)",
+                    entry.api_coin,
+                    dca_pct,
+                    est.size,
+                    trade.dev_pct,
+                )
+                old_avg = avg
+                old_sz = float(getattr(position, "size", 0) or 0)
+                new_pos = executor.execute_dca_add(est.size, tp_g, sl_g)
+                if new_pos is None:
+                    return flatten_ema(entry, "sl_dca_failed")
+                new_avg = float(new_pos.entry_price or mark)
+                new_sz = float(new_pos.size)
+                added = new_sz - old_sz
+                if added > 1e-12 and old_avg > 0:
+                    fill_px = (new_avg * new_sz - old_avg * old_sz) / added
+                else:
+                    fill_px = mark
+                ema_store.mark_dca(fill_px)
+                trade = ema_store.active() or trade
+                trade_store.record_dca_add(new_avg, new_sz, coin=entry.api_coin)
+                protected_coins.add(entry.api_coin)
+                if ema > 0 and ema_dev_should_tp(trade.side, client.get_mark_price(), ema):
+                    return flatten_ema(entry, "tp_ema")
+                return refresh_protect(entry, trade, new_avg, ema)
+        else:
+            ref = trade.last_fill_px if (dca_on and trade.dca_done) else trade.entry_px
+            if adverse_pct(trade.side, ref, mark) + 1e-12 >= trade.dev_pct:
+                return flatten_ema(
+                    entry,
+                    f"stop_loss D={trade.dev_pct:.2f}% from {ref:.6g}",
+                )
+        if bar_t > 0 and last_manage_bar.get(entry.api_coin) != bar_t:
+            last_manage_bar[entry.api_coin] = bar_t
+            return refresh_protect(entry, trade, avg, ema)
+        if entry.api_coin not in protected_coins or not client.has_exchange_tpsl():
+            return refresh_protect(entry, trade, avg, ema)
+        return False
+
+    def manage_ema_positions(open_positions: list) -> bool:
+        closed = False
+        tracked = ema_store.active()
+        keep = tracked.coin if tracked else None
+        if keep is None and open_positions:
+            first = find_watch_entry(watch, open_positions[0][0])
+            keep = first.api_coin if first else str(open_positions[0][0])
+        seen: set[str] = set()
+        for coin, position in list(open_positions):
+            entry = find_watch_entry(watch, coin)
+            key = entry.api_coin if entry else str(coin)
+            if key in seen:
+                continue
+            seen.add(key)
+            if keep and key != keep:
+                logger.warning(
+                    "EMA-dev is one pair — flattening extra %s", key
+                )
+                if entry is None:
+                    client.configure_coin(str(coin))
+                    executor.emergency_flatten("ema_dev_extra_position")
+                    wait_until_flat(
+                        client,
+                        trade_store,
+                        logger,
+                        coin=client.coin,
+                        coin_names=frozenset({client.coin, str(coin)}),
+                    )
+                    drop_local(client.coin)
+                else:
+                    flatten_ema(entry, "ema_dev_one_pair_only")
+                closed = True
+                continue
+            if entry is None:
+                logger.warning(
+                    "EMA-dev position on %s outside watch — flattening", coin
+                )
+                client.configure_coin(str(coin))
+                executor.emergency_flatten("ema_dev_outside_watch")
+                wait_until_flat(
+                    client,
+                    trade_store,
+                    logger,
+                    coin=client.coin,
+                    coin_names=frozenset({client.coin, str(coin)}),
+                )
+                drop_local(client.coin)
+                ema_store.close(coin=str(coin), bar_t=0)
+                closed = True
+                continue
+            if manage_ema_one(entry, position):
+                closed = True
+        return closed
+
+    def try_open_ema() -> bool:
+        if ema_store.active() is not None:
+            return False
+        period = _ema_period()
+        iv = _ema_iv()
+        min_dev = float(getattr(cfg, "EMA_DEV_MIN_DEV_PCT", 0) or 0)
+        snaps = []
+        parts: list[str] = []
+        by_coin = {e.api_coin: e for e in watch}
+        for entry in watch:
+            candles = client.get_closed_candles_for(
+                entry.api_coin, iv, min_bars=_ema_bars_need()
+            )
+            snap = snap_from_candles(entry.api_coin, candles, period)
+            if snap is None:
+                parts.append(f"{entry.api_coin} no-ema")
+                continue
+            parts.append(
+                f"{entry.api_coin} {snap.abs_dev_pct:.2f}% "
+                f"{'below' if snap.signal_side > 0 else 'above'} ema"
+            )
+            snaps.append(snap)
+        prev = ema_store.trade
+        skip_coin = prev.last_exit_coin if prev else None
+        skip_bar = prev.last_exit_bar_t if prev else 0
+        winner = pick_farthest(
+            snaps,
+            min_dev_pct=min_dev,
+            skip_coin=skip_coin or None,
+            skip_bar_t=skip_bar,
+        )
+        logger.info(
+            "EMA-dev scan | %s",
+            " || ".join(parts) if parts else "idle",
+        )
+        if winner is None:
+            return False
+        entry = by_coin.get(winner.coin)
+        if entry is None:
+            return False
+        signal_side = int(winner.signal_side)
+        side = signal_side
+        if flip_live:
+            logger.info(
+                "EMA-dev ignores REVERSE — staying %s (mean-revert to EMA)",
+                "LONG" if side > 0 else "SHORT",
+            )
+        entry_pct, dca_pct = ema_dev_fill_pcts(
+            float(cfg.EMA_DEV_ENTRY_PCT),
+            float(cfg.EMA_DEV_TOTAL_PCT),
+            dca_on=_ema_dca_on(),
+        )
+        activate_pair_for_trade(client, entry)
+        est = client.estimate_order_size(
+            entry_pct,
+            entry.leverage,
+            sz_decimals=entry.market.sz_decimals,
+            min_notional_usd=cfg.MIN_ORDER_NOTIONAL_USD,
+            margin_from="equity",
+        )
+        if not est.ok:
+            logger.warning("Skip %s — %s", entry.api_coin, est.reason)
+            return False
+        try:
+            equity = client.get_account_value(force=True)
+        except Exception:
+            equity = 0.0
+        if equity > 0 and est.available_margin < equity * cfg.MIN_FREE_MARGIN_FRAC:
+            logger.warning(
+                "Skip %s — free margin $%.2f low vs equity $%.2f",
+                entry.api_coin,
+                est.available_margin,
+                equity,
+            )
+            return False
+        draft = EmaDevTrade(
+            coin=entry.api_coin,
+            side="long" if side > 0 else "short",
+            dev_pct=max(0.0, float(winner.abs_dev_pct)),
+            entry_px=float(winner.close),
+            last_fill_px=float(winner.close),
+            dca_done=False,
+            entry_ema=float(winner.ema),
+            opened_bar_t=int(winner.bar_t),
+        )
+        pcts = ema_dev_protect_pcts(
+            draft, float(winner.close), float(winner.ema), dca_on=_ema_dca_on()
+        )
+        if pcts is None:
+            logger.info("Skip %s — already at EMA", entry.api_coin)
+            return False
+        tp_pct, sl_pct = pcts
+        logger.info(
+            "EMA-dev entry %s %s size=%s notional=$%.2f margin=%.2f%% equity "
+            "D=%.2f%% ema=%.6g close=%.6g tpsl=%.2f%%/%.2f%% [%s%s]",
+            entry.api_coin,
+            "LONG" if side > 0 else "SHORT",
+            est.size,
+            est.notional_usd,
+            entry_pct,
+            draft.dev_pct,
+            winner.ema,
+            winner.close,
+            tp_pct,
+            sl_pct,
+            mode,
+            "|REVERSE-ignored" if flip_live else "",
+        )
+        try:
+            ok = executor.execute_protected_entry(
+                is_buy=side > 0,
+                target_sz=est.size,
+                take_profit_pct=tp_pct,
+                stop_loss_pct=sl_pct,
+            )
+        except RuntimeError as exc:
+            if "insufficient margin" in str(exc).lower():
+                logger.warning("Insufficient margin for %s", entry.api_coin)
+                return False
+            raise
+        if not ok:
+            cleanup_closed_coin(client, trade_store, entry.api_coin)
+            return False
+        pos = client.get_position(force=True)
+        if pos is None:
+            cleanup_closed_coin(client, trade_store, entry.api_coin)
+            return False
+        if not client.has_exchange_tpsl():
+            executor.emergency_flatten("unprotected")
+            cleanup_closed_coin(client, trade_store, entry.api_coin)
+            return False
+        fill = pos.entry_price or client.get_mark_price()
+        draft.entry_px = float(fill)
+        draft.last_fill_px = float(fill)
+        ema_store.open_trade(draft)
+        trade_store.open_trade(
+            client.coin,
+            pos.side,
+            fill,
+            pos.size,
+            tp_pct,
+            sl_pct,
+            equity_at_entry=client.get_account_value(force=True),
+        )
+        last_manage_bar[entry.api_coin] = int(winner.bar_t)
+        protected_coins.add(entry.api_coin)
+        pcts2 = ema_dev_protect_pcts(
+            draft, float(fill), float(winner.ema), dca_on=_ema_dca_on()
+        )
+        if pcts2 is None:
+            return flatten_ema(entry, "tp_ema")
+        if abs(pcts2[0] - tp_pct) > 0.08 or abs(pcts2[1] - sl_pct) > 0.08:
+            if refresh_protect(entry, draft, float(fill), float(winner.ema)):
+                return True
+        logger.info(
+            "Opened EMA-dev %s %s size=%s @ %s D=%.2f%%",
+            client.coin,
+            pos.side,
+            pos.size,
+            fill,
+            draft.dev_pct,
+        )
+        return True
+
+    def maybe_refresh_ema_universe() -> None:
+        hours = float(getattr(cfg, "BACKTEST_REFRESH_HOURS", 24) or 24)
+        if time.time() - universe_built_at < hours * 3600.0:
+            return
+        logger.info("EMA-dev refreshing pair universe (every %.0fh)", hours)
+        refresh_universe_if_needed(force=True)
+
     while not stop.is_set():
         try:
             if not first_iter:
@@ -1106,21 +1620,43 @@ def main() -> None:
                 continue
 
             closed_any = False
-            seen_manage: set[str] = set()
-            for coin, position in list(open_positions):
-                entry = find_watch_entry(watch, coin)
-                key = entry.api_coin if entry else str(coin)
-                if key in seen_manage:
-                    continue
-                seen_manage.add(key)
-                if manage_one(coin, position):
-                    closed_any = True
+            if ema_dev_on:
+                closed_any = manage_ema_positions(open_positions)
+            else:
+                seen_manage: set[str] = set()
+                for coin, position in list(open_positions):
+                    entry = find_watch_entry(watch, coin)
+                    key = entry.api_coin if entry else str(coin)
+                    if key in seen_manage:
+                        continue
+                    seen_manage.add(key)
+                    if manage_one(coin, position):
+                        closed_any = True
 
             if closed_any:
                 pos_ok, open_positions = client.fetch_open_positions(force=True)
                 if not pos_ok:
                     continue
             occupied = occupied_api(open_positions)
+
+            if ema_dev_on:
+                tracked = ema_store.active()
+                if tracked is not None and tracked.coin not in occupied:
+                    logger.info(
+                        "EMA-dev %s closed on exchange — clearing local state",
+                        tracked.coin,
+                    )
+                    bar_t = 0
+                    try:
+                        candles = client.get_closed_candles_for(
+                            tracked.coin, _ema_iv(), min_bars=_ema_bars_need()
+                        )
+                        if candles:
+                            bar_t = int(candles[-1]["t"])
+                    except Exception:
+                        bar_t = 0
+                    ema_store.close(coin=tracked.coin, bar_t=bar_t)
+                    drop_local(tracked.coin)
 
             if not occupied:
                 if was_in_position or trade_store.trades:
@@ -1131,9 +1667,17 @@ def main() -> None:
                     open_setup_mem.clear()
                     protected_coins.clear()
                     was_in_position = False
-                maybe_tune(force=not store.setups())
+                if ema_dev_on:
+                    maybe_refresh_ema_universe()
+                else:
+                    maybe_tune(force=not store.setups())
             else:
                 was_in_position = True
+
+            if ema_dev_on:
+                if not occupied:
+                    try_open_ema()
+                continue
 
             can_scan = concurrent or not occupied
             if can_scan and max_concurrent > 0 and len(occupied) >= max_concurrent:

@@ -7,6 +7,38 @@ Edit this file. Live bot and one-shot backtest both import from here.
 from __future__ import annotations
 
 # =============================================================================
+# WHICH STRATEGY  (set this first)
+# =============================================================================
+# False = current MTF strategy (tune / backtest, multi-pair).
+# True  = EMA-deviation strategy (no tune). Same PAIR_SELECTION_MODE either way.
+# This file only -- not profit-meta-follower/config.py.
+USE_EMA_DEV_STRATEGY = True
+
+# EMA-dev knobs (ignored when USE_EMA_DEV_STRATEGY is False).
+# Pick the watch-list coin whose last closed 1m close is farthest from EMA(200)
+# by abs(close-EMA)/EMA. Below EMA => LONG. Above EMA => SHORT.
+# One pair / one position. TP = price touches EMA. D = that entry deviation %.
+#   DCA on  => add once after D% against from the first fill, then SL after
+#             another D% against from the DCA fill.
+#   DCA off => SL after D% against from the first fill.
+# X=50 Y=98 => first fill 50% of equity, DCA the other 48% (98% total).
+# EMA_DEV_ALLOW_DCA is independent of ALLOW_DCA (that one is MTF only).
+EMA_DEV_INTERVAL = "1m"
+EMA_DEV_PERIOD = 200
+EMA_DEV_MIN_DEV_PCT = 0.0
+EMA_DEV_ENTRY_PCT = 50.0
+EMA_DEV_TOTAL_PCT = 98.0
+EMA_DEV_ALLOW_DCA = True
+
+
+def ema_dev_strategy_enabled() -> bool:
+    """True when live/paper should use the EMA-deviation path instead of MTF."""
+    try:
+        return bool(USE_EMA_DEV_STRATEGY)
+    except NameError:
+        return False
+
+# =============================================================================
 # PAIR SELECTION
 # =============================================================================
 # "manual"      = use PAIRS (+ PAIR_LEVERAGE) exactly as listed.
