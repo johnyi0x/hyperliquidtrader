@@ -205,8 +205,8 @@ IP_WEIGHT_RESERVE = 50
 # Backtest/tune is NEVER reversed — only live/paper execution.
 # top_movers: live still shorts 24h gainers / longs 24h losers either way —
 # the tuner locks the opposite side when this is True so the flip fades.
-REVERSE_STRATEGY = True
-FLIP_EXECUTION = True # legacy alias; either True enables reverse
+REVERSE_STRATEGY = False
+FLIP_EXECUTION = False # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:
