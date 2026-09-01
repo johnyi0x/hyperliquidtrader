@@ -79,6 +79,7 @@ def main() -> None:
         requested_leverage_for=cfg.requested_leverage_for,
         min_max_leverage=int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
         max_max_leverage=int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0),
+        min_day_notional=float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0),
         xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
         logger=logger,
     )
@@ -107,12 +108,13 @@ def main() -> None:
     )
     if is_volume_mode(pair_mode):
         logger.info(
-            "Top-volume: count=%s xyz_mode=%s use_max_lev=%s min_maxLev≥%s max_maxLev≤%s",
+            "Top-volume: count=%s xyz_mode=%s use_max_lev=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s",
             int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
             cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
             bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+            int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
         )
     mover_buckets = dict(universe.buckets)
     side_map = (
@@ -125,8 +127,8 @@ def main() -> None:
         loser_side = mover_tune_side("loser")
         logger.info(
             "Top-movers: count=%s (%s gainers + %s losers) xyz_mode=%s "
-            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s | tune with-trend "
-            "gainers=%s losers=%s | live reverse off → same side as tune",
+            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s | tune with-trend "
+            "gainers=%s losers=%s",
             int(
                 getattr(cfg, "TOP_MOVER_COUNT", 0)
                 or getattr(cfg, "TOP_VOLUME_COUNT", 14)
@@ -138,6 +140,7 @@ def main() -> None:
             bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+            int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
             "LONG" if gainer_side > 0 else "SHORT",
             "LONG" if loser_side > 0 else "SHORT",
         )

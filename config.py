@@ -26,6 +26,10 @@ TOP_VOLUME_COUNT = 27
 # Look-set size. Half are 24h gainers, half are 24h losers (odd extra → gainers).
 # Example 14 → 7 gainers + 7 losers, then MAX_LIVE_PAIRS keeps the best of those.
 TOP_MOVER_COUNT = 14
+# Skip markets whose 24h notional volume (dayNtlVlm) is below this USD amount.
+# 0 = off. Movers especially need this — tiny HIP-3 books can print huge 24h %.
+# 1_000_000 ≈ $1M/day. Raise if you still see thin names; lower to include more xyz.
+MIN_DAY_NOTIONAL_USD = 1_000_000
 # Skip markets whose exchange max leverage is below this (e.g. 3x/5x memes).
 # 0 = no filter. 10 = only pairs with maxLev ≥ 10, then take top N among those.
 MIN_MAX_LEVERAGE = 10

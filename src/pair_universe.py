@@ -122,6 +122,15 @@ def _as_float(raw: Any, default: float = 0.0) -> float:
         return default
 
 
+def _fmt_notional(usd: float) -> str:
+    v = float(usd or 0.0)
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.0f}k"
+    return f"{v:.0f}"
+
+
 def _fetch_meta_and_ctxs(info: Any, dex: str = "") -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """
     POST metaAndAssetCtxs. Empty dex = native HL perps.
@@ -292,6 +301,33 @@ def _filter_by_leverage(
     return ranked
 
 
+def _filter_by_day_notional(
+    ranked: list[VolumePair],
+    *,
+    min_day_notional: float,
+    logger: logging.Logger,
+) -> list[VolumePair]:
+    floor = max(0.0, float(min_day_notional or 0.0))
+    if floor <= 0:
+        return ranked
+    skipped = [p for p in ranked if p.day_ntl_vlm < floor]
+    kept = [p for p in ranked if p.day_ntl_vlm >= floor]
+    if skipped:
+        skipped.sort(key=lambda p: p.day_ntl_vlm)
+        sample = ", ".join(
+            f"{p.api_coin}(${p.day_ntl_vlm:,.0f})" for p in skipped[:8]
+        )
+        extra = "" if len(skipped) <= 8 else f" +{len(skipped) - 8} more"
+        logger.info(
+            "Min 24h notional ≥$%.0f: dropped %s thin markets (%s%s)",
+            floor,
+            len(skipped),
+            sample,
+            extra,
+        )
+    return kept
+
+
 def _lev_label(min_lev: int, max_lev_cap: int) -> str:
     lev_lo = min_lev if min_lev > 0 else 1
     lev_hi = max_lev_cap if max_lev_cap > 0 else None
@@ -342,6 +378,7 @@ def discover_top_volume_pairs(
     xyz_mode: str = "native",
     min_max_leverage: int = 0,
     max_max_leverage: int = 0,
+    min_day_notional: float = 0.0,
     logger: logging.Logger | None = None,
 ) -> list[VolumePair]:
     """
@@ -378,6 +415,9 @@ def discover_top_volume_pairs(
     ranked = sorted(_dedupe_by_api_coin(collected), key=lambda p: p.day_ntl_vlm, reverse=True)
     ranked = _filter_by_leverage(
         ranked, min_lev=min_lev, max_lev_cap=max_lev_cap, logger=log
+    )
+    ranked = _filter_by_day_notional(
+        ranked, min_day_notional=min_day_notional, logger=log
     )
     top = ranked[:n]
     lev_label = _lev_label(min_lev, max_lev_cap)
@@ -421,6 +461,7 @@ def discover_top_mover_pairs(
     xyz_mode: str = "native",
     min_max_leverage: int = 0,
     max_max_leverage: int = 0,
+    min_day_notional: float = 0.0,
     logger: logging.Logger | None = None,
 ) -> tuple[list[VolumePair], dict[str, str]]:
     """
@@ -454,6 +495,9 @@ def discover_top_mover_pairs(
         min_lev=min_lev,
         max_lev_cap=max_lev_cap,
         logger=log,
+    )
+    ranked = _filter_by_day_notional(
+        ranked, min_day_notional=min_day_notional, logger=log
     )
     eligible = [p for p in ranked if p.prev_day_px > 0 and p.mark_px > 0]
     skipped_px = len(ranked) - len(eligible)
@@ -489,8 +533,14 @@ def discover_top_mover_pairs(
     top = list(gainers) + list(losers)
     lev_label = _lev_label(min_lev, max_lev_cap)
     if top:
-        g_txt = ", ".join(f"{p.api_coin}({p.day_chg_pct:+.1f}%)" for p in gainers[:7])
-        l_txt = ", ".join(f"{p.api_coin}({p.day_chg_pct:+.1f}%)" for p in losers[:7])
+        g_txt = ", ".join(
+            f"{p.api_coin}({p.day_chg_pct:+.1f}% ${_fmt_notional(p.day_ntl_vlm)})"
+            for p in gainers[:7]
+        )
+        l_txt = ", ".join(
+            f"{p.api_coin}({p.day_chg_pct:+.1f}% ${_fmt_notional(p.day_ntl_vlm)})"
+            for p in losers[:7]
+        )
         extra_g = f" +{len(gainers) - 7}" if len(gainers) > 7 else ""
         extra_l = f" +{len(losers) - 7}" if len(losers) > 7 else ""
         log.info(
@@ -538,6 +588,7 @@ def resolve_pair_universe(
     max_max_leverage: int = 0,
     xyz_mode: str | None = None,
     top_mover_count: int | None = None,
+    min_day_notional: float = 0.0,
     logger: logging.Logger | None = None,
 ) -> PairUniverse:
     """
@@ -563,12 +614,14 @@ def resolve_pair_universe(
             xyz_mode=scope,
             min_max_leverage=int(min_max_leverage or 0),
             max_max_leverage=int(max_max_leverage or 0),
+            min_day_notional=float(min_day_notional or 0.0),
             logger=log,
         )
         if not discovered:
             raise RuntimeError(
                 "PAIR_SELECTION_MODE=top_volume found no markets — check "
-                "XYZ_PAIR_MODE / INCLUDE_XYZ_PAIRS / MIN_MAX_LEVERAGE / MAX_MAX_LEVERAGE"
+                "XYZ_PAIR_MODE / INCLUDE_XYZ_PAIRS / MIN_MAX_LEVERAGE / "
+                "MAX_MAX_LEVERAGE / MIN_DAY_NOTIONAL_USD"
             )
         pairs = _assign_discovered_leverage(
             discovered,
@@ -587,12 +640,14 @@ def resolve_pair_universe(
             xyz_mode=scope,
             min_max_leverage=int(min_max_leverage or 0),
             max_max_leverage=int(max_max_leverage or 0),
+            min_day_notional=float(min_day_notional or 0.0),
             logger=log,
         )
         if not discovered:
             raise RuntimeError(
                 "PAIR_SELECTION_MODE=top_movers found no markets — check "
-                "XYZ_PAIR_MODE / INCLUDE_XYZ_PAIRS / MIN_MAX_LEVERAGE / MAX_MAX_LEVERAGE"
+                "XYZ_PAIR_MODE / INCLUDE_XYZ_PAIRS / MIN_MAX_LEVERAGE / "
+                "MAX_MAX_LEVERAGE / MIN_DAY_NOTIONAL_USD"
             )
         pairs = _assign_discovered_leverage(
             discovered,

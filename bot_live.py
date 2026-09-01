@@ -297,6 +297,8 @@ def main() -> None:
             raise ValueError("MIN_MAX_LEVERAGE must be >= 0")
         if int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) < 0:
             raise ValueError("MAX_MAX_LEVERAGE must be >= 0")
+        if float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) < 0:
+            raise ValueError("MIN_DAY_NOTIONAL_USD must be >= 0")
         pairs = ()
     bad_iv = [i for i in cfg.INTERVALS if i not in INTERVAL_MS]
     if bad_iv:
@@ -352,6 +354,7 @@ def main() -> None:
         requested_leverage_for=cfg.requested_leverage_for,
         min_max_leverage=int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
         max_max_leverage=int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0),
+        min_day_notional=float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0),
         xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
         logger=logger,
     )
@@ -412,7 +415,7 @@ def main() -> None:
             return
         if is_mover_mode(pair_mode):
             logger.info(
-                "Refreshing top-mover universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s)",
+                "Refreshing top-mover universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s)",
                 int(
                     getattr(cfg, "TOP_MOVER_COUNT", 0)
                     or getattr(cfg, "TOP_VOLUME_COUNT", 14)
@@ -421,14 +424,16 @@ def main() -> None:
                 cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
                 int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
                 int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+                int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
             )
         else:
             logger.info(
-                "Refreshing top-volume universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s)",
+                "Refreshing top-volume universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s)",
                 int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
                 cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
                 int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
                 int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+                int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
             )
         fresh = resolve_pair_universe(
             client.info,
@@ -449,6 +454,7 @@ def main() -> None:
             requested_leverage_for=cfg.requested_leverage_for,
             min_max_leverage=int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             max_max_leverage=int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0),
+            min_day_notional=float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0),
             xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
             logger=logger,
         )
@@ -637,12 +643,13 @@ def main() -> None:
     )
     if is_volume_mode(pair_mode):
         logger.info(
-            "Top-volume settings: count=%s xyz_mode=%s use_max_lev=%s min_maxLev≥%s max_maxLev≤%s",
+            "Top-volume settings: count=%s xyz_mode=%s use_max_lev=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s",
             int(getattr(cfg, "TOP_VOLUME_COUNT", 50) or 50),
             cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
             bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+            int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
         )
     if is_mover_mode(pair_mode):
         gainer_side = mover_tune_side("gainer")
@@ -651,7 +658,7 @@ def main() -> None:
         losers = [c for c, b in mover_buckets.items() if b == "loser"]
         logger.info(
             "Top-mover settings: count=%s (%s gainers + %s losers) xyz_mode=%s "
-            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s",
+            "use_max_lev=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s",
             int(
                 getattr(cfg, "TOP_MOVER_COUNT", 0)
                 or getattr(cfg, "TOP_VOLUME_COUNT", 14)
@@ -663,6 +670,7 @@ def main() -> None:
             bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
+            int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
         )
         logger.info(
             "Movers: tune with-trend gainers=%s losers=%s | live reverse=%s "
