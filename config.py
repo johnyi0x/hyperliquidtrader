@@ -197,8 +197,8 @@ IP_WEIGHT_RESERVE = 50
 #         Frequency matches the original; DCA/TP/SL follow the real position.
 # False → orders match the backtest side.
 # Backtest/tune is NEVER reversed — only live/paper execution.
-REVERSE_STRATEGY = True
-FLIP_EXECUTION = True # legacy alias; either True enables reverse
+REVERSE_STRATEGY = False
+FLIP_EXECUTION = False # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:
