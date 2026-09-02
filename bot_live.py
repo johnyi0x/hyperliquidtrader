@@ -683,7 +683,7 @@ def main() -> None:
             "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
             "one pair | refresh pair list after every close",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
-            int(getattr(cfg, "EMA_DEV_PERIOD", 200) or 200),
+            int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100),
             entry_pct,
             "on" if dca_pct > 0 else "off",
             dca_pct,
@@ -1158,7 +1158,7 @@ def main() -> None:
         return str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m")
 
     def _ema_period() -> int:
-        return int(getattr(cfg, "EMA_DEV_PERIOD", 200) or 200)
+        return int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100)
 
     def _ema_bars_need() -> int:
         return max(40, _ema_period() + 30)

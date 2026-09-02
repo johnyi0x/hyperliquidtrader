@@ -15,7 +15,7 @@ from __future__ import annotations
 USE_EMA_DEV_STRATEGY = True
 
 # EMA-dev knobs (ignored when USE_EMA_DEV_STRATEGY is False).
-# Pick the watch-list coin whose last closed 1m close is farthest from EMA(200)
+# Pick the watch-list coin whose last closed 1m close is farthest from EMA(100)
 # by abs(close-EMA)/EMA. Below EMA => LONG. Above EMA => SHORT.
 # One pair / one position. TP = price touches EMA. D = that entry deviation %.
 #   DCA on  => add once after D% against from the first fill, then SL after
@@ -28,7 +28,7 @@ USE_EMA_DEV_STRATEGY = True
 # If Y% of current equity does not fit in free margin, add with remaining free.
 # EMA_DEV_ALLOW_DCA is independent of ALLOW_DCA (that one is MTF only).
 EMA_DEV_INTERVAL = "1m"
-EMA_DEV_PERIOD = 200
+EMA_DEV_PERIOD = 100
 EMA_DEV_MIN_DEV_PCT = 0.0
 EMA_DEV_ENTRY_PCT = 25.0
 EMA_DEV_TOTAL_PCT = 33.0
@@ -72,11 +72,12 @@ MIN_MAX_LEVERAGE = 10
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # 0 = no ceiling. 20 = only pairs with maxLev ≤ 20 (after the min filter).
 MAX_MAX_LEVERAGE = 20
-# Which books to scan (volume or 24h movers):
-#   "native"   = Hyperliquid main perps only (no HIP-3)
-#   "include"  = native + HIP-3 (xyz:...)
-#   "xyz_only" = HIP-3 builder dexes only (e.g. xyz:SKHY)
-XYZ_PAIR_MODE = "include"
+# Which books to scan (volume or 24h movers). Same filter in EMA-dev and MTF.
+#   "native"   = Hyperliquid main perps only (BTC, ETH, …). No HIP-3.
+#                Drops xyz: / para: / 10x: / other builder-dex prefixes.
+#   "include"  = native + HIP-3 (xyz:..., para:..., 10x:...)
+#   "xyz_only" = HIP-3 builder dexes only
+XYZ_PAIR_MODE = "native"
 # Legacy alias (used only if XYZ_PAIR_MODE is missing/invalid):
 # False → native, True → include. Prefer XYZ_PAIR_MODE.
 INCLUDE_XYZ_PAIRS = False

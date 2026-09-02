@@ -1,12 +1,12 @@
 """
-Mean-revert to 1m EMA(200): pick the watch-list coin farthest from EMA,
+Mean-revert to 1m EMA: pick the watch-list coin farthest from EMA,
 go long below / short above, one pair at a time. No backtest / tune.
 
 D = abs(close - EMA) / EMA at entry (percent).
   DCA on  => add once after D% adverse from the first fill, then SL after
             another D% adverse from the DCA fill.
   DCA off => SL after D% adverse from the first fill.
-  TP      => full close when mark touches the current EMA(200).
+  TP      => full close when mark touches the current EMA.
 """
 
 from __future__ import annotations
