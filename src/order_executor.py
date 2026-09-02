@@ -134,6 +134,11 @@ class OrderExecutor:
                 self._emergency_flatten_unlocked("size_mismatch")
                 return False
 
+            if self.mid_limit_then_market:
+                return self._protect_or_flatten_maker(
+                    take_profit_pct, stop_loss_pct, after="entry"
+                )
+
             if not self.client.attach_position_tpsl(
                 pos,
                 take_profit_pct,
@@ -215,6 +220,14 @@ class OrderExecutor:
                 self.client.cancel_all_orders_for_coin()
                 return None
 
+            if self.mid_limit_then_market:
+                status = self._protect_or_flatten_maker(
+                    take_profit_pct, stop_loss_pct, after="dca"
+                )
+                if not status:
+                    return None
+                return self.client.get_position(force=True)
+
             # Old TP/SL triggers cover the old size/entry — replace them.
             self.client.cancel_all_orders_for_coin()
             if not self.client.attach_position_tpsl(
@@ -231,6 +244,46 @@ class OrderExecutor:
         eps = 10 ** (-self.client.sz_decimals)
         pos = self.client.get_position(force=True)
         return pos is None or pos.size <= eps
+
+    def _protect_or_flatten_maker(
+        self,
+        take_profit_pct: float,
+        stop_loss_pct: float,
+        *,
+        after: str,
+    ) -> bool:
+        """
+        Park post-only TP + market SL. If TP would take (already at EMA),
+        close with mid-limit then market. False means flatten / no open trade.
+        """
+        status = self.client.protect_ema_maker(
+            take_profit_pct, stop_loss_pct, max_attempts=3
+        )
+        if status == "flat":
+            self.client.cancel_all_orders_for_coin()
+            return after == "dca"
+        if status == "unprotected":
+            self._emergency_flatten_unlocked(f"{after}_sl_attach_failed")
+            return False
+        if status == "would_take":
+            pos = self.client.get_position(force=True)
+            if pos is None:
+                self.client.cancel_all_orders_for_coin()
+                return after == "dca"
+            self.logger.info(
+                "Maker TP would take — closing at mid (post-only then market)"
+            )
+            is_buy = pos.side == "short"
+            self.client.cancel_reduce_only_limits_for_coin()
+            self.client.cancel_tp_triggers_for_coin()
+            self._fill_mid_limit_then_market(
+                is_buy=is_buy, target_sz=pos.size, reduce_only=True
+            )
+            self.client.cancel_all_orders_for_coin()
+            if not self._position_flat():
+                self._emergency_flatten_unlocked("maker_tp_would_take")
+            return False
+        return True
 
     def execute_close(self, is_buy: bool, target_sz: float) -> bool:
         with self._lock:
@@ -265,6 +318,7 @@ class OrderExecutor:
         """
         with self._lock:
             self.client.cancel_entry_orders_for_coin()
+            self.client.cancel_reduce_only_limits_for_coin()
             self.client.cancel_tp_triggers_for_coin()
             self.client.invalidate_user_state()
             pos = self.client.get_position(force=True)

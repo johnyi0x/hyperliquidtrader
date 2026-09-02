@@ -503,9 +503,53 @@ class PaperHyperliquidClient(HyperliquidClient):
         self._settle()
         return True
 
+    def protect_ema_maker(
+        self,
+        take_profit_pct: float,
+        stop_loss_pct: float,
+        *,
+        max_attempts: int = 3,
+    ) -> str:
+        pos = self.positions.get(self.coin)
+        if not pos:
+            return "flat"
+        entry = float(pos["entry_px"])
+        tp_px, sl_px = self.tp_sl_prices_for_entry(
+            pos["side"], entry, take_profit_pct, stop_loss_pct
+        )
+        pos["tp_px"] = float(tp_px)
+        pos["sl_px"] = float(sl_px)
+        self._save_account()
+        self.logger.info(
+            "PAPER maker TP + SL %s %s entry=%.8f tp=%.8f sl=%.8f",
+            pos["coin"],
+            pos["side"],
+            entry,
+            tp_px,
+            sl_px,
+        )
+        self._settle()
+        if self.coin not in self.positions:
+            return "flat"
+        return "ok"
+
     def has_exchange_tpsl(self) -> bool:
         pos = self.positions.get(self.coin)
         return bool(pos and pos.get("tp_px") is not None and pos.get("sl_px") is not None)
+
+    def has_exchange_sl(self) -> bool:
+        pos = self.positions.get(self.coin)
+        return bool(pos and pos.get("sl_px") is not None)
+
+    def has_resting_tp_limit(self) -> bool:
+        pos = self.positions.get(self.coin)
+        return bool(pos and pos.get("tp_px") is not None)
+
+    def resting_tp_px(self) -> float | None:
+        pos = self.positions.get(self.coin)
+        if not pos or pos.get("tp_px") is None:
+            return None
+        return float(pos["tp_px"])
 
     def has_open_entry_orders(self) -> bool:
         return False
@@ -535,4 +579,10 @@ class PaperHyperliquidClient(HyperliquidClient):
         return
 
     def cancel_tp_triggers_for_coin(self) -> None:
+        return
+
+    def cancel_sl_triggers_for_coin(self) -> None:
+        return
+
+    def cancel_reduce_only_limits_for_coin(self, *, keep_oid: int | None = None) -> None:
         return

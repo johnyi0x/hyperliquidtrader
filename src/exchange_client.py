@@ -28,7 +28,14 @@ from .market_resolver import (
     resolve_market,
     sdk_perp_dexs_for_dexes,
 )
-from .pricing import ceil_size, floor_size, round_price, round_size, size_step
+from .pricing import (
+    ceil_size,
+    floor_size,
+    limit_would_take,
+    round_price,
+    round_size,
+    size_step,
+)
 from .tp_sl import tp_sl_from_entry
 from .ema import EmaSnapshot, build_snapshot
 from .rsi import RsiValues, compute_rsi, parse_closes, wilder_rsi_series
@@ -985,10 +992,12 @@ class HyperliquidClient:
                 self.logger.warning("Cancel failed oid=%s: %s", oid, exc)
 
     def cancel_entry_orders_for_coin(self) -> None:
-        """Cancel non-trigger orders only (leave TP/SL triggers in place)."""
+        """Cancel non-trigger, non-reduce-only orders (leave TP limit + TP/SL triggers)."""
         self.invalidate_user_state()
         for order in self._frontend_orders_for_coin():
             if order.get("isTrigger"):
+                continue
+            if order.get("reduceOnly"):
                 continue
             oid = order.get("oid")
             if oid is None:
@@ -1020,6 +1029,40 @@ class HyperliquidClient:
             except Exception as exc:
                 self.logger.warning("Cancel TP failed oid=%s: %s", oid, exc)
 
+    def cancel_sl_triggers_for_coin(self) -> None:
+        """Cancel stop-loss triggers only (leave TP limits/triggers in place)."""
+        self.invalidate_user_state()
+        for order in self._reduce_only_triggers():
+            if not self._is_sl_trigger(order):
+                continue
+            oid = order.get("oid")
+            if oid is None:
+                continue
+            try:
+                self.exchange.cancel(self.coin, oid)
+                self.invalidate_user_state()
+                self.logger.info("Cancelled SL trigger oid=%s", oid)
+            except Exception as exc:
+                self.logger.warning("Cancel SL failed oid=%s: %s", oid, exc)
+
+    def cancel_reduce_only_limits_for_coin(self, *, keep_oid: int | None = None) -> None:
+        """Cancel resting reduce-only limits (parked TP). Leave trigger TP/SL."""
+        self.invalidate_user_state()
+        for order in self._frontend_orders_for_coin():
+            if order.get("isTrigger"):
+                continue
+            if not order.get("reduceOnly"):
+                continue
+            oid = order.get("oid")
+            if oid is None or (keep_oid is not None and int(oid) == int(keep_oid)):
+                continue
+            try:
+                self.exchange.cancel(self.coin, oid)
+                self.invalidate_user_state()
+                self.logger.info("Cancelled reduce-only limit oid=%s", oid)
+            except Exception as exc:
+                self.logger.warning("Cancel reduce-only limit failed oid=%s: %s", oid, exc)
+
     def tp_sl_prices_for_entry(
         self,
         side: str,
@@ -1035,6 +1078,16 @@ class HyperliquidClient:
     def _order_type_label(order: dict) -> str:
         return str(order.get("orderType") or order.get("triggerCondition") or "").lower()
 
+    def _is_sl_trigger(self, order: dict) -> bool:
+        label = self._order_type_label(order)
+        tpsl = str(order.get("tpsl") or "").lower()
+        return tpsl == "sl" or ("stop" in label and "take profit" not in label)
+
+    def _is_tp_trigger(self, order: dict) -> bool:
+        label = self._order_type_label(order)
+        tpsl = str(order.get("tpsl") or "").lower()
+        return tpsl == "tp" or "take profit" in label
+
     def _reduce_only_triggers(self) -> list[dict]:
         out: list[dict] = []
         for order in self._frontend_orders_for_coin():
@@ -1047,12 +1100,39 @@ class HyperliquidClient:
         has_tp = False
         has_sl = False
         for order in self._reduce_only_triggers():
-            label = self._order_type_label(order)
-            if "take profit" in label:
+            if self._is_tp_trigger(order):
                 has_tp = True
-            if "stop" in label:
+            if self._is_sl_trigger(order):
                 has_sl = True
         return has_tp and has_sl
+
+    def has_exchange_sl(self) -> bool:
+        return any(self._is_sl_trigger(order) for order in self._reduce_only_triggers())
+
+    def _resting_reduce_only_limits(self) -> list[dict]:
+        out: list[dict] = []
+        for order in self._frontend_orders_for_coin():
+            if order.get("isTrigger"):
+                continue
+            if not order.get("reduceOnly"):
+                continue
+            out.append(order)
+        return out
+
+    def has_resting_tp_limit(self) -> bool:
+        return bool(self._resting_reduce_only_limits())
+
+    def resting_tp_px(self) -> float | None:
+        for order in self._resting_reduce_only_limits():
+            raw = order.get("limitPx") or order.get("px")
+            if raw is None:
+                continue
+            return float(raw)
+        return None
+
+    def has_ema_maker_protect(self) -> bool:
+        """SL market trigger + resting reduce-only TP limit (not a market TP)."""
+        return self.has_exchange_sl() and self.has_resting_tp_limit()
 
     def has_open_entry_orders(self) -> bool:
         for order in self._frontend_orders_for_coin():
@@ -1201,6 +1281,7 @@ class HyperliquidClient:
                         pass
             self.invalidate_user_state()
             self.cancel_entry_orders_for_coin()
+            self.cancel_reduce_only_limits_for_coin()
 
             self.logger.info(
                 "positionTpsl attempt %s/%s | %s sz=%s entry=%.2f tp=%.2f sl=%.2f",
@@ -1230,6 +1311,225 @@ class HyperliquidClient:
             self.logger.warning("TP/SL placed but not both visible yet — retrying")
 
         return False
+
+    def _sl_through_px(self, side: str, sl_trigger_px: float) -> float:
+        # Market SL limit slightly through the trigger so gaps still fill.
+        if side == "long":
+            return round_price(sl_trigger_px * 0.995, self.sz_decimals)
+        return round_price(sl_trigger_px * 1.005, self.sz_decimals)
+
+    def _order_sz(self, order: dict) -> float:
+        for key in ("sz", "origSz", "orderSz"):
+            raw = order.get(key)
+            if raw is not None:
+                return float(raw)
+        return 0.0
+
+    def _sl_matches(self, position: Position, sl_px: float) -> bool:
+        eps = 10 ** (-self.sz_decimals)
+        for order in self._reduce_only_triggers():
+            if not self._is_sl_trigger(order):
+                continue
+            trig = float(order.get("triggerPx") or 0)
+            sz = self._order_sz(order)
+            if sz + eps < position.size:
+                return False
+            if sl_px > 0 and trig > 0 and abs(trig - sl_px) / sl_px > 0.002:
+                return False
+            return True
+        return False
+
+    def _tp_limit_matches(self, position: Position, tp_px: float) -> bool:
+        eps = 10 ** (-self.sz_decimals)
+        for order in self._resting_reduce_only_limits():
+            raw = order.get("limitPx") or order.get("px")
+            if raw is None:
+                continue
+            px = float(raw)
+            sz = self._order_sz(order)
+            if sz + eps < position.size:
+                continue
+            if tp_px > 0 and abs(px - tp_px) / tp_px <= 0.0008:
+                return True
+        return False
+
+    def _place_sl_trigger_raw(
+        self,
+        side: str,
+        sz: float,
+        sl_trigger_px: float,
+    ) -> tuple[bool, str | None]:
+        close_is_buy = side == "short"
+        sz = round_size(sz, self.sz_decimals)
+        sl_trigger_px = round_price(sl_trigger_px, self.sz_decimals)
+        sl_limit_px = self._sl_through_px(side, sl_trigger_px)
+        try:
+            result = self.exchange.order(
+                self.coin,
+                close_is_buy,
+                sz,
+                sl_limit_px,
+                {
+                    "trigger": {
+                        "isMarket": True,
+                        "triggerPx": sl_trigger_px,
+                        "tpsl": "sl",
+                    }
+                },
+                reduce_only=True,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        self.invalidate_user_state()
+        if result.get("status") != "ok":
+            return False, str(result)
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        if statuses:
+            err = self._bulk_status_error(statuses[0])
+            if err:
+                return False, err
+        return True, None
+
+    def attach_stop_loss_only(
+        self,
+        position: Position,
+        stop_loss_pct: float,
+        *,
+        max_attempts: int = 3,
+    ) -> bool:
+        import time as time_mod
+
+        for _attempt in range(1, max_attempts + 1):
+            live = self.get_position(force=True)
+            if live is None or live.size < 1e-12:
+                return False
+            entry = live.entry_price or self.get_mark_price()
+            _, sl_px = self.tp_sl_prices_for_entry(
+                live.side, entry, 0.05, stop_loss_pct
+            )
+            if self._sl_matches(live, sl_px):
+                return True
+            self.cancel_sl_triggers_for_coin()
+            ok, err = self._place_sl_trigger_raw(live.side, live.size, sl_px)
+            if not ok:
+                self.logger.warning("SL-only place failed: %s", err)
+                time_mod.sleep(0.6)
+                continue
+            time_mod.sleep(0.45)
+            if self.has_exchange_sl():
+                self.logger.info(
+                    "Exchange SL confirmed %s sz=%s sl=%.6g",
+                    live.side,
+                    live.size,
+                    sl_px,
+                )
+                return True
+        return self.has_exchange_sl()
+
+    def place_or_replace_tp_limit(
+        self,
+        side: str,
+        sz: float,
+        tp_px: float,
+    ) -> str:
+        """
+        Park a post-only reduce-only limit at tp_px.
+        Returns resting | filled | would_take | failed.
+        """
+        close_is_buy = side == "short"
+        sz = round_size(sz, self.sz_decimals)
+        tp_px = round_price(tp_px, self.sz_decimals)
+        if sz <= 0 or tp_px <= 0:
+            return "failed"
+        live = self.get_position(force=True)
+        if live is not None and self._tp_limit_matches(live, tp_px):
+            return "resting"
+        try:
+            if hasattr(self, "_l2_cache"):
+                self._l2_cache = None
+            l2 = self.l2_book()
+            if limit_would_take(l2, close_is_buy, tp_px):
+                return "would_take"
+        except Exception as exc:
+            self.logger.warning("L2 for maker TP failed: %s", exc)
+            return "failed"
+        try:
+            result = self.place_limit(close_is_buy, sz, tp_px, reduce_only=True)
+        except Exception as exc:
+            self.logger.error("Maker TP place failed: %s", exc)
+            return "failed"
+        try:
+            filled, oid, alo_rejected = self.parse_fill_from_result(result)
+        except RuntimeError as exc:
+            self.logger.warning("Maker TP parse failed: %s", exc)
+            return "failed"
+        if alo_rejected:
+            return "would_take"
+        if filled > 0:
+            self.cancel_reduce_only_limits_for_coin()
+            self.logger.info("Maker TP filled immediately sz=%s px=%s", filled, tp_px)
+            return "filled"
+        if oid is not None:
+            self.cancel_reduce_only_limits_for_coin(keep_oid=int(oid))
+            self.logger.info("Parked maker TP oid=%s px=%s sz=%s", oid, tp_px, sz)
+            return "resting"
+        return "failed"
+
+    def protect_ema_maker(
+        self,
+        take_profit_pct: float,
+        stop_loss_pct: float,
+        *,
+        max_attempts: int = 3,
+    ) -> str:
+        """
+        SL stays a market trigger. TP is a resting post-only limit.
+        Returns ok | flat | would_take | unprotected.
+        """
+        import time as time_mod
+
+        live = self.get_position(force=True)
+        if live is None or live.size < 1e-12:
+            self.cancel_all_orders_for_coin()
+            return "flat"
+        self.cancel_tp_triggers_for_coin()
+        self.cancel_entry_orders_for_coin()
+        if not self.attach_stop_loss_only(
+            live, stop_loss_pct, max_attempts=max_attempts
+        ):
+            return "unprotected"
+        live = self.get_position(force=True)
+        if live is None or live.size < 1e-12:
+            self.cancel_all_orders_for_coin()
+            return "flat"
+        status = "failed"
+        for _ in range(max_attempts):
+            live = self.get_position(force=True)
+            if live is None or live.size < 1e-12:
+                self.cancel_all_orders_for_coin()
+                return "flat"
+            entry = live.entry_price or self.get_mark_price()
+            tp_px, _sl_px = self.tp_sl_prices_for_entry(
+                live.side, entry, take_profit_pct, stop_loss_pct
+            )
+            status = self.place_or_replace_tp_limit(live.side, live.size, tp_px)
+            if status in ("resting", "filled", "would_take"):
+                break
+            time_mod.sleep(0.4)
+        if status == "filled":
+            live = self.get_position(force=True)
+            if live is None or live.size < 1e-12:
+                self.cancel_all_orders_for_coin()
+                return "flat"
+            return "ok" if self.has_resting_tp_limit() else "would_take"
+        if status == "would_take":
+            return "would_take"
+        if self.has_exchange_sl():
+            if status == "resting":
+                return "ok"
+            self.logger.warning("Maker TP not on book — SL is on, will retry next poll")
+            return "ok"
+        return "unprotected"
 
     def place_limit(
         self,

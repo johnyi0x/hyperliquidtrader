@@ -40,6 +40,7 @@ from src.ema_dev import (
     signed_dev_pct,
     snap_from_candles,
     should_tp as ema_dev_should_tp,
+    tp_through_pct as ema_dev_tp_through_pct,
 )
 from src.engine import (
     dca_should_add,
@@ -688,7 +689,7 @@ def main() -> None:
             "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% of equity now "
             "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
             "one pair | refresh pair list after every close | limit_orders=%s "
-            "(%sx mid post-only, %.0fs each, then market)",
+            "(%sx mid post-only entry, parked TP limit, %.0fs wait, then market leftover)",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
             int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100),
             entry_pct,
@@ -1176,15 +1177,37 @@ def main() -> None:
     def _ema_dca_on() -> bool:
         return bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False))
 
-    def force_attach_tpsl(tp_pct: float, sl_pct: float) -> bool:
+    def force_attach_tpsl(tp_pct: float, sl_pct: float) -> str:
+        if executor.mid_limit_then_market:
+            return client.protect_ema_maker(tp_pct, sl_pct, max_attempts=3)
         client.cancel_all_orders_for_coin()
         client.invalidate_user_state()
         pos = client.get_position(force=True)
         if pos is None:
-            return False
-        return client.attach_position_tpsl(
+            return "flat"
+        ok = client.attach_position_tpsl(
             pos, tp_pct, sl_pct, max_attempts=3
         )
+        return "ok" if ok else "failed"
+
+    def ema_is_protected() -> bool:
+        if executor.mid_limit_then_market:
+            return bool(client.has_ema_maker_protect())
+        return bool(client.has_exchange_tpsl())
+
+    def should_chase_maker_tp(side: str, mark: float, ema: float) -> bool:
+        if ema <= 0 or not ema_dev_should_tp(side, mark, ema):
+            return False
+        if not executor.mid_limit_then_market:
+            return True
+        through = ema_dev_tp_through_pct(side, mark, ema)
+        resting = client.resting_tp_px()
+        resting_ok = (
+            resting is not None and abs(float(resting) - ema) / ema * 100.0 < 0.2
+        )
+        # Resting maker TP is the fill. Chase only if it's missing/stale or
+        # mark gapped well through EMA without trading our limit.
+        return (not resting_ok) or through >= 0.25
 
     def flatten_ema(entry: PairSetup, reason: str) -> bool:
         activate_pair_for_trade(client, entry)
@@ -1253,15 +1276,32 @@ def main() -> None:
             return flatten_ema(entry, "tp_ema")
         tp_pct, sl_pct = pcts
         tracked = trade_store.get(entry.api_coin)
-        same = (
-            tracked is not None
-            and abs(tracked.take_profit_pct - tp_pct) < 0.08
-            and abs(tracked.stop_loss_pct - sl_pct) < 0.08
-            and client.has_exchange_tpsl()
-        )
+        if executor.mid_limit_then_market:
+            resting = client.resting_tp_px()
+            ema_ok = (
+                resting is not None
+                and ema > 0
+                and abs(float(resting) - ema) / ema * 100.0 < 0.12
+            )
+            same = (
+                tracked is not None
+                and abs(tracked.stop_loss_pct - sl_pct) < 0.08
+                and client.has_exchange_sl()
+                and ema_ok
+            )
+        else:
+            same = (
+                tracked is not None
+                and abs(tracked.take_profit_pct - tp_pct) < 0.08
+                and abs(tracked.stop_loss_pct - sl_pct) < 0.08
+                and client.has_exchange_tpsl()
+            )
         if same:
             return False
-        if not force_attach_tpsl(tp_pct, sl_pct):
+        status = force_attach_tpsl(tp_pct, sl_pct)
+        if status == "would_take" or status == "flat":
+            return flatten_ema(entry, "tp_ema")
+        if status != "ok":
             return flatten_ema(entry, "tpsl_attach_failed")
         pos = client.get_position(force=True)
         fill = float(pos.entry_price or avg_entry) if pos else avg_entry
@@ -1300,7 +1340,7 @@ def main() -> None:
         ema = float(snap.ema) if snap else float(trade.entry_ema or 0)
         bar_t = int(snap.bar_t) if snap else int(trade.opened_bar_t)
         avg = float(getattr(position, "entry_price", 0) or 0) or mark
-        if ema > 0 and ema_dev_should_tp(trade.side, mark, ema):
+        if ema > 0 and should_chase_maker_tp(trade.side, mark, ema):
             return flatten_ema(
                 entry,
                 f"tp_ema ema={ema:.6g} mark={mark:.6g}",
@@ -1395,7 +1435,9 @@ def main() -> None:
                 trade = ema_store.active() or trade
                 trade_store.record_dca_add(new_avg, new_sz, coin=entry.api_coin)
                 protected_coins.add(entry.api_coin)
-                if ema > 0 and ema_dev_should_tp(trade.side, client.get_mark_price(), ema):
+                if ema > 0 and should_chase_maker_tp(
+                    trade.side, client.get_mark_price(), ema
+                ):
                     return flatten_ema(entry, "tp_ema")
                 return refresh_protect(entry, trade, new_avg, ema)
         else:
@@ -1408,7 +1450,7 @@ def main() -> None:
         if bar_t > 0 and last_manage_bar.get(entry.api_coin) != bar_t:
             last_manage_bar[entry.api_coin] = bar_t
             return refresh_protect(entry, trade, avg, ema)
-        if entry.api_coin not in protected_coins or not client.has_exchange_tpsl():
+        if entry.api_coin not in protected_coins or not ema_is_protected():
             return refresh_protect(entry, trade, avg, ema)
         return False
 
@@ -1593,7 +1635,17 @@ def main() -> None:
         if pos is None:
             cleanup_closed_coin(client, trade_store, entry.api_coin)
             return False
-        if not client.has_exchange_tpsl():
+        if executor.mid_limit_then_market:
+            if not client.has_exchange_sl():
+                executor.emergency_flatten("unprotected")
+                cleanup_closed_coin(client, trade_store, entry.api_coin)
+                return False
+            if not client.has_resting_tp_limit():
+                logger.warning(
+                    "EMA-dev %s SL is on but maker TP is not resting — retry next bar",
+                    entry.api_coin,
+                )
+        elif not client.has_exchange_tpsl():
             executor.emergency_flatten("unprotected")
             cleanup_closed_coin(client, trade_store, entry.api_coin)
             return False

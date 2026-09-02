@@ -6,7 +6,7 @@ D = abs(close - EMA) / EMA at entry (percent).
   DCA on  => add once after D% adverse from the first fill, then SL after
             another D% adverse from the DCA fill.
   DCA off => SL after D% adverse from the first fill.
-  TP      => full close when mark touches the current EMA.
+  TP      => resting post-only limit at the current EMA (rewrite each 1m bar).
 """
 
 from __future__ import annotations
@@ -140,6 +140,19 @@ def should_tp(side: str, price: float, ema: float) -> bool:
     if side == "long":
         return price >= ema
     return price <= ema
+
+
+def tp_through_pct(side: str, price: float, ema: float) -> float:
+    """How far price has gone through EMA in the TP direction (percent)."""
+    if ema <= 0 or price <= 0:
+        return 0.0
+    if side == "long":
+        if price < ema:
+            return 0.0
+        return (price - ema) / ema * 100.0
+    if price > ema:
+        return 0.0
+    return (ema - price) / ema * 100.0
 
 
 def sl_price(side: str, from_px: float, d_pct: float) -> float:

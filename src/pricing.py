@@ -116,3 +116,16 @@ def mid_post_only_price(
         px = max(px, min_px)
         px = min(px, best_ask + passive_nudge * tick)
     return round_price(px, sz_decimals)
+
+
+def limit_would_take(l2: dict, is_buy: bool, px: float) -> bool:
+    """True if a limit at px would cross the spread (taker)."""
+    bids = l2["levels"][0]
+    asks = l2["levels"][1]
+    if not bids or not asks:
+        return True
+    best_bid = float(bids[0]["px"])
+    best_ask = float(asks[0]["px"])
+    if is_buy:
+        return px + 1e-12 >= best_ask
+    return px - 1e-12 <= best_bid
