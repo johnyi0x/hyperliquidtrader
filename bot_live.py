@@ -300,10 +300,6 @@ def main() -> None:
             raise ValueError("EMA_DEV_ENTRY_PCT must be in (0, 99]")
         if total_pct <= 0 or total_pct > 99:
             raise ValueError("EMA_DEV_TOTAL_PCT must be in (0, 99]")
-        if bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False)) and total_pct <= entry_pct:
-            raise ValueError(
-                "EMA_DEV_TOTAL_PCT must be > EMA_DEV_ENTRY_PCT when EMA_DEV_ALLOW_DCA is on"
-            )
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
     if pair_mode != "manual" and not is_auto_pair_mode(pair_mode):
         raise ValueError(
@@ -683,14 +679,14 @@ def main() -> None:
             dca_on=bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False)),
         )
         logger.info(
-            "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% equity "
-            "dca=%s add=%.1f%% (cap Y=%.1f%%) | one pair at a time",
+            "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% of equity now "
+            "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
+            "one pair | refresh pair list after every close",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
             int(getattr(cfg, "EMA_DEV_PERIOD", 200) or 200),
             entry_pct,
             "on" if dca_pct > 0 else "off",
             dca_pct,
-            min(99.0, float(getattr(cfg, "EMA_DEV_TOTAL_PCT", 0) or 0)),
         )
         if flip_live:
             logger.warning(
@@ -1311,20 +1307,35 @@ def main() -> None:
                 if dca_pct <= 0:
                     return flatten_ema(entry, "sl_dca_size_zero")
                 activate_pair_for_trade(client, entry)
-                est = client.estimate_order_size(
-                    dca_pct,
-                    entry.leverage,
+                size_kw = dict(
+                    leverage=entry.leverage,
                     sz_decimals=entry.market.sz_decimals,
                     min_notional_usd=cfg.MIN_ORDER_NOTIONAL_USD,
-                    margin_from="equity",
+                )
+                est = client.estimate_order_size(
+                    dca_pct, margin_from="equity", **size_kw
                 )
                 if not est.ok:
+                    # Losing trades shrink equity AND free margin. Still add with
+                    # whatever collateral is left instead of flattening.
                     logger.warning(
-                        "EMA-dev DCA skipped %s — %s (SL instead)",
+                        "EMA-dev DCA %s %.1f%% of current equity won't fit (%s) "
+                        "— sizing add to remaining free margin",
+                        entry.api_coin,
+                        dca_pct,
+                        est.reason,
+                    )
+                    est = client.estimate_order_size(
+                        95.0, margin_from="available", **size_kw
+                    )
+                if not est.ok:
+                    logger.warning(
+                        "EMA-dev DCA %s still cannot add (%s) — keeping first "
+                        "fill, retry next poll (not SL)",
                         entry.api_coin,
                         est.reason,
                     )
-                    return flatten_ema(entry, "sl_dca_failed")
+                    return False
                 guess = ema_dev_protect_pcts(
                     EmaDevTrade(
                         coin=trade.coin,
@@ -1342,17 +1353,21 @@ def main() -> None:
                 )
                 tp_g, sl_g = guess if guess else (max(0.05, trade.dev_pct), trade.dev_pct)
                 logger.info(
-                    "EMA-dev DCA %s +%.2f%% equity size=%s (D=%.2f%% against entry)",
+                    "EMA-dev DCA %s size=%s (%.1f%% of equity now, D=%.2f%% against entry)",
                     entry.api_coin,
-                    dca_pct,
                     est.size,
+                    dca_pct,
                     trade.dev_pct,
                 )
                 old_avg = avg
                 old_sz = float(getattr(position, "size", 0) or 0)
                 new_pos = executor.execute_dca_add(est.size, tp_g, sl_g)
                 if new_pos is None:
-                    return flatten_ema(entry, "sl_dca_failed")
+                    logger.warning(
+                        "EMA-dev DCA %s add order failed — keeping first fill, retry next poll",
+                        entry.api_coin,
+                    )
+                    return False
                 new_avg = float(new_pos.entry_price or mark)
                 new_sz = float(new_pos.size)
                 added = new_sz - old_sz
@@ -1599,11 +1614,10 @@ def main() -> None:
         )
         return True
 
-    def maybe_refresh_ema_universe() -> None:
-        hours = float(getattr(cfg, "BACKTEST_REFRESH_HOURS", 24) or 24)
-        if time.time() - universe_built_at < hours * 3600.0:
+    def maybe_refresh_ema_universe(*, after_close: bool) -> None:
+        if not after_close:
             return
-        logger.info("EMA-dev refreshing pair universe (every %.0fh)", hours)
+        logger.info("EMA-dev refreshing pair list after close (then pick farthest from EMA)")
         refresh_universe_if_needed(force=True)
 
     while not stop.is_set():
@@ -1659,6 +1673,7 @@ def main() -> None:
                     drop_local(tracked.coin)
 
             if not occupied:
+                just_closed = bool(was_in_position)
                 if was_in_position or trade_store.trades:
                     cleanup_when_flat(
                         client, trade_store, extra_coins=cleanup_coins
@@ -1668,7 +1683,7 @@ def main() -> None:
                     protected_coins.clear()
                     was_in_position = False
                 if ema_dev_on:
-                    maybe_refresh_ema_universe()
+                    maybe_refresh_ema_universe(after_close=just_closed)
                 else:
                     maybe_tune(force=not store.setups())
             else:

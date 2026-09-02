@@ -196,17 +196,17 @@ def protect_pcts(
 
 def fill_pcts(
     entry_pct: float,
-    total_pct: float,
+    dca_equity_pct: float,
     *,
     dca_on: bool,
     cap: float = 99.0,
 ) -> tuple[float, float]:
-    """(entry_pct, dca_pct) of equity. DCA leg is Y−X when DCA is on."""
+    """(entry_pct, dca_pct) of equity at that moment (entry now, DCA later)."""
     x = min(cap, max(0.1, float(entry_pct)))
-    y = min(cap, max(x, float(total_pct)))
+    y = min(cap, max(0.1, float(dca_equity_pct)))
     if not dca_on:
         return x, 0.0
-    return x, max(0.0, y - x)
+    return x, y
 
 
 class EmaDevStore:

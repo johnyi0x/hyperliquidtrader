@@ -21,7 +21,11 @@ USE_EMA_DEV_STRATEGY = True
 #   DCA on  => add once after D% against from the first fill, then SL after
 #             another D% against from the DCA fill.
 #   DCA off => SL after D% against from the first fill.
-# X=50 Y=98 => first fill 50% of equity, DCA the other 48% (98% total).
+# X = first fill as % of equity at entry time.
+# Y = DCA add as % of equity at DCA time (current balance, including after a loss).
+# Example 50 / 98: enter 50% of equity then; add 98% of equity when DCA fires.
+# Example 25 / 50: enter 25% now, add 50% of whatever equity is left at DCA.
+# If Y% of current equity does not fit in free margin, add with remaining free.
 # EMA_DEV_ALLOW_DCA is independent of ALLOW_DCA (that one is MTF only).
 EMA_DEV_INTERVAL = "1m"
 EMA_DEV_PERIOD = 200
@@ -201,7 +205,7 @@ STOP_LOSS_PCT = 1.0
 # True = add one extra same-size fill when price moves against the position.
 # Pair budget (TOTAL_BALANCE_PCT / BALANCE_SPLIT_POSITIONS) is split equally
 # across entry + DCA_MAX_ADDS extra fills. 1 extra add = two equal legs.
-ALLOW_DCA = False
+ALLOW_DCA = True
 DCA_MAX_ADDS = 1
 
 
