@@ -33,6 +33,11 @@ EMA_DEV_MIN_DEV_PCT = 0.0
 EMA_DEV_ENTRY_PCT = 50.0
 EMA_DEV_TOTAL_PCT = 50.0
 EMA_DEV_ALLOW_DCA = False
+# True = entry and TP close try post-only limit at mid (3 times, 10s each),
+# then market the rest. SL stays a market trigger. False = market in/out.
+EMA_DEV_LIMIT_ORDERS = True
+EMA_DEV_LIMIT_WAIT_SECONDS = 10.0
+EMA_DEV_LIMIT_ATTEMPTS = 3
 
 
 def ema_dev_strategy_enabled() -> bool:

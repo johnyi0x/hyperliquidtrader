@@ -433,9 +433,24 @@ class PaperHyperliquidClient(HyperliquidClient):
             if self.coin in self.positions:
                 self._close_position(float(limit_px), "manual_close", coin=self.coin)
             return self._fill_result(sz, limit_px)
-        if self.coin in self.positions:
-            return {"status": "err", "response": "position exists"}
         side = "long" if is_buy else "short"
+        existing = self.positions.get(self.coin)
+        if existing is not None:
+            if existing["side"] != side:
+                return {"status": "err", "response": "opposite position exists"}
+            old_sz = float(existing["size"])
+            old_px = float(existing["entry_px"])
+            entry_fee = float(limit_px) * sz * self._fee_frac
+            self.balance -= entry_fee
+            new_sz = old_sz + float(sz)
+            avg_px = (old_px * old_sz + float(limit_px) * float(sz)) / new_sz
+            existing["size"] = new_sz
+            existing["entry_px"] = float(avg_px)
+            existing["entry_fee"] = float(existing.get("entry_fee", 0.0)) + float(entry_fee)
+            existing["tp_px"] = None
+            existing["sl_px"] = None
+            self._save_account()
+            return self._fill_result(sz, limit_px)
         entry_fee = float(limit_px) * sz * self._fee_frac
         self.balance -= entry_fee
         self.positions[self.coin] = {
@@ -517,4 +532,7 @@ class PaperHyperliquidClient(HyperliquidClient):
         return
 
     def cancel_entry_orders_for_coin(self) -> None:
+        return
+
+    def cancel_tp_triggers_for_coin(self) -> None:
         return

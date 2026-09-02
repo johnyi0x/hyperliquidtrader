@@ -7,7 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from .pricing import maker_limit_price, round_size
+from .pricing import maker_limit_price, mid_post_only_price, round_size
 
 if TYPE_CHECKING:
     from .exchange_client import HyperliquidClient, Position
@@ -26,6 +26,9 @@ class OrderExecutor:
         *,
         use_market_orders: bool = False,
         market_slippage: float = 0.05,
+        mid_limit_then_market: bool = False,
+        mid_limit_wait_seconds: float = 10.0,
+        mid_limit_attempts: int = 3,
     ) -> None:
         self.client = client
         self.wait_seconds = wait_seconds
@@ -33,6 +36,9 @@ class OrderExecutor:
         self.logger = logger
         self.use_market_orders = use_market_orders
         self.market_slippage = market_slippage
+        self.mid_limit_then_market = bool(mid_limit_then_market)
+        self.mid_limit_wait_seconds = max(1.0, float(mid_limit_wait_seconds))
+        self.mid_limit_attempts = max(1, int(mid_limit_attempts))
         self._lock = threading.Lock()
 
     @property
@@ -93,7 +99,13 @@ class OrderExecutor:
         3) If TP/SL cannot be verified, flatten — never leave naked leverage.
         """
         with self._lock:
-            if self.use_market_orders:
+            if self.mid_limit_then_market:
+                filled = self._fill_mid_limit_then_market(
+                    is_buy=is_buy,
+                    target_sz=target_sz,
+                    reduce_only=False,
+                )
+            elif self.use_market_orders:
                 filled = self._market_open_unlocked(is_buy, target_sz)
             else:
                 filled = self._fill_with_limits(
@@ -142,10 +154,11 @@ class OrderExecutor:
     ) -> "Position | None":
         """
         Add to the open position (AI-mode DCA), then re-center exchange TP/SL
-        on the new average entry for the full size. Market order regardless of
-        entry mode (a DCA trigger is time-sensitive). Returns the updated
-        position, or None when the add failed / was skipped. Never leaves the
-        position without both TP and SL (emergency flatten on attach failure).
+        on the new average entry for the full size. Uses mid post-only then
+        market when mid_limit_then_market is on; otherwise a market add.
+        Returns the updated position, or None when the add failed / was skipped.
+        Never leaves the position without both TP and SL (emergency flatten on
+        attach failure).
         """
         with self._lock:
             pos = self.client.get_position(force=True)
@@ -155,28 +168,48 @@ class OrderExecutor:
             if add_sz <= 0:
                 return None
             is_buy = pos.side == "long"
-            self.logger.info(
-                "DCA add: market %s +%s onto %s size=%s",
-                "BUY" if is_buy else "SELL",
-                add_sz,
-                pos.side,
-                pos.size,
-            )
-            try:
-                result = self.client.place_market_open(
-                    is_buy,
+            start_sz = pos.size
+            if self.mid_limit_then_market:
+                self.logger.info(
+                    "DCA add: mid-limit then market %s +%s onto %s size=%s",
+                    "BUY" if is_buy else "SELL",
                     add_sz,
-                    slippage=self.market_slippage,
+                    pos.side,
+                    pos.size,
                 )
-            except Exception as exc:
-                self.logger.error("DCA add failed: %s", exc)
-                return None
-            filled = self._parse_market_fill_sz(result)
-            if filled is None or filled <= 0:
-                self.logger.warning("DCA add returned no fill: %s", result)
-                return None
-            time.sleep(0.5)
-            self.client.invalidate_user_state()
+                added_ok = self._fill_mid_limit_then_market(
+                    is_buy=is_buy,
+                    target_sz=add_sz,
+                    reduce_only=False,
+                )
+                if not added_ok:
+                    self.client.cancel_entry_orders_for_coin()
+                    pos_after = self.client.get_position(force=True)
+                    if pos_after is None or pos_after.size <= start_sz:
+                        return None
+            else:
+                self.logger.info(
+                    "DCA add: market %s +%s onto %s size=%s",
+                    "BUY" if is_buy else "SELL",
+                    add_sz,
+                    pos.side,
+                    pos.size,
+                )
+                try:
+                    result = self.client.place_market_open(
+                        is_buy,
+                        add_sz,
+                        slippage=self.market_slippage,
+                    )
+                except Exception as exc:
+                    self.logger.error("DCA add failed: %s", exc)
+                    return None
+                filled = self._parse_market_fill_sz(result)
+                if filled is None or filled <= 0:
+                    self.logger.warning("DCA add returned no fill: %s", result)
+                    return None
+                time.sleep(0.5)
+                self.client.invalidate_user_state()
             pos = self.client.get_position(force=True)
             if pos is None:
                 self.client.cancel_all_orders_for_coin()
@@ -223,6 +256,48 @@ class OrderExecutor:
                 self.client.sz_decimals,
             )
             return self._execute_close_unlocked(is_buy, pos.size)
+
+    def execute_mid_limit_close(self) -> bool:
+        """
+        TP close: cancel leftover limits and the exchange TP trigger, keep SL,
+        try post-only at mid (3 waits), then market the rest. Always cancels
+        leftover limits at the end.
+        """
+        with self._lock:
+            self.client.cancel_entry_orders_for_coin()
+            self.client.cancel_tp_triggers_for_coin()
+            self.client.invalidate_user_state()
+            pos = self.client.get_position(force=True)
+            if pos is None:
+                self.client.cancel_all_orders_for_coin()
+                return True
+            is_buy = pos.side == "short"
+            self.logger.info(
+                "Mid-limit TP close %s size=%s (SL stays until flat)",
+                pos.side,
+                pos.size,
+            )
+            self._fill_mid_limit_then_market(
+                is_buy=is_buy,
+                target_sz=pos.size,
+                reduce_only=True,
+            )
+            self.client.cancel_entry_orders_for_coin()
+            if self._position_flat():
+                self.client.cancel_all_orders_for_coin()
+                return True
+            current = self.client.get_position(force=True)
+            if current is not None:
+                self.logger.warning(
+                    "Mid-limit TP close leftover size=%s — market flattening",
+                    current.size,
+                )
+                try:
+                    self.client.place_market_close(sz=current.size)
+                except Exception as exc:
+                    self.logger.error("Market close after mid-limit TP failed: %s", exc)
+            self.client.cancel_all_orders_for_coin()
+            return self._position_flat()
 
     def _execute_close_unlocked(self, is_buy: bool, target_sz: float) -> bool:
         self.client.cancel_all_orders_for_coin()
@@ -334,6 +409,74 @@ class OrderExecutor:
         self.logger.warning("Could not place resting ALO after %s reprices", MAX_ALO_PLACE_RETRIES)
         return 0.0, None
 
+    def _cancel_oid(self, oid: int | None) -> None:
+        if oid is None:
+            return
+        try:
+            self.client.exchange.cancel(self.client.coin, oid)
+            self.logger.info("Cancelled limit oid=%s", oid)
+        except Exception as exc:
+            self.logger.debug("Cancel oid=%s: %s", oid, exc)
+        self.client.invalidate_user_state()
+
+    def _place_resting_mid_order(
+        self,
+        is_buy: bool,
+        sz: float,
+        reduce_only: bool,
+    ) -> tuple[float, int | None]:
+        """Post-only (ALO) at mid, clamped so it cannot take. Inner ALO retries."""
+        if hasattr(self.client, "_l2_cache"):
+            self.client._l2_cache = None
+        passive_nudge = 0
+        for inner in range(1, MAX_ALO_PLACE_RETRIES + 1):
+            try:
+                l2 = self.client.l2_book()
+                px = mid_post_only_price(
+                    l2,
+                    is_buy,
+                    self.client.sz_decimals,
+                    passive_nudge=passive_nudge,
+                )
+            except Exception as exc:
+                self.logger.error("Mid price error: %s", exc)
+                time.sleep(0.5)
+                continue
+
+            try:
+                result = self.client.place_limit(
+                    is_buy, sz, px, reduce_only=reduce_only
+                )
+            except Exception as exc:
+                self.logger.error("Mid ALO placement failed: %s", exc)
+                time.sleep(0.5)
+                continue
+
+            filled, oid, alo_rejected = self.client.parse_fill_from_result(result)
+
+            if alo_rejected:
+                passive_nudge += 1
+                self.logger.info(
+                    "Mid ALO rejected (would take) — more passive px=%s inner=%s",
+                    px,
+                    inner,
+                )
+                time.sleep(0.4)
+                continue
+
+            if filled > 0:
+                self.logger.info("Mid ALO filled immediately sz=%s px=%s", filled, px)
+                return filled, None
+
+            if oid is not None:
+                self.logger.info("Mid ALO resting oid=%s px=%s sz=%s", oid, px, sz)
+                return 0.0, oid
+
+        self.logger.warning(
+            "Could not place mid ALO after %s reprices", MAX_ALO_PLACE_RETRIES
+        )
+        return 0.0, None
+
     @staticmethod
     def _position_filled_toward(
         start: Position | None,
@@ -432,6 +575,124 @@ class OrderExecutor:
             reduce_only,
             self.client.sz_decimals,
         )
+        return target_sz - filled_so_far <= eps
+
+    def _market_remainder(
+        self,
+        is_buy: bool,
+        remaining: float,
+        reduce_only: bool,
+    ) -> None:
+        remaining = round_size(remaining, self.client.sz_decimals)
+        eps = 10 ** (-self.client.sz_decimals)
+        if remaining <= eps:
+            return
+        self.logger.info(
+            "Mid-limit leftover — market %s size=%s",
+            "close" if reduce_only else ("BUY" if is_buy else "SELL"),
+            remaining,
+        )
+        try:
+            if reduce_only:
+                result = self.client.place_market_close(sz=remaining)
+            else:
+                result = self.client.place_market_open(
+                    is_buy,
+                    remaining,
+                    slippage=self.market_slippage,
+                )
+            self.logger.info("Market remainder result: %s", result)
+        except Exception as exc:
+            self.logger.error("Market remainder failed: %s", exc)
+        time.sleep(0.5)
+        self.client.invalidate_user_state()
+
+    def _fill_mid_limit_then_market(
+        self,
+        is_buy: bool,
+        target_sz: float,
+        reduce_only: bool,
+    ) -> bool:
+        """
+        Up to mid_limit_attempts post-only limits at refreshed mid, waiting
+        mid_limit_wait_seconds each time. Cancels the resting oid before the
+        next reprice. Unfilled size is sent as a market order.
+        """
+        start_pos = self.client.get_position(force=True)
+        eps = 10 ** (-self.client.sz_decimals)
+        target_sz = round_size(target_sz, self.client.sz_decimals)
+        if target_sz <= eps:
+            return True
+
+        for attempt in range(self.mid_limit_attempts):
+            current = self.client.get_position(force=True)
+            filled_so_far = self._position_filled_toward(
+                start_pos,
+                current,
+                is_buy,
+                target_sz,
+                reduce_only,
+                self.client.sz_decimals,
+            )
+            remaining = round_size(target_sz - filled_so_far, self.client.sz_decimals)
+            if remaining <= eps:
+                self.client.cancel_entry_orders_for_coin()
+                return True
+
+            self.client.cancel_entry_orders_for_coin()
+            self.logger.info(
+                "Mid post-only %s attempt %s/%s remaining=%.8f wait=%.0fs",
+                "BUY" if is_buy else "SELL",
+                attempt + 1,
+                self.mid_limit_attempts,
+                remaining,
+                self.mid_limit_wait_seconds,
+            )
+            filled_now, oid = self._place_resting_mid_order(
+                is_buy, remaining, reduce_only
+            )
+            if oid is not None:
+                time.sleep(self.mid_limit_wait_seconds)
+                self._cancel_oid(oid)
+            elif filled_now <= 0:
+                time.sleep(min(1.0, self.mid_limit_wait_seconds))
+
+            current = self.client.get_position(force=True)
+            filled_so_far = self._position_filled_toward(
+                start_pos,
+                current,
+                is_buy,
+                target_sz,
+                reduce_only,
+                self.client.sz_decimals,
+            )
+            if target_sz - filled_so_far <= eps:
+                self.client.cancel_entry_orders_for_coin()
+                return True
+
+        self.client.cancel_entry_orders_for_coin()
+        current = self.client.get_position(force=True)
+        filled_so_far = self._position_filled_toward(
+            start_pos,
+            current,
+            is_buy,
+            target_sz,
+            reduce_only,
+            self.client.sz_decimals,
+        )
+        remaining = round_size(target_sz - filled_so_far, self.client.sz_decimals)
+        if remaining > eps:
+            self._market_remainder(is_buy, remaining, reduce_only)
+            current = self.client.get_position(force=True)
+            filled_so_far = self._position_filled_toward(
+                start_pos,
+                current,
+                is_buy,
+                target_sz,
+                reduce_only,
+                self.client.sz_decimals,
+            )
+        self.client.cancel_entry_orders_for_coin()
         return target_sz - filled_so_far <= eps
 
     @staticmethod

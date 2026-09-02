@@ -430,6 +430,12 @@ def main() -> None:
         logger=logger,
         use_market_orders=cfg.USE_MARKET_ORDERS,
         market_slippage=cfg.MARKET_ORDER_SLIPPAGE,
+        mid_limit_then_market=ema_dev_on
+        and bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)),
+        mid_limit_wait_seconds=float(
+            getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0
+        ),
+        mid_limit_attempts=int(getattr(cfg, "EMA_DEV_LIMIT_ATTEMPTS", 3) or 3),
     )
 
     def refresh_universe_if_needed(*, force: bool = False) -> None:
@@ -681,12 +687,16 @@ def main() -> None:
         logger.info(
             "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% of equity now "
             "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
-            "one pair | refresh pair list after every close",
+            "one pair | refresh pair list after every close | limit_orders=%s "
+            "(%sx mid post-only, %.0fs each, then market)",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
             int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100),
             entry_pct,
             "on" if dca_pct > 0 else "off",
             dca_pct,
+            "on" if bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)) else "off",
+            int(getattr(cfg, "EMA_DEV_LIMIT_ATTEMPTS", 3) or 3),
+            float(getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0),
         )
         if flip_live:
             logger.warning(
@@ -1179,7 +1189,13 @@ def main() -> None:
     def flatten_ema(entry: PairSetup, reason: str) -> bool:
         activate_pair_for_trade(client, entry)
         logger.info("EMA-dev close %s (%s)", entry.api_coin, reason)
-        if not executor.execute_rsi_exit():
+        limit_tp = executor.mid_limit_then_market and str(reason).startswith("tp_ema")
+        closed = (
+            executor.execute_mid_limit_close()
+            if limit_tp
+            else executor.execute_rsi_exit()
+        )
+        if not closed:
             executor.emergency_flatten(reason)
         bar_t = 0
         candles = client.get_closed_candles_for(

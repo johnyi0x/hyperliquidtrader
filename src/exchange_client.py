@@ -1000,6 +1000,26 @@ class HyperliquidClient:
             except Exception as exc:
                 self.logger.warning("Cancel failed oid=%s: %s", oid, exc)
 
+    def cancel_tp_triggers_for_coin(self) -> None:
+        """Cancel take-profit triggers only (leave stop-loss in place)."""
+        self.invalidate_user_state()
+        for order in self._reduce_only_triggers():
+            label = self._order_type_label(order)
+            tpsl = str(order.get("tpsl") or "").lower()
+            is_sl = tpsl == "sl" or ("stop" in label and "take profit" not in label)
+            is_tp = tpsl == "tp" or "take profit" in label
+            if is_sl or not is_tp:
+                continue
+            oid = order.get("oid")
+            if oid is None:
+                continue
+            try:
+                self.exchange.cancel(self.coin, oid)
+                self.invalidate_user_state()
+                self.logger.info("Cancelled TP trigger oid=%s", oid)
+            except Exception as exc:
+                self.logger.warning("Cancel TP failed oid=%s: %s", oid, exc)
+
     def tp_sl_prices_for_entry(
         self,
         side: str,
