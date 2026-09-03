@@ -92,11 +92,11 @@ class OrderExecutor:
         target_sz: float,
         take_profit_pct: float,
         stop_loss_pct: float,
+        attach_protect: bool = True,
     ) -> bool:
         """
-        1) ALO entry only until full size filled (partials keep accumulating, no TP/SL yet).
-        2) positionTpsl on full position from exchange entryPx.
-        3) If TP/SL cannot be verified, flatten — never leave naked leverage.
+        Fill entry, then attach TP/SL unless attach_protect is False
+        (EMA-dev momentum: no exchange TP/SL, software exit at EMA).
         """
         with self._lock:
             if self.mid_limit_then_market:
@@ -133,6 +133,11 @@ class OrderExecutor:
                 )
                 self._emergency_flatten_unlocked("size_mismatch")
                 return False
+
+            if not attach_protect:
+                self.client.cancel_all_orders_for_coin()
+                self.logger.info("Entry filled with no TP/SL (momentum exit at EMA)")
+                return True
 
             if self.mid_limit_then_market:
                 return self._protect_or_flatten_maker(

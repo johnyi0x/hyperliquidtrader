@@ -1,12 +1,11 @@
 """
-Mean-revert to 1m EMA: pick the watch-list coin farthest from EMA,
-go long below / short above, one pair at a time. No backtest / tune.
+Pick the watch-list coin farthest from EMA. No backtest / tune.
 
 D = abs(close - EMA) / EMA at entry (percent).
-  DCA on  => add once after D% adverse from the first fill, then SL after
-            another D% adverse from the DCA fill.
-  DCA off => SL after D% adverse from the first fill.
-  TP      => resting post-only limit at the current EMA (rewrite each 1m bar).
+Mean-revert (REVERSE off): below EMA => LONG, above => SHORT.
+  TP at EMA. SL D% further against. Optional DCA at D% against.
+Momentum (REVERSE on): below EMA => SHORT, above => LONG.
+  No TP/SL. Close when price returns to EMA. DCA off.
 """
 
 from __future__ import annotations
@@ -162,6 +161,36 @@ def sl_price(side: str, from_px: float, d_pct: float) -> float:
     return from_px * (1.0 + m)
 
 
+def tp_price_from_dev(side: str, from_px: float, d_pct: float) -> float:
+    """Favorable target: D% beyond the fill (momentum TP)."""
+    m = max(0.0, d_pct) / 100.0
+    if side == "long":
+        return from_px * (1.0 + m)
+    return from_px * (1.0 - m)
+
+
+def should_sl_ema(side: str, price: float, ema: float) -> bool:
+    """Momentum SL: mark has come back through EMA."""
+    if ema <= 0 or price <= 0:
+        return False
+    if side == "long":
+        return price <= ema
+    return price >= ema
+
+
+def sl_pct_to_ema(side: str, avg_entry: float, ema: float) -> float | None:
+    """None when already through EMA (caller should flatten)."""
+    if avg_entry <= 0 or ema <= 0:
+        return None
+    if side == "long":
+        if ema >= avg_entry:
+            return None
+        return max(0.05, (avg_entry - ema) / avg_entry * 100.0)
+    if ema <= avg_entry:
+        return None
+    return max(0.05, (ema - avg_entry) / avg_entry * 100.0)
+
+
 def pct_from_avg_to_price(side: str, avg_entry: float, target: float) -> float:
     """Spot-% from average entry to a target price (for exchange TP/SL)."""
     if avg_entry <= 0 or target <= 0:
@@ -190,15 +219,22 @@ def protect_pcts(
     ema: float,
     *,
     dca_on: bool,
+    reverse: bool = False,
 ) -> tuple[float, float] | None:
     """
-    (tp_pct, sl_pct) from average entry for exchange triggers.
-    None → already at/through EMA, flatten instead of attaching.
+    (tp_pct, sl_pct) from average entry for exchange TP/SL.
+    None → already through EMA (mean-rev TP or momentum SL).
+    reverse: TP = D% in favor, SL = back to EMA.
     """
+    d = max(0.0, float(trade.dev_pct))
+    if reverse:
+        sl = sl_pct_to_ema(trade.side, avg_entry, ema)
+        if sl is None:
+            return None
+        return max(0.05, d), sl
     tp = tp_pct_to_ema(trade.side, avg_entry, ema)
     if tp is None:
         return None
-    d = max(0.0, float(trade.dev_pct))
     if dca_on and not trade.dca_done:
         sl_px = sl_price(trade.side, trade.entry_px, 2.0 * d)
     else:

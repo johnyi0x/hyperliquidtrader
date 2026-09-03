@@ -39,7 +39,9 @@ from src.ema_dev import (
     protect_pcts as ema_dev_protect_pcts,
     signed_dev_pct,
     snap_from_candles,
+    should_sl_ema as ema_dev_should_sl_ema,
     should_tp as ema_dev_should_tp,
+    tp_price_from_dev as ema_dev_tp_price_from_dev,
     tp_through_pct as ema_dev_tp_through_pct,
 )
 from src.engine import (
@@ -683,26 +685,29 @@ def main() -> None:
         entry_pct, dca_pct = ema_dev_fill_pcts(
             float(cfg.EMA_DEV_ENTRY_PCT),
             float(cfg.EMA_DEV_TOTAL_PCT),
-            dca_on=bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False)),
+            dca_on=bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False)) and not flip_live,
         )
         logger.info(
             "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% of equity now "
             "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
-            "one pair | refresh pair list after every close | limit_orders=%s "
+            "one pair | refresh pair list after every close | reverse=%s | limit_orders=%s "
             "(%sx mid post-only entry, parked TP limit, %.0fs wait, then market leftover)",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
             int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100),
             entry_pct,
             "on" if dca_pct > 0 else "off",
             dca_pct,
+            "on (momentum: long above / short below, no TP/SL, close at EMA)"
+            if flip_live
+            else "off (mean-revert)",
             "on" if bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)) else "off",
             int(getattr(cfg, "EMA_DEV_LIMIT_ATTEMPTS", 3) or 3),
             float(getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0),
         )
         if flip_live:
-            logger.warning(
-                "REVERSE_STRATEGY is on but EMA-dev ignores it — "
-                "TP at EMA only works as mean-reversion (long below / short above)"
+            logger.info(
+                "REVERSE_STRATEGY on for EMA-dev — momentum, no TP/SL, "
+                "close when price hits EMA. DCA is off while reversed."
             )
     if is_volume_mode(pair_mode):
         logger.info(
@@ -1175,7 +1180,12 @@ def main() -> None:
         return max(40, _ema_period() + 30)
 
     def _ema_dca_on() -> bool:
+        if flip_live:
+            return False
         return bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False))
+
+    def _ema_protect_kw() -> dict:
+        return {"dca_on": _ema_dca_on(), "reverse": flip_live}
 
     def force_attach_tpsl(tp_pct: float, sl_pct: float) -> str:
         if executor.mid_limit_then_market:
@@ -1191,31 +1201,39 @@ def main() -> None:
         return "ok" if ok else "failed"
 
     def ema_is_protected() -> bool:
+        if flip_live:
+            return True
         if executor.mid_limit_then_market:
             return bool(client.has_ema_maker_protect())
         return bool(client.has_exchange_tpsl())
 
-    def should_chase_maker_tp(side: str, mark: float, ema: float) -> bool:
-        if ema <= 0 or not ema_dev_should_tp(side, mark, ema):
+    def should_chase_maker_tp(side: str, mark: float, target_px: float) -> bool:
+        if target_px <= 0 or not ema_dev_should_tp(side, mark, target_px):
             return False
         if not executor.mid_limit_then_market:
             return True
-        through = ema_dev_tp_through_pct(side, mark, ema)
+        through = ema_dev_tp_through_pct(side, mark, target_px)
         resting = client.resting_tp_px()
         resting_ok = (
-            resting is not None and abs(float(resting) - ema) / ema * 100.0 < 0.2
+            resting is not None
+            and abs(float(resting) - target_px) / target_px * 100.0 < 0.2
         )
-        # Resting maker TP is the fill. Chase only if it's missing/stale or
-        # mark gapped well through EMA without trading our limit.
         return (not resting_ok) or through >= 0.25
+
+    def ema_tp_target(trade: EmaDevTrade, avg: float, ema: float) -> float:
+        if flip_live:
+            return ema_dev_tp_price_from_dev(trade.side, avg, trade.dev_pct)
+        return ema
 
     def flatten_ema(entry: PairSetup, reason: str) -> bool:
         activate_pair_for_trade(client, entry)
         logger.info("EMA-dev close %s (%s)", entry.api_coin, reason)
-        limit_tp = executor.mid_limit_then_market and str(reason).startswith("tp_ema")
+        limit_close = executor.mid_limit_then_market and (
+            str(reason).startswith("tp_") or str(reason).startswith("exit_ema")
+        )
         closed = (
             executor.execute_mid_limit_close()
-            if limit_tp
+            if limit_close
             else executor.execute_rsi_exit()
         )
         if not closed:
@@ -1270,24 +1288,27 @@ def main() -> None:
 
     def refresh_protect(entry: PairSetup, trade: EmaDevTrade, avg_entry: float, ema: float) -> bool:
         pcts = ema_dev_protect_pcts(
-            trade, avg_entry, ema, dca_on=_ema_dca_on()
+            trade, avg_entry, ema, **_ema_protect_kw()
         )
         if pcts is None:
+            if flip_live:
+                return flatten_ema(entry, "stop_loss through_ema")
             return flatten_ema(entry, "tp_ema")
         tp_pct, sl_pct = pcts
         tracked = trade_store.get(entry.api_coin)
         if executor.mid_limit_then_market:
             resting = client.resting_tp_px()
-            ema_ok = (
+            target = ema_tp_target(trade, avg_entry, ema)
+            tp_ok = (
                 resting is not None
-                and ema > 0
-                and abs(float(resting) - ema) / ema * 100.0 < 0.12
+                and target > 0
+                and abs(float(resting) - target) / target * 100.0 < 0.12
             )
             same = (
                 tracked is not None
                 and abs(tracked.stop_loss_pct - sl_pct) < 0.08
                 and client.has_exchange_sl()
-                and ema_ok
+                and tp_ok
             )
         else:
             same = (
@@ -1300,7 +1321,9 @@ def main() -> None:
             return False
         status = force_attach_tpsl(tp_pct, sl_pct)
         if status == "would_take" or status == "flat":
-            return flatten_ema(entry, "tp_ema")
+            if flip_live and status == "flat":
+                return flatten_ema(entry, "stop_loss through_ema")
+            return flatten_ema(entry, "tp_ext" if flip_live else "tp_ema")
         if status != "ok":
             return flatten_ema(entry, "tpsl_attach_failed")
         pos = client.get_position(force=True)
@@ -1340,10 +1363,24 @@ def main() -> None:
         ema = float(snap.ema) if snap else float(trade.entry_ema or 0)
         bar_t = int(snap.bar_t) if snap else int(trade.opened_bar_t)
         avg = float(getattr(position, "entry_price", 0) or 0) or mark
-        if ema > 0 and should_chase_maker_tp(trade.side, mark, ema):
+        if flip_live:
+            if (
+                client.has_exchange_sl()
+                or client.has_resting_tp_limit()
+                or client.has_exchange_tpsl()
+            ):
+                client.cancel_all_orders_for_coin()
+            if ema > 0 and ema_dev_should_sl_ema(trade.side, mark, ema):
+                return flatten_ema(
+                    entry,
+                    f"exit_ema ema={ema:.6g} mark={mark:.6g}",
+                )
+            return False
+        tp_target = ema_tp_target(trade, avg, ema)
+        if tp_target > 0 and should_chase_maker_tp(trade.side, mark, tp_target):
             return flatten_ema(
                 entry,
-                f"tp_ema ema={ema:.6g} mark={mark:.6g}",
+                f"tp_ema target={tp_target:.6g} mark={mark:.6g}",
             )
         dca_on = _ema_dca_on()
         if dca_on and not trade.dca_done:
@@ -1405,7 +1442,7 @@ def main() -> None:
                     ),
                     avg,
                     ema,
-                    dca_on=True,
+                    **_ema_protect_kw(),
                 )
                 tp_g, sl_g = guess if guess else (max(0.05, trade.dev_pct), trade.dev_pct)
                 logger.info(
@@ -1435,18 +1472,21 @@ def main() -> None:
                 trade = ema_store.active() or trade
                 trade_store.record_dca_add(new_avg, new_sz, coin=entry.api_coin)
                 protected_coins.add(entry.api_coin)
-                if ema > 0 and should_chase_maker_tp(
-                    trade.side, client.get_mark_price(), ema
+                if should_chase_maker_tp(
+                    trade.side,
+                    client.get_mark_price(),
+                    ema_tp_target(trade, new_avg, ema),
                 ):
-                    return flatten_ema(entry, "tp_ema")
+                    return flatten_ema(entry, "tp_ext" if flip_live else "tp_ema")
                 return refresh_protect(entry, trade, new_avg, ema)
         else:
-            ref = trade.last_fill_px if (dca_on and trade.dca_done) else trade.entry_px
-            if adverse_pct(trade.side, ref, mark) + 1e-12 >= trade.dev_pct:
-                return flatten_ema(
-                    entry,
-                    f"stop_loss D={trade.dev_pct:.2f}% from {ref:.6g}",
-                )
+            if not flip_live:
+                ref = trade.last_fill_px if (dca_on and trade.dca_done) else trade.entry_px
+                if adverse_pct(trade.side, ref, mark) + 1e-12 >= trade.dev_pct:
+                    return flatten_ema(
+                        entry,
+                        f"stop_loss D={trade.dev_pct:.2f}% from {ref:.6g}",
+                    )
         if bar_t > 0 and last_manage_bar.get(entry.api_coin) != bar_t:
             last_manage_bar[entry.api_coin] = bar_t
             return refresh_protect(entry, trade, avg, ema)
@@ -1549,12 +1589,7 @@ def main() -> None:
         if entry is None:
             return False
         signal_side = int(winner.signal_side)
-        side = signal_side
-        if flip_live:
-            logger.info(
-                "EMA-dev ignores REVERSE — staying %s (mean-revert to EMA)",
-                "LONG" if side > 0 else "SHORT",
-            )
+        side = -signal_side if flip_live else signal_side
         entry_pct, dca_pct = ema_dev_fill_pcts(
             float(cfg.EMA_DEV_ENTRY_PCT),
             float(cfg.EMA_DEV_TOTAL_PCT),
@@ -1594,34 +1629,49 @@ def main() -> None:
             opened_bar_t=int(winner.bar_t),
         )
         pcts = ema_dev_protect_pcts(
-            draft, float(winner.close), float(winner.ema), dca_on=_ema_dca_on()
+            draft, float(winner.close), float(winner.ema), **_ema_protect_kw()
         )
         if pcts is None:
             logger.info("Skip %s — already at EMA", entry.api_coin)
             return False
-        tp_pct, sl_pct = pcts
-        logger.info(
-            "EMA-dev entry %s %s size=%s notional=$%.2f margin=%.2f%% equity "
-            "D=%.2f%% ema=%.6g close=%.6g tpsl=%.2f%%/%.2f%% [%s%s]",
-            entry.api_coin,
-            "LONG" if side > 0 else "SHORT",
-            est.size,
-            est.notional_usd,
-            entry_pct,
-            draft.dev_pct,
-            winner.ema,
-            winner.close,
-            tp_pct,
-            sl_pct,
-            mode,
-            "|REVERSE-ignored" if flip_live else "",
-        )
+        tp_pct, sl_pct = (0.0, 0.0) if flip_live else pcts
+        if flip_live:
+            logger.info(
+                "EMA-dev entry %s %s size=%s notional=$%.2f margin=%.2f%% equity "
+                "D=%.2f%% ema=%.6g close=%.6g no TP/SL (exit at EMA) [%s|REVERSE]",
+                entry.api_coin,
+                "LONG" if side > 0 else "SHORT",
+                est.size,
+                est.notional_usd,
+                entry_pct,
+                draft.dev_pct,
+                winner.ema,
+                winner.close,
+                mode,
+            )
+        else:
+            logger.info(
+                "EMA-dev entry %s %s size=%s notional=$%.2f margin=%.2f%% equity "
+                "D=%.2f%% ema=%.6g close=%.6g tpsl=%.2f%%/%.2f%% [%s]",
+                entry.api_coin,
+                "LONG" if side > 0 else "SHORT",
+                est.size,
+                est.notional_usd,
+                entry_pct,
+                draft.dev_pct,
+                winner.ema,
+                winner.close,
+                tp_pct,
+                sl_pct,
+                mode,
+            )
         try:
             ok = executor.execute_protected_entry(
                 is_buy=side > 0,
                 target_sz=est.size,
                 take_profit_pct=tp_pct,
                 stop_loss_pct=sl_pct,
+                attach_protect=not flip_live,
             )
         except RuntimeError as exc:
             if "insufficient margin" in str(exc).lower():
@@ -1635,7 +1685,9 @@ def main() -> None:
         if pos is None:
             cleanup_closed_coin(client, trade_store, entry.api_coin)
             return False
-        if executor.mid_limit_then_market:
+        if flip_live:
+            client.cancel_all_orders_for_coin()
+        elif executor.mid_limit_then_market:
             if not client.has_exchange_sl():
                 executor.emergency_flatten("unprotected")
                 cleanup_closed_coin(client, trade_store, entry.api_coin)
@@ -1663,9 +1715,22 @@ def main() -> None:
             equity_at_entry=client.get_account_value(force=True),
         )
         last_manage_bar[entry.api_coin] = int(winner.bar_t)
+        if flip_live:
+            protected_coins.add(entry.api_coin)
+            logger.info(
+                "Opened EMA-dev %s %s size=%s @ %s D=%.2f%% (no TP/SL, exit at EMA)",
+                client.coin,
+                pos.side,
+                pos.size,
+                fill,
+                draft.dev_pct,
+            )
+            if ema_dev_should_sl_ema(pos.side, float(fill), float(winner.ema)):
+                return flatten_ema(entry, "exit_ema")
+            return True
         protected_coins.add(entry.api_coin)
         pcts2 = ema_dev_protect_pcts(
-            draft, float(fill), float(winner.ema), dca_on=_ema_dca_on()
+            draft, float(fill), float(winner.ema), **_ema_protect_kw()
         )
         if pcts2 is None:
             return flatten_ema(entry, "tp_ema")

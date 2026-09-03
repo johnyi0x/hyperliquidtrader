@@ -17,10 +17,12 @@ USE_EMA_DEV_STRATEGY = True
 # EMA-dev knobs (ignored when USE_EMA_DEV_STRATEGY is False).
 # Pick the watch-list coin whose last closed 1m close is farthest from EMA(100)
 # by abs(close-EMA)/EMA. Below EMA => LONG. Above EMA => SHORT.
-# One pair / one position. TP = price touches EMA. D = that entry deviation %.
-#   DCA on  => add once after D% against from the first fill, then SL after
-#             another D% against from the DCA fill.
-#   DCA off => SL after D% against from the first fill.
+# One pair / one position. D = that entry deviation %.
+# REVERSE_STRATEGY off (mean-revert): below EMA => LONG, above => SHORT.
+#   TP = price back to EMA. SL = D% further against the fill.
+# REVERSE_STRATEGY on (momentum): below EMA => SHORT, above => LONG.
+#   No TP, no SL. Hold until price comes back to EMA, then close.
+#   EMA_DEV_ALLOW_DCA is ignored while reversed.
 # X = first fill as % of equity at entry time.
 # Y = DCA add as % of equity at DCA time (current balance, including after a loss).
 # Example 50 / 98: enter 50% of equity then; add 98% of equity when DCA fires.
@@ -246,14 +248,11 @@ MAX_CONCURRENT_POSITIONS = 5
 # Raise to 250 if a browser or extra bots share the same IP.
 IP_WEIGHT_RESERVE = 50
 
-# Live/paper only: reverse every order vs the backtested signal.
-# True  → same entry bars as the tuned mask, but buy↔sell flipped at order time.
-#         Frequency matches the original; DCA/TP/SL follow the real position.
-# False → orders match the backtest side.
-# Backtest/tune is NEVER reversed — only live/paper execution.
-# top_movers: tuner searches WITH the 24h move so MTF can fire. This flag
-# still controls whether live orders are flipped. Off = same side as tune.
-REVERSE_STRATEGY = False
+# Live/paper only. MTF: reverse every order vs the backtested signal.
+# EMA-dev: off = mean-revert to EMA; on = momentum (long above / short below,
+# no TP/SL, close when price hits EMA). Same flag for both strategies.
+# Backtest/tune is NEVER reversed.
+REVERSE_STRATEGY = True
 FLIP_EXECUTION = False # legacy alias; either True enables reverse
 
 
