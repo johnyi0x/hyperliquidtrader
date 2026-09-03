@@ -28,6 +28,7 @@ class EmaDevSnap:
     signed_dev_pct: float
     signal_side: int  # +1 long (price below EMA), -1 short (price above)
     bar_t: int
+    cross_bars: int = 1  # closed bars on this side of EMA (1 = just crossed)
 
 
 @dataclass
@@ -78,8 +79,11 @@ def snap_from_candles(
     if len(candles) < period:
         return None
     closes = [float(c["c"]) for c in candles]
-    ema = last_ema(closes, period)
-    if ema is None:
+    ema_tail = compute_ema_series(closes, period)
+    if not ema_tail:
+        return None
+    ema = float(ema_tail[-1])
+    if ema <= 0:
         return None
     close = closes[-1]
     if close <= 0:
@@ -96,7 +100,32 @@ def snap_from_candles(
         signed_dev_pct=signed,
         signal_side=side,
         bar_t=int(candles[-1]["t"]),
+        cross_bars=bars_on_ema_side(closes, ema_tail),
     )
+
+
+def bars_on_ema_side(closes: list[float], ema_tail: list[float]) -> int:
+    """Closed bars the last close has stayed on the same side of EMA (min 1)."""
+    n_ema = len(ema_tail)
+    if n_ema == 0 or len(closes) < n_ema:
+        return 1
+    offset = len(closes) - n_ema
+    last_side = signal_side_from_price(closes[-1], ema_tail[-1])
+    if last_side == 0:
+        return 1
+    count = 1
+    for j in range(n_ema - 2, -1, -1):
+        side = signal_side_from_price(closes[offset + j], ema_tail[j])
+        if side != last_side:
+            break
+        count += 1
+    return count
+
+
+def _dense_ranks(values: list[float], *, higher_is_better: bool) -> list[int]:
+    ordered = sorted(set(values), reverse=higher_is_better)
+    rank_of = {v: i + 1 for i, v in enumerate(ordered)}
+    return [rank_of[v] for v in values]
 
 
 def pick_farthest(
@@ -105,22 +134,45 @@ def pick_farthest(
     min_dev_pct: float = 0.0,
     skip_coin: str | None = None,
     skip_bar_t: int = 0,
+    rank_cross_age: bool = False,
+    reverse: bool = False,
 ) -> EmaDevSnap | None:
-    best: EmaDevSnap | None = None
+    eligible: list[EmaDevSnap] = []
     for snap in snaps:
         if skip_coin and snap.coin == skip_coin and snap.bar_t == skip_bar_t:
             continue
         if snap.abs_dev_pct + 1e-12 < min_dev_pct:
             continue
-        if best is None or snap.abs_dev_pct > best.abs_dev_pct + 1e-12:
+        eligible.append(snap)
+    if not eligible:
+        return None
+    if not rank_cross_age:
+        best = eligible[0]
+        for snap in eligible[1:]:
+            if snap.abs_dev_pct > best.abs_dev_pct + 1e-12:
+                best = snap
+            elif (
+                abs(snap.abs_dev_pct - best.abs_dev_pct) <= 1e-12
+                and snap.coin < best.coin
+            ):
+                best = snap
+        return best
+    # Equal-weight ranks: 1 is best. Mean-revert wants old crosses; momentum wants new.
+    dev_ranks = _dense_ranks([s.abs_dev_pct for s in eligible], higher_is_better=True)
+    age_ranks = _dense_ranks(
+        [float(s.cross_bars) for s in eligible],
+        higher_is_better=not reverse,
+    )
+    best = eligible[0]
+    best_score = dev_ranks[0] + age_ranks[0]
+    for i, snap in enumerate(eligible[1:], start=1):
+        score = dev_ranks[i] + age_ranks[i]
+        if score < best_score - 1e-12:
             best = snap
-            continue
-        if (
-            best is not None
-            and abs(snap.abs_dev_pct - best.abs_dev_pct) <= 1e-12
-            and snap.coin < best.coin
-        ):
+            best_score = score
+        elif abs(score - best_score) <= 1e-12 and snap.coin < best.coin:
             best = snap
+            best_score = score
     return best
 
 

@@ -41,6 +41,11 @@ EMA_DEV_ALLOW_DCA = False
 EMA_DEV_LIMIT_ORDERS = True
 EMA_DEV_LIMIT_WAIT_SECONDS = 10.0
 EMA_DEV_LIMIT_ATTEMPTS = 3
+# Rank watch-list coins by two equal ranks: |close-EMA| and bars since last
+# EMA cross. Off = farthest from EMA only (previous behavior).
+# Mean-revert (REVERSE off): older cross ranks better.
+# Momentum (REVERSE on): newer cross ranks better.
+EMA_DEV_RANK_CROSS_AGE = True
 
 
 def ema_dev_strategy_enabled() -> bool:

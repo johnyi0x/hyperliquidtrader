@@ -690,7 +690,8 @@ def main() -> None:
         logger.info(
             "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% of equity now "
             "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
-            "one pair | refresh pair list after every close | reverse=%s | limit_orders=%s "
+            "one pair | refresh pair list after every close | reverse=%s | "
+            "rank_cross_age=%s | limit_orders=%s "
             "(%sx mid post-only entry, parked TP limit, %.0fs wait, then market leftover)",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
             int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100),
@@ -700,6 +701,10 @@ def main() -> None:
             "on (momentum: long above / short below, no TP/SL, close at EMA)"
             if flip_live
             else "off (mean-revert)",
+            "on (%s crosses better)"
+            % ("newer" if flip_live else "older")
+            if bool(getattr(cfg, "EMA_DEV_RANK_CROSS_AGE", False))
+            else "off",
             "on" if bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)) else "off",
             int(getattr(cfg, "EMA_DEV_LIMIT_ATTEMPTS", 3) or 3),
             float(getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0),
@@ -1179,6 +1184,16 @@ def main() -> None:
     def _ema_bars_need() -> int:
         return max(40, _ema_period() + 30)
 
+    def _ema_rank_age() -> bool:
+        return bool(getattr(cfg, "EMA_DEV_RANK_CROSS_AGE", False))
+
+    def _ema_scan_bars_need() -> int:
+        need = _ema_bars_need()
+        if _ema_rank_age():
+            # ~8h of 1m bars so "hours above EMA" can rank vs a fresh cross.
+            need = max(need, _ema_period() + 480)
+        return need
+
     def _ema_dca_on() -> bool:
         if flip_live:
             return False
@@ -1559,15 +1574,16 @@ def main() -> None:
         by_coin = {e.api_coin: e for e in watch}
         for entry in watch:
             candles = client.get_closed_candles_for(
-                entry.api_coin, iv, min_bars=_ema_bars_need()
+                entry.api_coin, iv, min_bars=_ema_scan_bars_need()
             )
             snap = snap_from_candles(entry.api_coin, candles, period)
             if snap is None:
                 parts.append(f"{entry.api_coin} no-ema")
                 continue
+            age = f" {snap.cross_bars}b" if _ema_rank_age() else ""
             parts.append(
                 f"{entry.api_coin} {snap.abs_dev_pct:.2f}% "
-                f"{'below' if snap.signal_side > 0 else 'above'} ema"
+                f"{'below' if snap.signal_side > 0 else 'above'} ema{age}"
             )
             snaps.append(snap)
         prev = ema_store.trade
@@ -1578,6 +1594,8 @@ def main() -> None:
             min_dev_pct=min_dev,
             skip_coin=skip_coin or None,
             skip_bar_t=skip_bar,
+            rank_cross_age=_ema_rank_age(),
+            reverse=flip_live,
         )
         logger.info(
             "EMA-dev scan | %s",
