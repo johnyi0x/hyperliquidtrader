@@ -30,10 +30,10 @@ USE_EMA_DEV_STRATEGY = True
 # If Y% of current equity does not fit in free margin, add with remaining free.
 # EMA_DEV_ALLOW_DCA is independent of ALLOW_DCA (that one is MTF only).
 EMA_DEV_INTERVAL = "1m"
-EMA_DEV_PERIOD = 50
+EMA_DEV_PERIOD = 100
 EMA_DEV_MIN_DEV_PCT = 0.0
-EMA_DEV_ENTRY_PCT = 50.0
-EMA_DEV_TOTAL_PCT = 50.0
+EMA_DEV_ENTRY_PCT = 25.0
+EMA_DEV_TOTAL_PCT = 25.0
 EMA_DEV_ALLOW_DCA = False
 # True = entry uses post-only at mid (3x, 10s), then market leftover.
 # TP is a resting post-only limit at EMA (rewritten each 1m bar), not a
