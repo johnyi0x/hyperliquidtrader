@@ -17,18 +17,17 @@ USE_EMA_DEV_STRATEGY = True
 # EMA-dev knobs (ignored when USE_EMA_DEV_STRATEGY is False).
 # Pick the watch-list coin whose last closed 1m close is farthest from EMA(100)
 # by abs(close-EMA)/EMA. Below EMA => LONG. Above EMA => SHORT.
-# One pair / one position. D = that entry deviation %.
+# One pair / one position. D = |price-EMA|/EMA locked at entry.
 # REVERSE_STRATEGY off (mean-revert): below EMA => LONG, above => SHORT.
-#   TP = price back to EMA. SL = D% further against the fill.
 # REVERSE_STRATEGY on (momentum): below EMA => SHORT, above => LONG.
-#   No TP, no SL. Hold until price comes back to EMA, then close.
-#   EMA_DEV_ALLOW_DCA is ignored while reversed.
+# Both modes: fixed TP = D% in favor from fill, fixed SL = D% against from fill.
+# TP/SL do not move when EMA or price later change.
+# EMA_DEV_ALLOW_DCA is independent of ALLOW_DCA (that one is MTF only).
 # X = first fill as % of equity at entry time.
 # Y = DCA add as % of equity at DCA time (current balance, including after a loss).
 # Example 50 / 98: enter 50% of equity then; add 98% of equity when DCA fires.
 # Example 25 / 50: enter 25% now, add 50% of whatever equity is left at DCA.
 # If Y% of current equity does not fit in free margin, add with remaining free.
-# EMA_DEV_ALLOW_DCA is independent of ALLOW_DCA (that one is MTF only).
 EMA_DEV_INTERVAL = "1m"
 EMA_DEV_PERIOD = 100
 EMA_DEV_MIN_DEV_PCT = 0.0
@@ -36,8 +35,8 @@ EMA_DEV_ENTRY_PCT = 50.0
 EMA_DEV_TOTAL_PCT = 50.0
 EMA_DEV_ALLOW_DCA = False
 # True = entry uses post-only at mid (3x, 10s), then market leftover.
-# TP is a resting post-only limit at EMA (rewritten each 1m bar), not a
-# market trigger. SL stays a market stop. False = market in/out + market TP/SL.
+# TP is a resting post-only limit at entry±D (fixed), not a market trigger.
+# SL stays a market stop at entry∓D. False = market in/out + market TP/SL.
 EMA_DEV_LIMIT_ORDERS = False
 EMA_DEV_LIMIT_WAIT_SECONDS = 10.0
 EMA_DEV_LIMIT_ATTEMPTS = 3
@@ -254,11 +253,11 @@ MAX_CONCURRENT_POSITIONS = 5
 IP_WEIGHT_RESERVE = 50
 
 # Live/paper only. MTF: reverse every order vs the backtested signal.
-# EMA-dev: off = mean-revert to EMA; on = momentum (long above / short below,
-# no TP/SL, close when price hits EMA). Same flag for both strategies.
+# EMA-dev: off = mean-revert; on = momentum (long above / short below).
+# Both use fixed TP/SL = ±D% from the fill (D locked at entry). Same flag.
 # Backtest/tune is NEVER reversed.
-REVERSE_STRATEGY = False
-FLIP_EXECUTION = False # legacy alias; either True enables reverse
+REVERSE_STRATEGY = True
+FLIP_EXECUTION = True # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:

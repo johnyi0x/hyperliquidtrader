@@ -94,10 +94,7 @@ class OrderExecutor:
         stop_loss_pct: float,
         attach_protect: bool = True,
     ) -> bool:
-        """
-        Fill entry, then attach TP/SL unless attach_protect is False
-        (EMA-dev momentum: no exchange TP/SL, software exit at EMA).
-        """
+        """Fill entry, then attach TP/SL unless attach_protect is False."""
         with self._lock:
             if self.mid_limit_then_market:
                 filled = self._fill_mid_limit_then_market(
@@ -136,7 +133,7 @@ class OrderExecutor:
 
             if not attach_protect:
                 self.client.cancel_all_orders_for_coin()
-                self.logger.info("Entry filled with no TP/SL (momentum exit at EMA)")
+                self.logger.info("Entry filled with no TP/SL attached")
                 return True
 
             if self.mid_limit_then_market:

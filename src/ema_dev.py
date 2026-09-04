@@ -1,11 +1,10 @@
 """
 Pick the watch-list coin farthest from EMA. No backtest / tune.
 
-D = abs(close - EMA) / EMA at entry (percent).
+D = abs(close - EMA) / EMA locked at entry.
 Mean-revert (REVERSE off): below EMA => LONG, above => SHORT.
-  TP at EMA. SL D% further against. Optional DCA at D% against.
 Momentum (REVERSE on): below EMA => SHORT, above => LONG.
-  No TP/SL. Close when price returns to EMA. DCA off.
+Both: fixed TP = D% in favor from fill, fixed SL = D% against from fill.
 """
 
 from __future__ import annotations
@@ -214,7 +213,7 @@ def sl_price(side: str, from_px: float, d_pct: float) -> float:
 
 
 def tp_price_from_dev(side: str, from_px: float, d_pct: float) -> float:
-    """Favorable target: D% beyond the fill (momentum TP)."""
+    """Favorable target: D% beyond the fill."""
     m = max(0.0, d_pct) / 100.0
     if side == "long":
         return from_px * (1.0 + m)
@@ -274,25 +273,15 @@ def protect_pcts(
     reverse: bool = False,
 ) -> tuple[float, float] | None:
     """
-    (tp_pct, sl_pct) from average entry for exchange TP/SL.
-    None → already through EMA (mean-rev TP or momentum SL).
-    reverse: TP = D% in favor, SL = back to EMA.
+    Fixed (tp_pct, sl_pct) = (D, D) from the entry gap. Not live EMA.
+    None only when D is unusable.
     """
+    del avg_entry, ema, dca_on, reverse
     d = max(0.0, float(trade.dev_pct))
-    if reverse:
-        sl = sl_pct_to_ema(trade.side, avg_entry, ema)
-        if sl is None:
-            return None
-        return max(0.05, d), sl
-    tp = tp_pct_to_ema(trade.side, avg_entry, ema)
-    if tp is None:
+    if d <= 0:
         return None
-    if dca_on and not trade.dca_done:
-        sl_px = sl_price(trade.side, trade.entry_px, 2.0 * d)
-    else:
-        sl_px = sl_price(trade.side, trade.last_fill_px, d)
-    sl = pct_from_avg_to_price(trade.side, avg_entry, sl_px)
-    return tp, sl
+    pct = max(0.05, d)
+    return pct, pct
 
 
 def fill_pcts(
