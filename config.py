@@ -257,8 +257,8 @@ IP_WEIGHT_RESERVE = 50
 # EMA-dev: off = mean-revert to EMA; on = momentum (long above / short below,
 # no TP/SL, close when price hits EMA). Same flag for both strategies.
 # Backtest/tune is NEVER reversed.
-REVERSE_STRATEGY = False
-FLIP_EXECUTION = False # legacy alias; either True enables reverse
+REVERSE_STRATEGY = True
+FLIP_EXECUTION = True # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:
