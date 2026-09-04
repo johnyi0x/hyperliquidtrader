@@ -45,6 +45,9 @@ EMA_DEV_LIMIT_ATTEMPTS = 3
 # Mean-revert (REVERSE off): older cross ranks better.
 # Momentum (REVERSE on): newer cross ranks better.
 EMA_DEV_RANK_CROSS_AGE = True
+# Flatten if the trade has been open this long. 0 = off.
+# Clock is the original fill time (survives restart). Does not change MTF MAX_POSITION_HOURS.
+EMA_DEV_MAX_POSITION_HOURS = 3.0
 
 
 def ema_dev_strategy_enabled() -> bool:

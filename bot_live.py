@@ -691,7 +691,8 @@ def main() -> None:
             "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
             "one pair | refresh pair list after every close | reverse=%s | "
             "rank_cross_age=%s | limit_orders=%s "
-            "(%sx mid post-only entry, parked TP limit, %.0fs wait, then market leftover)",
+            "(%sx mid post-only entry, parked TP limit, %.0fs wait, then market leftover) | "
+            "max_hold=%.1fh from original entry",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
             int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100),
             entry_pct,
@@ -707,6 +708,7 @@ def main() -> None:
             "on" if bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)) else "off",
             int(getattr(cfg, "EMA_DEV_LIMIT_ATTEMPTS", 3) or 3),
             float(getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0),
+            float(getattr(cfg, "EMA_DEV_MAX_POSITION_HOURS", 0) or 0),
         )
         if flip_live:
             logger.info(
@@ -821,6 +823,16 @@ def main() -> None:
             )
             if trade_store.trades:
                 wait = min(wait, max(1.0, float(cfg.POSITION_POLL_SECONDS)))
+            hold_h = float(getattr(cfg, "EMA_DEV_MAX_POSITION_HOURS", 0) or 0)
+            if hold_h > 0 and trade_store.trades:
+                now = time.time()
+                upcoming = [
+                    hold_h * 3600.0 - (now - t.opened_at)
+                    for t in trade_store.trades.values()
+                ]
+                upcoming = [left for left in upcoming if left > 0]
+                if upcoming:
+                    wait = min(wait, max(1.0, min(upcoming)))
             return wait
         intervals = {
             s.interval for c in store.watch_coins() for s in store.setups_for(c)
@@ -1195,6 +1207,30 @@ def main() -> None:
     def _ema_dca_on() -> bool:
         return bool(getattr(cfg, "EMA_DEV_ALLOW_DCA", False))
 
+    def _ema_max_hold_hours() -> float:
+        return max(0.0, float(getattr(cfg, "EMA_DEV_MAX_POSITION_HOURS", 0) or 0))
+
+    def ema_hold_started_at(trade: EmaDevTrade, entry: PairSetup) -> float:
+        """Earliest known fill time so a restart does not reset the 3h clock."""
+        cands: list[float] = []
+        if float(trade.opened_at or 0) > 0:
+            cands.append(float(trade.opened_at))
+        tracked = trade_store.get(entry.api_coin)
+        if (
+            tracked is not None
+            and tracked.side == trade.side
+            and float(tracked.opened_at or 0) > 0
+        ):
+            cands.append(float(tracked.opened_at))
+        bar = int(trade.opened_bar_t or 0)
+        if bar > 10_000_000_000:
+            cands.append(bar / 1000.0)
+        elif bar > 1_000_000_000:
+            cands.append(float(bar))
+        if not cands:
+            return time.time()
+        return min(cands)
+
     def _ema_protect_kw() -> dict:
         return {"dca_on": _ema_dca_on(), "reverse": flip_live}
 
@@ -1266,6 +1302,15 @@ def main() -> None:
             and existing.coin == entry.api_coin
             and existing.side == side
         ):
+            if float(existing.opened_at or 0) <= 0:
+                tracked = trade_store.get(entry.api_coin)
+                if (
+                    tracked is not None
+                    and tracked.side == side
+                    and float(tracked.opened_at or 0) > 0
+                ):
+                    existing.opened_at = float(tracked.opened_at)
+                    ema_store._save()
             return existing
         candles = client.get_closed_candles_for(
             entry.api_coin, _ema_iv(), min_bars=_ema_bars_need()
@@ -1274,6 +1319,10 @@ def main() -> None:
         ema = float(snap.ema) if snap else fill
         bar_t = int(snap.bar_t) if snap else 0
         d = abs(signed_dev_pct(fill, ema)) if ema else 1.0
+        tracked = trade_store.get(entry.api_coin)
+        opened_at = 0.0
+        if tracked is not None and tracked.side == side:
+            opened_at = float(tracked.opened_at or 0)
         trade = EmaDevTrade(
             coin=entry.api_coin,
             side=side,
@@ -1283,6 +1332,7 @@ def main() -> None:
             dca_done=False,
             entry_ema=ema,
             opened_bar_t=bar_t,
+            opened_at=opened_at,
         )
         ema_store.open_trade(trade)
         logger.warning(
@@ -1343,6 +1393,11 @@ def main() -> None:
                 sl_pct,
                 equity_at_entry=client.get_account_value(force=True),
             )
+            t = trade_store.get(entry.api_coin)
+            started = ema_hold_started_at(trade, entry)
+            if t is not None and started > 0 and started < float(t.opened_at or 0):
+                t.opened_at = started
+                trade_store._save()
         else:
             t = trade_store.get(entry.api_coin)
             t.take_profit_pct = tp_pct
@@ -1367,6 +1422,18 @@ def main() -> None:
         ema = float(snap.ema) if snap else float(trade.entry_ema or 0)
         bar_t = int(snap.bar_t) if snap else int(trade.opened_bar_t)
         avg = float(getattr(position, "entry_price", 0) or 0) or mark
+        hold_h = _ema_max_hold_hours()
+        if hold_h > 0:
+            started = ema_hold_started_at(trade, entry)
+            hold_s = max(0.0, time.time() - started)
+            if float(trade.opened_at or 0) <= 0 and started > 0:
+                trade.opened_at = started
+                ema_store._save()
+            if hold_s >= hold_h * 3600.0:
+                return flatten_ema(
+                    entry,
+                    f"max_hold {hold_h:.1f}h ({hold_s / 3600.0:.2f}h since entry)",
+                )
         tp_target = ema_tp_target(trade, avg, ema)
         if tp_target > 0 and should_chase_maker_tp(trade.side, mark, tp_target):
             return flatten_ema(
@@ -1697,6 +1764,7 @@ def main() -> None:
         fill = pos.entry_price or client.get_mark_price()
         draft.entry_px = float(fill)
         draft.last_fill_px = float(fill)
+        draft.opened_at = time.time()
         if float(winner.ema) > 0 and float(fill) > 0:
             draft.dev_pct = abs(signed_dev_pct(float(fill), float(winner.ema)))
         ema_store.open_trade(draft)
