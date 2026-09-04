@@ -38,7 +38,7 @@ EMA_DEV_ALLOW_DCA = False
 # True = entry uses post-only at mid (3x, 10s), then market leftover.
 # TP is a resting post-only limit at EMA (rewritten each 1m bar), not a
 # market trigger. SL stays a market stop. False = market in/out + market TP/SL.
-EMA_DEV_LIMIT_ORDERS = True
+EMA_DEV_LIMIT_ORDERS = False
 EMA_DEV_LIMIT_WAIT_SECONDS = 10.0
 EMA_DEV_LIMIT_ATTEMPTS = 3
 # Rank watch-list coins by two equal ranks: |close-EMA| and bars since last
