@@ -81,7 +81,7 @@ TOP_MOVER_COUNT = 14
 MIN_DAY_NOTIONAL_USD = 1_000_000
 # Skip markets whose exchange max leverage is below this (e.g. 3x/5x memes).
 # 0 = no filter. 10 = only pairs with maxLev ≥ 10, then take top N among those.
-MIN_MAX_LEVERAGE = 10
+MIN_MAX_LEVERAGE = 3
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # 0 = no ceiling. 20 = only pairs with maxLev ≤ 20 (after the min filter).
 MAX_MAX_LEVERAGE = 20
@@ -257,8 +257,8 @@ IP_WEIGHT_RESERVE = 50
 # EMA-dev: off = mean-revert to EMA; on = momentum (long above / short below,
 # no TP/SL, close when price hits EMA). Same flag for both strategies.
 # Backtest/tune is NEVER reversed.
-REVERSE_STRATEGY = True
-FLIP_EXECUTION = True # legacy alias; either True enables reverse
+REVERSE_STRATEGY = False
+FLIP_EXECUTION = False # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:
