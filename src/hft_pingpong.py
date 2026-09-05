@@ -51,6 +51,7 @@ class HftState:
     coin: str
     opened_at: float = 0.0
     last_fill_at: float = 0.0
+    last_fill_buy: bool = False
     last_score_at: float = 0.0
     last_exit_coin: str = ""
     last_exit_until: float = 0.0
@@ -166,14 +167,14 @@ def chop_from_candles(coin: str, candles: list[dict], lookback: int) -> ChopSnap
     fast_n = min(12, len(highs))
     box_high_fast = max(highs[-fast_n:])
     box_low_fast = min(lows[-fast_n:])
-    # Prefer two-sided tape; do not let micro-chop dominate, but let 3x ATR score.
+    # Prefer two-sided calm tape. High ATR names get picked off.
     balance = 1.0 - abs(up_frac - 0.5) * 2.0
     score = (
-        min(path_over_net, 10.0)
+        min(path_over_net, 8.0)
         * max(0.05, balance)
-        * min(range_bps, 400.0)
+        * min(range_bps, 80.0)
         * (1.0 - er)
-        * min(max(atr_bps, 1.0), 80.0)
+        * max(0.2, 1.0 - min(atr_bps, 50.0) / 50.0)
     )
     if burst:
         score *= 0.15
@@ -218,7 +219,9 @@ def chop_reject_reason(
         return f"rng={s.range_bps:.0f}b>{max_range_bps:.0f}"
     if s.atr_bps < 4.0:
         return f"atr={s.atr_bps:.1f}b"
-    if s.up_frac < 0.22 or s.up_frac > 0.78:
+    if s.atr_bps > 32.0:
+        return f"atr={s.atr_bps:.0f}b>32"
+    if s.up_frac < 0.28 or s.up_frac > 0.72:
         return f"one-way={s.up_frac:.0%}"
     return None
 
@@ -360,40 +363,37 @@ def decide(
             None, None, True, False, True, False, timeout, vs, "reduce short"
         )
 
+    if in_pos and book.spread_bps > max_spread_bps:
+        return _reduce()
+
     if book.spread_bps > max_spread_bps:
-        if in_pos:
-            return HftDecision(
-                "spread_toxic", None, False, False, False, False, timeout, vs, "spread wide"
-            )
         return HftDecision(
             None, "spread_wide", False, False, False, False, timeout, vs, "spread wide"
         )
 
-    if (not in_pos) and book.spread_bps + 1e-12 < (
-        min_spread_bps * 0.72 if holding_quotes else min_spread_bps
-    ):
+    if (not in_pos) and (not holding_quotes) and book.spread_bps + 1e-12 < min_spread_bps:
         return HftDecision(
             None, "spread_tight", False, False, False, False, timeout, vs, "spread tight"
         )
 
     trending = bool(chop and (chop.er > max_er or chop.burst))
-    if (not in_pos) and trending:
+    if (not in_pos) and (not holding_quotes) and trending:
         return HftDecision(
             None, "trend", False, False, False, False, timeout, vs, "trend pause"
         )
-    if (not in_pos) and last_bar >= max(18.0, 2.0 * book.spread_bps):
+    if (not in_pos) and (not holding_quotes) and last_bar >= max(18.0, 2.0 * book.spread_bps):
         return HftDecision(
             None, "whip_bar", False, False, False, False, timeout, vs, "whip pause"
         )
-    if (not in_pos) and atr >= 40.0:
+    if (not in_pos) and (not holding_quotes) and atr >= 32.0:
         return HftDecision(
             None, "atr_spike", False, False, False, False, timeout, vs, "atr spike"
         )
-    if (not in_pos) and (loc < 0.22 or loc > 0.78):
+    if (not in_pos) and (not holding_quotes) and (loc < 0.22 or loc > 0.78):
         return HftDecision(
             None, "edge", False, False, False, False, timeout, vs, "edge of box"
         )
-    if (not in_pos) and abs(book.imbalance) > 0.80:
+    if (not in_pos) and (not holding_quotes) and abs(book.imbalance) > 0.88:
         return HftDecision(
             None, "imbalance", False, False, False, False, timeout, vs, "one-sided book"
         )
@@ -406,26 +406,10 @@ def decide(
             pnl_bps = (entry_px - book.mid) / entry_px * 10_000.0
 
     # Hard stop only. Taker fee is 4.5bps — do not market-out for a 1–5bps dip.
-    stop_bps = 12.0
+    stop_bps = 20.0
     if in_pos and pnl_bps <= -stop_bps:
         return HftDecision(
             "inv_stop", None, False, False, False, False, timeout, vs, "inv stop"
-        )
-    if in_pos and trending and pnl_bps < 0 and hold >= 8.0:
-        return HftDecision(
-            "trend", None, False, False, False, False, timeout, vs, "trend loser"
-        )
-    if in_pos and hold >= timeout and pnl_bps < 0:
-        return HftDecision(
-            "inventory_timeout",
-            None,
-            False,
-            False,
-            False,
-            False,
-            timeout,
-            vs,
-            "timeout loser",
         )
     if in_pos:
         return _reduce()
@@ -446,7 +430,7 @@ def decide(
 def quote_px_ok(existing_px: float, target_px: float, tick: float, mid: float) -> bool:
     if existing_px <= 0 or target_px <= 0:
         return False
-    tol = max(tick * 0.51, mid * 1.2e-4)
+    tol = max(tick * 1.1, mid * 4.0e-4)
     return abs(existing_px - target_px) <= tol
 
 
@@ -471,6 +455,7 @@ class HftStore:
                 coin=str(raw["coin"]),
                 opened_at=float(raw.get("opened_at", 0) or 0),
                 last_fill_at=float(raw.get("last_fill_at", 0) or 0),
+                last_fill_buy=bool(raw.get("last_fill_buy", False)),
                 last_score_at=float(raw.get("last_score_at", 0) or 0),
                 last_exit_coin=str(raw.get("last_exit_coin", "") or ""),
                 last_exit_until=float(raw.get("last_exit_until", 0) or 0),
@@ -514,12 +499,14 @@ class HftStore:
         self._save()
         return st
 
-    def touch_fill(self, *, now: float) -> None:
+    def touch_fill(self, *, now: float, is_buy: bool | None = None) -> None:
         if self.state is None:
             return
         if self.state.opened_at <= 0:
             self.state.opened_at = now
         self.state.last_fill_at = now
+        if is_buy is not None:
+            self.state.last_fill_buy = bool(is_buy)
         self.state.fav_px = 0.0
         self._save()
 
@@ -533,6 +520,13 @@ class HftStore:
             self.state.fav_px = mid if cur <= 0 else min(cur, mid)
         else:
             return
+        self._save()
+
+    def mark_flat(self) -> None:
+        if self.state is None:
+            return
+        self.state.last_fill_at = 0.0
+        self.state.fav_px = 0.0
         self._save()
 
     def mark_scored(self, now: float) -> None:

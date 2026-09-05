@@ -359,10 +359,10 @@ def main() -> None:
     )
     universe_max_lev = int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0)
     if hft_on:
-        scan_n = max(1, int(getattr(cfg, "HFT_SCAN_COUNT", 12) or 12))
+        scan_n = max(1, int(getattr(cfg, "HFT_SCAN_COUNT", 16) or 16))
         vol_n = max(vol_n, scan_n)
         mov_n = max(mov_n, scan_n)
-        universe_max_lev = int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 3) or 3)
+        universe_max_lev = int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 20) or 20)
     bad_iv = [i for i in cfg.INTERVALS if i not in INTERVAL_MS]
     if bad_iv:
         raise ValueError(f"Unknown INTERVALS {bad_iv}; known={list(INTERVAL_MS)}")
@@ -386,7 +386,7 @@ def main() -> None:
         """HFT-only: keep markets whose exchange maxLev is ≤ HFT_MAX_MAX_LEVERAGE."""
         if not hft_on:
             return list(entries)
-        cap = max(1, int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 3) or 3))
+        cap = max(1, int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 20) or 20))
         kept, dropped = filter_hft_entries(entries, max_max_leverage=cap)
         if dropped:
             extra = "" if len(dropped) <= 12 else f" +{len(dropped) - 12} more"
@@ -559,7 +559,7 @@ def main() -> None:
         if hft_on and not filtered:
             logger.warning(
                 "HFT refresh produced 0 names with maxLev≤%sx — keeping previous watch",
-                int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 3) or 3),
+                int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 20) or 20),
             )
             return
         watch = filtered
@@ -789,7 +789,7 @@ def main() -> None:
             "scan minLev≥%s maxLev≤%s | HFT maxLev≤%sx | EMA-dev and MTF live paths are off",
             float(getattr(cfg, "HFT_POLL_SECONDS", 3) or 3),
             float(getattr(cfg, "HFT_CLIP_MAX_NOTIONAL_USD", 15) or 15),
-            int(getattr(cfg, "HFT_MAX_LEVERAGE", 3) or 3),
+            int(getattr(cfg, "HFT_MAX_LEVERAGE", 20) or 20),
             int(getattr(cfg, "HFT_LOOKBACK_BARS", 45) or 45),
             float(getattr(cfg, "HFT_MAX_ER", 0.32) or 0.32),
             float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 2.8) or 2.8),
@@ -798,7 +798,7 @@ def main() -> None:
             float(getattr(cfg, "HFT_BOX_BREAK_BPS", 8) or 8),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 1) or 1),
             universe_max_lev or "off",
-            int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 3) or 3),
+            int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 20) or 20),
         )
     if is_volume_mode(pair_mode):
         logger.info(
@@ -1918,7 +1918,7 @@ def main() -> None:
     def _hft_clip_size(entry: PairSetup) -> float:
         lev = min(
             int(entry.leverage),
-            max(1, int(getattr(cfg, "HFT_MAX_LEVERAGE", 3) or 3)),
+            max(1, int(getattr(cfg, "HFT_MAX_LEVERAGE", 20) or 20)),
         )
         try:
             equity = client.get_account_value(force=True)
@@ -1973,7 +1973,7 @@ def main() -> None:
             return
         lev = min(
             int(entry.leverage),
-            max(1, int(getattr(cfg, "HFT_MAX_LEVERAGE", 3) or 3)),
+            max(1, int(getattr(cfg, "HFT_MAX_LEVERAGE", 20) or 20)),
         )
         try:
             client.set_leverage(lev, is_cross=entry.use_cross_margin)
@@ -2068,13 +2068,17 @@ def main() -> None:
             if alo:
                 continue
             if filled > 0:
-                hft_store.touch_fill(now=time.time())
+                if reduce_only:
+                    hft_store.mark_flat()
+                else:
+                    hft_store.touch_fill(now=time.time(), is_buy=is_buy)
                 logger.info(
-                    "HFT fill %s %s sz=%s px=%s",
+                    "HFT fill %s %s sz=%s px=%s%s",
                     client.coin,
                     "BUY" if is_buy else "SELL",
                     filled,
                     px,
+                    " reduce" if reduce_only else "",
                 )
                 return True
             if oid is not None:
@@ -2102,9 +2106,20 @@ def main() -> None:
         size = float(getattr(position, "size", 0) or 0)
         entry_px = float(getattr(position, "entry_price", 0) or 0)
         last_fill = float(st.last_fill_at if st else 0) or 0.0
+        if (
+            size <= 1e-12
+            and st is not None
+            and last_fill > 0
+            and now - last_fill < 15.0
+        ):
+            # Position fetch lags a maker fill. Keep reduce-only until the book shows flat.
+            side = "long" if bool(st.last_fill_buy) else "short"
+            size = max(clip, 1e-8)
+            if entry_px <= 0:
+                entry_px = book.mid
         if position is not None and last_fill <= 0:
             last_fill = now
-            hft_store.touch_fill(now=now)
+            hft_store.touch_fill(now=now, is_buy=(side == "long"))
         if position is not None and size > 1e-12 and book.mid > 0:
             hft_store.mark_fav(book.mid, side or "")
             st = hft_store.active() or st
@@ -2142,7 +2157,7 @@ def main() -> None:
                 logger.info("HFT flatten %s thin_exit | %s", entry.api_coin, _ctx())
                 hft_flatten(entry, "thin_exit")
                 return "flatten"
-        holding = bool(st is not None and st.coin == entry.api_coin and size <= 1e-12)
+        holding = bool(st is not None and st.coin == entry.api_coin)
         decision = hft_decide(
             book=book,
             chop=chop,
@@ -2155,7 +2170,7 @@ def main() -> None:
             max_spread_bps=float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 16) or 16),
             max_er=float(getattr(cfg, "HFT_MAX_ER", 0.32) or 0.32),
             box_break_bps=float(getattr(cfg, "HFT_BOX_BREAK_BPS", 8) or 8),
-            base_timeout_s=float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 40) or 40),
+            base_timeout_s=float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 90) or 90),
             clip_sz=clip,
             fav_px=float(st.fav_px if st else 0) or 0.0,
             holding_quotes=holding,
@@ -2170,8 +2185,8 @@ def main() -> None:
             hft_flatten(entry, decision.flatten)
             return "flatten"
         if decision.pause:
-            client.cancel_entry_orders_for_coin()
-            client.cancel_reduce_only_limits_for_coin()
+            if size <= 1e-12:
+                client.cancel_entry_orders_for_coin()
             hft_log(
                 f"pause:{entry.api_coin}:{decision.pause}",
                 "HFT skip %s %s | %s",
@@ -2201,12 +2216,13 @@ def main() -> None:
             return quote_px_ok(float(raw or 0), tpx, book.tick, book.mid)
 
         placed = False
-        filled_now = False
+        filled_bid = False
+        filled_ask = False
         if decision.quote_bid:
             if not _keep(bid_o, True, aggressive=decision.bid_reduce):
                 if bid_o is not None:
                     client.cancel_oid(bid_o.get("oid"))
-                filled_now = hft_place_quote(
+                filled_bid = hft_place_quote(
                     True,
                     exit_sz if decision.bid_reduce else add_sz,
                     decision.bid_reduce,
@@ -2217,15 +2233,18 @@ def main() -> None:
         elif bid_o is not None:
             client.cancel_oid(bid_o.get("oid"))
             bid_o = None
-        if filled_now:
+        if filled_bid:
             if ask_o is not None:
                 client.cancel_oid(ask_o.get("oid"))
+            if not decision.bid_reduce:
+                hft_place_quote(False, add_sz, True, book, aggressive=True)
+                logger.info("HFT rest %s ask-red (cover buy) | %s", entry.api_coin, _ctx())
             return "quoted"
         if decision.quote_ask:
             if not _keep(ask_o, False, aggressive=decision.ask_reduce):
                 if ask_o is not None:
                     client.cancel_oid(ask_o.get("oid"))
-                filled_now = hft_place_quote(
+                filled_ask = hft_place_quote(
                     False,
                     exit_sz if decision.ask_reduce else add_sz,
                     decision.ask_reduce,
@@ -2235,8 +2254,13 @@ def main() -> None:
                 placed = True
         elif ask_o is not None:
             client.cancel_oid(ask_o.get("oid"))
-        if filled_now and bid_o is not None:
-            client.cancel_oid(bid_o.get("oid"))
+        if filled_ask:
+            if bid_o is not None:
+                client.cancel_oid(bid_o.get("oid"))
+            if not decision.ask_reduce:
+                hft_place_quote(True, add_sz, True, book, aggressive=True)
+                logger.info("HFT rest %s bid-red (cover sell) | %s", entry.api_coin, _ctx())
+            return "quoted"
         if placed:
             sides = []
             if decision.quote_bid:
@@ -2319,7 +2343,7 @@ def main() -> None:
         max_er = float(getattr(cfg, 'HFT_MAX_ER', 0.32) or 0.32)
         min_sp = float(getattr(cfg, 'HFT_MIN_SPREAD_BPS', 2.8) or 2.8)
         max_sp = float(getattr(cfg, 'HFT_MAX_SPREAD_BPS', 16) or 16)
-        max_range = float(getattr(cfg, 'HFT_MAX_RANGE_BPS', 900) or 900)
+        max_range = float(getattr(cfg, 'HFT_MAX_RANGE_BPS', 400) or 400)
         max_n = max(1, int(getattr(cfg, 'HFT_MAX_CANDIDATES', 8) or 8))
         prev = hft_store.state
         skip_coin = prev.last_exit_coin if prev else None
@@ -2389,10 +2413,6 @@ def main() -> None:
                 if outcome in ('quoted', 'flatten'):
                     return True
                 book_bits.append(f'{snap.coin}:{outcome}')
-                act = hft_store.active()
-                if act is not None and act.coin == entry.api_coin:
-                    client.cancel_all_orders_for_coin_named(entry.api_coin)
-                    hft_store.close(coin=entry.api_coin, until=now)
             hft_log(
                 'idle',
                 'HFT idle %s need>=%.1fbps | %s',
@@ -2423,7 +2443,11 @@ def main() -> None:
                     max_range_bps=max_range,
                 )
                 better = ranked[0] if ranked else None
-                if better is not None and better.coin != st.coin:
+                if (
+                    better is not None
+                    and better.coin != st.coin
+                    and float(st.last_fill_at or 0) <= 0
+                ):
                     logger.info(
                         'HFT rescore %s -> try %s | %s',
                         st.coin,
@@ -2434,10 +2458,7 @@ def main() -> None:
                     hft_store.close(coin=st.coin, until=now)
                     if _try_quote(snaps, reason='rescore'):
                         return
-            outcome = run_hft_coin(entry, None)
-            if outcome in ('paused', 'idle'):
-                client.cancel_all_orders_for_coin_named(entry.api_coin)
-                hft_store.close(coin=entry.api_coin, until=now)
+            run_hft_coin(entry, None)
             return
         snaps, why = _scan_snaps()
         if why:

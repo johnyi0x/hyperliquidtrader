@@ -62,14 +62,12 @@ HFT_POLL_SECONDS = 3.0
 # One clip: at least Hyperliquid min notional, never a large bag.
 # Small accounts use the exchange minimum (~$10). Bigger accounts still cap here.
 HFT_CLIP_MAX_NOTIONAL_USD = 15.0
-# Cap leverage used for clip sizing (≤ the pair's exchange max). 3x names stay at 3.
-HFT_MAX_LEVERAGE = 3
+# Cap leverage used for clip sizing (≤ the pair's exchange max).
+HFT_MAX_LEVERAGE = 20
 # HFT-only: drop markets whose exchange maxLev is ABOVE this.
-# 3 = only quote pairs whose maximum leverage is ≤ 3. Does not change EMA/MTF.
-HFT_MAX_MAX_LEVERAGE = 3
-# When HFT is on, mover/volume discover uses HFT_MAX_MAX_LEVERAGE as the ceiling,
-# then keeps this many names. 12 is enough to pick a book without burning IP weight.
-HFT_SCAN_COUNT = 12
+HFT_MAX_MAX_LEVERAGE = 20
+# Discover this many names among maxLev ≤ HFT_MAX_MAX_LEVERAGE.
+HFT_SCAN_COUNT = 16
 HFT_LOOKBACK_BARS = 45
 # Kaufman ER above this = trend: do not add; flatten if in.
 HFT_MAX_ER = 0.32
@@ -77,14 +75,14 @@ HFT_MAX_ER = 0.32
 HFT_MIN_SPREAD_BPS = 2.8
 # 0.16% = 16bps. Wider than that is a gap / runaway book, not a ping-pong.
 HFT_MAX_SPREAD_BPS = 16.0
-# Wait for the other maker side. Market flatten only on a real stop, not this clock.
-HFT_INVENTORY_TIMEOUT_S = 40.0
+# Wait for the other maker side. Do not market-dump a clip on this clock.
+HFT_INVENTORY_TIMEOUT_S = 90.0
 HFT_BOX_BREAK_BPS = 8.0
-# Skip names whose 45m range exceeds this (still allow typical 3x swings).
-HFT_MAX_RANGE_BPS = 900.0
-HFT_RESCORE_SECONDS = 90.0
+# Skip names whose 45m range exceeds this.
+HFT_MAX_RANGE_BPS = 400.0
+HFT_RESCORE_SECONDS = 120.0
 HFT_UNIVERSE_REFRESH_SECONDS = 600.0
-HFT_COOLDOWN_SECONDS = 30.0
+HFT_COOLDOWN_SECONDS = 20.0
 HFT_MAX_CANDIDATES = 8
 
 
@@ -134,7 +132,7 @@ MIN_DAY_NOTIONAL_USD = 1_000_000
 # HFT then applies HFT_MAX_MAX_LEVERAGE on top; EMA/MTF use this scan as-is.
 MIN_MAX_LEVERAGE = 1
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
-# 0 = no ceiling. Ping-pong's ≤3x cut is HFT_MAX_MAX_LEVERAGE, not this.
+# Ping-pong's ≤20x cut is HFT_MAX_MAX_LEVERAGE, not this.
 MAX_MAX_LEVERAGE = 0
 # Which books to scan (volume or 24h movers). Same filter in EMA-dev and MTF.
 #   "native"   = Hyperliquid main perps only (BTC, ETH, …). No HIP-3.
