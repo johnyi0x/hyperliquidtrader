@@ -377,7 +377,9 @@ def decide(
             None, "spread_wide", False, False, False, False, timeout, vs, "spread wide"
         )
 
-    if (not in_pos) and (not holding_quotes) and book.spread_bps + 1e-12 < min_spread_bps:
+    # Do not keep two-sided quotes on a book that compressed inside the fee floor.
+    # holding_quotes used to skip this and rest ZRO at 0.9bps.
+    if (not in_pos) and book.spread_bps + 1e-12 < min_spread_bps:
         return HftDecision(
             None, "spread_tight", False, False, False, False, timeout, vs, "spread tight"
         )

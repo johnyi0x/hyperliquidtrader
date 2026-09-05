@@ -2103,9 +2103,18 @@ def main() -> None:
             return "idle"
         chop = _hft_chop(entry, force=True)
         clip = _hft_clip_size(entry)
-        live = position
+        live = client.get_position(force=True)
+        pos_ok = True
         if live is None:
-            live = client.get_position(force=True)
+            pos_ok, all_pos = client.fetch_open_positions(force=True)
+            if pos_ok:
+                names = entry.position_coin_names()
+                for coin, pos in all_pos:
+                    if coin == entry.api_coin or coin in names:
+                        live = pos
+                        break
+        # Ignore a stale caller snapshot. A leftover short of 23.6 on a 351 long
+        # made dust flatten market-dump the real clip.
         side = str(getattr(live, "side", "") or "") or None
         size = float(getattr(live, "size", 0) or 0)
         entry_px = float(getattr(live, "entry_price", 0) or 0)
@@ -2123,12 +2132,27 @@ def main() -> None:
                 hft_store.mark_fav(book.mid, side or "")
                 st = hft_store.active() or st
         elif last_fill > 0:
+            if not pos_ok:
+                logger.warning(
+                    "HFT %s position query failed — not treating as flat",
+                    entry.api_coin,
+                )
+                return "idle"
+            bid_w, ask_w = client.working_limit_quotes()
+            if bid_w is not None or ask_w is not None:
+                hft_store.reset_flat_streak()
+                logger.info(
+                    "HFT %s quotes still working — not flat yet",
+                    entry.api_coin,
+                )
+                return "quoted"
             streak = hft_store.bump_flat()
             logger.info(
-                "HFT %s wait-flat %s/3 — reduce-only until exchange confirms",
+                "HFT %s wait-flat %s/3 — no ghost reduce (live book empty)",
                 entry.api_coin,
                 streak,
             )
+            client.cancel_entry_orders_for_coin()
             if streak >= 3:
                 cool = float(getattr(cfg, "HFT_COOLDOWN_SECONDS", 20) or 20)
                 logger.info(
@@ -2139,11 +2163,7 @@ def main() -> None:
                 client.cancel_all_orders_for_coin()
                 hft_store.close(coin=entry.api_coin, until=now + cool)
                 return "idle"
-            # Fetch missed or cover just filled. Reduce-only until confirmed flat.
-            side = "long" if bool(st and st.last_fill_buy) else "short"
-            size = max(clip, 1e-8)
-            if entry_px <= 0:
-                entry_px = book.mid
+            return "quoted"
         if st is not None and now < float(st.pause_until or 0) and size <= 1e-12:
             client.cancel_entry_orders_for_coin()
             return "paused"
@@ -2175,9 +2195,37 @@ def main() -> None:
             )
 
         if live is not None and size > 1e-12 and book.mid > 0 and size * book.mid + 1e-9 < min_n:
-            logger.info("HFT flatten %s dust leftover $%.2f | %s", entry.api_coin, size * book.mid, _ctx())
-            hft_flatten(entry, "dust")
-            return "flatten"
+            client.cancel_all_orders_for_coin()
+            fresh = client.get_position(force=True)
+            if fresh is None:
+                hft_store.mark_flat()
+                return "idle"
+            size = float(fresh.size or 0)
+            side = str(fresh.side or "") or side
+            entry_px = float(fresh.entry_price or 0) or entry_px
+            live = fresh
+            if size > 1e-12 and entry_px > 0:
+                if side == "long":
+                    pnl_bps = (book.mid - entry_px) / entry_px * 10_000.0
+                else:
+                    pnl_bps = (entry_px - book.mid) / entry_px * 10_000.0
+            if size * book.mid + 1e-9 < min_n:
+                logger.info(
+                    "HFT flatten %s dust leftover $%.2f | %s",
+                    entry.api_coin,
+                    size * book.mid,
+                    _ctx(),
+                )
+                hft_flatten(entry, "dust")
+                return "flatten"
+            logger.info(
+                "HFT %s dust skipped — live %s sz=%s ($%.2f) after refetch | %s",
+                entry.api_coin,
+                side,
+                size,
+                size * book.mid,
+                _ctx(),
+            )
         if size > 1e-12:
             client.cancel_entry_orders_for_coin()
         holding = bool(st is not None and st.coin == entry.api_coin)
