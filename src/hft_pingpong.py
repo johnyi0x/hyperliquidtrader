@@ -3,7 +3,7 @@ Maker ping-pong for Hyperliquid perps (Railway-safe, REST poll).
 
 Picks a choppy wide-enough book, quotes one clip post-only on both sides when
 flat, skews to flatten when filled, and market-exits on trend / box break /
-inventory timeout so size is not left behind when price walks away.
+whip / inventory timeout so size is not left behind when 3x books run.
 """
 
 from __future__ import annotations
@@ -37,8 +37,11 @@ class ChopSnap:
     range_bps: float
     box_high: float
     box_low: float
+    box_high_fast: float
+    box_low_fast: float
     up_frac: float
     burst: bool  # last bars one-way
+    last_bar_bps: float
     bar_t: int
     score: float
 
@@ -53,6 +56,7 @@ class HftState:
     last_exit_until: float = 0.0
     cleared_legacy: bool = False
     pause_until: float = 0.0
+    fav_px: float = 0.0  # best mid in our favor since fill (give-back flatten)
 
 
 @dataclass(frozen=True)
@@ -150,16 +154,27 @@ def chop_from_candles(coin: str, candles: list[dict], lookback: int) -> ChopSnap
     atr_bps = atr / close * 10_000.0
     sides = up + down
     up_frac = (up / sides) if sides else 0.5
-    last3 = closes[-4:]
+    last_bar_bps = 0.0
+    if len(closes) >= 2 and closes[-2] > 0:
+        last_bar_bps = abs(closes[-1] - closes[-2]) / closes[-2] * 10_000.0
+    # Two consecutive 1m closes same way + a real move = tape is running.
     burst = False
-    if len(last3) >= 4:
-        same_up = all(last3[i] > last3[i - 1] for i in range(1, 4))
-        same_dn = all(last3[i] < last3[i - 1] for i in range(1, 4))
-        move_bps = abs(last3[-1] - last3[0]) / last3[0] * 10_000.0
-        burst = (same_up or same_dn) and move_bps >= max(12.0, 0.9 * atr_bps)
-    # Prefer lots of path, two-sided tape, usable range; penalize trend.
+    if len(closes) >= 3 and closes[-3] > 0:
+        same_up = closes[-1] > closes[-2] > closes[-3]
+        same_dn = closes[-1] < closes[-2] < closes[-3]
+        burst = (same_up or same_dn) and last_bar_bps >= max(10.0, 0.65 * atr_bps)
+    fast_n = min(12, len(highs))
+    box_high_fast = max(highs[-fast_n:])
+    box_low_fast = min(lows[-fast_n:])
+    # Prefer two-sided tape; do not let micro-chop dominate, but let 3x ATR score.
     balance = 1.0 - abs(up_frac - 0.5) * 2.0
-    score = path_over_net * max(0.05, balance) * min(range_bps, 80.0) * (1.0 - er)
+    score = (
+        min(path_over_net, 10.0)
+        * max(0.05, balance)
+        * min(range_bps, 400.0)
+        * (1.0 - er)
+        * min(max(atr_bps, 1.0), 80.0)
+    )
     if burst:
         score *= 0.15
     return ChopSnap(
@@ -171,11 +186,42 @@ def chop_from_candles(coin: str, candles: list[dict], lookback: int) -> ChopSnap
         range_bps=range_bps,
         box_high=box_high,
         box_low=box_low,
+        box_high_fast=box_high_fast,
+        box_low_fast=box_low_fast,
         up_frac=up_frac,
         burst=burst,
+        last_bar_bps=last_bar_bps,
         bar_t=int(tail[-1]["t"]),
         score=float(score),
     )
+
+
+def rank_chop(
+    snaps: list[ChopSnap],
+    *,
+    max_er: float,
+    skip_coin: str | None = None,
+    skip_until: float = 0.0,
+    now: float = 0.0,
+    max_range_bps: float = 900.0,
+) -> list[ChopSnap]:
+    eligible: list[ChopSnap] = []
+    for s in snaps:
+        if skip_coin and s.coin == skip_coin and now < skip_until:
+            continue
+        if s.er > max_er + 1e-12:
+            continue
+        if s.burst:
+            continue
+        if s.range_bps < 10.0 or s.range_bps > max_range_bps:
+            continue
+        if s.atr_bps < 4.0:
+            continue
+        if s.up_frac < 0.22 or s.up_frac > 0.78:
+            continue
+        eligible.append(s)
+    eligible.sort(key=lambda s: (-s.score, s.coin))
+    return eligible
 
 
 def pick_chop(
@@ -186,32 +232,64 @@ def pick_chop(
     skip_until: float = 0.0,
     now: float = 0.0,
 ) -> ChopSnap | None:
-    eligible: list[ChopSnap] = []
-    for s in snaps:
-        if skip_coin and s.coin == skip_coin and now < skip_until:
-            continue
-        if s.er > max_er + 1e-12:
-            continue
-        if s.burst:
-            continue
-        if s.range_bps < 8.0:
-            continue
-        if s.up_frac < 0.22 or s.up_frac > 0.78:
-            continue
-        eligible.append(s)
-    if not eligible:
-        return None
-    best = eligible[0]
-    for s in eligible[1:]:
-        if s.score > best.score + 1e-12:
-            best = s
-        elif abs(s.score - best.score) <= 1e-12 and s.coin < best.coin:
-            best = s
-    return best
+    ranked = rank_chop(
+        snaps,
+        max_er=max_er,
+        skip_coin=skip_coin,
+        skip_until=skip_until,
+        now=now,
+    )
+    return ranked[0] if ranked else None
+
+
+def filter_hft_entries(entries: list, *, max_max_leverage: int) -> tuple[list, list[str]]:
+    """Keep only names whose exchange maxLev is ≤ cap (HFT-only pair cut)."""
+    cap = max(1, int(max_max_leverage or 1))
+    kept: list = []
+    dropped: list[str] = []
+    for e in entries:
+        market = getattr(e, "market", None)
+        mx = int(getattr(market, "max_leverage", 0) or 0)
+        label = str(getattr(e, "api_coin", None) or getattr(e, "coin", "?") or "?")
+        if mx <= cap:
+            kept.append(e)
+        else:
+            dropped.append(f"{label}({mx}x)")
+    return kept, dropped
+
+
+def target_clip_notional(
+    *,
+    equity: float,
+    available: float,
+    leverage: int,
+    min_notional: float,
+    max_notional: float,
+) -> float | None:
+    """
+    One small clip: at least exchange min, never a fat order.
+    Tiny accounts use the min notional. Returns None if free margin cannot fund it.
+    """
+    lev = max(1, int(leverage))
+    floor = max(float(min_notional) * 1.08, float(min_notional))
+    cap = max(floor, float(max_notional))
+    if equity > 0:
+        cap = min(cap, max(floor, equity * 0.20))
+    if equity > 0 and equity >= 50.0:
+        target = min(cap, max(floor, equity * 0.12))
+    else:
+        target = floor
+    margin = target / lev
+    if available + 1e-9 >= margin:
+        return target
+    affordable = max(0.0, available) * 0.90 * lev
+    if affordable + 1e-9 >= float(min_notional):
+        return max(float(min_notional), affordable)
+    return None
 
 
 def vol_scale(atr_bps: float) -> float:
-    return max(0.55, min(2.6, (max(4.0, atr_bps) / 16.0)))
+    return max(0.70, min(2.8, (max(4.0, atr_bps) / 16.0)))
 
 
 def decide(
@@ -229,11 +307,15 @@ def decide(
     box_break_bps: float,
     base_timeout_s: float,
     clip_sz: float,
+    fav_px: float = 0.0,
 ) -> HftDecision:
     del clip_sz
     vs = vol_scale(chop.atr_bps if chop else 16.0)
-    timeout = max(8.0, min(48.0, base_timeout_s / vs))
+    timeout = max(4.0, min(float(base_timeout_s), float(base_timeout_s) / vs))
     in_pos = bool(side) and size > 1e-12
+    hold = (now - last_fill_at) if last_fill_at > 0 else 0.0
+    last_bar = float(chop.last_bar_bps if chop else 0.0)
+    atr = float(chop.atr_bps if chop else 16.0)
 
     if book.spread_bps > max_spread_bps:
         if in_pos:
@@ -259,6 +341,20 @@ def decide(
             None, "trend", False, False, False, False, timeout, vs, "trend pause"
         )
 
+    # Last 1m bar already moved ~a spread: leftover will become a bag on 3x tape.
+    if in_pos and last_bar >= max(10.0, 1.05 * book.spread_bps):
+        return HftDecision(
+            "whip", None, False, False, False, False, timeout, vs, "whip bar"
+        )
+    if (not in_pos) and last_bar >= max(20.0, 1.8 * book.spread_bps):
+        return HftDecision(
+            None, "whip_bar", False, False, False, False, timeout, vs, "whip pause"
+        )
+    if (not in_pos) and atr >= 90.0:
+        return HftDecision(
+            None, "atr_spike", False, False, False, False, timeout, vs, "atr spike"
+        )
+
     if chop is not None and chop.box_high > chop.box_low:
         span = chop.box_high - chop.box_low
         pad = book.mid * (box_break_bps / 10_000.0)
@@ -274,7 +370,14 @@ def decide(
     else:
         loc = 0.5
 
-    if in_pos and last_fill_at > 0 and now - last_fill_at >= timeout:
+    if in_pos and chop is not None and chop.box_high_fast > chop.box_low_fast:
+        pad_f = book.mid * (max(3.0, box_break_bps) / 10_000.0)
+        if book.mid > chop.box_high_fast + pad_f or book.mid < chop.box_low_fast - pad_f:
+            return HftDecision(
+                "fast_box", None, False, False, False, False, timeout, vs, "fast box"
+            )
+
+    if in_pos and hold >= timeout:
         return HftDecision(
             "inventory_timeout",
             None,
@@ -288,44 +391,54 @@ def decide(
         )
 
     if in_pos and entry_px > 0:
-        stop_bps = max(14.0, 2.2 * book.spread_bps, 0.55 * (chop.atr_bps if chop else 20.0))
-        if side == "long" and (entry_px - book.mid) / entry_px * 10_000.0 >= stop_bps:
+        if side == "long":
+            pnl_bps = (book.mid - entry_px) / entry_px * 10_000.0
+        else:
+            pnl_bps = (entry_px - book.mid) / entry_px * 10_000.0
+        # Cap the stop in bps so a 50–100bps meme spread cannot hold a bag.
+        stop_bps = min(14.0, max(7.0, 0.55 * book.spread_bps, 0.16 * atr))
+        if pnl_bps <= -stop_bps:
             return HftDecision(
-                "inv_stop", None, False, False, False, False, timeout, vs, "long stop"
+                "inv_stop", None, False, False, False, False, timeout, vs, "inv stop"
             )
-        if side == "short" and (book.mid - entry_px) / entry_px * 10_000.0 >= stop_bps:
+        if pnl_bps <= -4.0 and hold >= 1.5:
             return HftDecision(
-                "inv_stop", None, False, False, False, False, timeout, vs, "short stop"
+                "inv_tick", None, False, False, False, False, timeout, vs, "adverse tick"
             )
-        # Winner: don't sit long into a lift or short into a dump waiting on a stale quote.
-        take_bps = max(book.spread_bps * 0.85, 3.0)
-        if side == "long" and (book.mid - entry_px) / entry_px * 10_000.0 >= take_bps:
+        if pnl_bps < 0 and hold >= timeout * 0.22:
             return HftDecision(
-                None,
-                None,
-                False,
-                True,
-                False,
-                True,
-                timeout,
-                vs,
-                "exit long",
+                "inv_bleed", None, False, False, False, False, timeout, vs, "bleed"
             )
-        if side == "short" and (entry_px - book.mid) / entry_px * 10_000.0 >= take_bps:
+        give_need = min(8.0, max(4.0, 0.55 * book.spread_bps))
+        if fav_px > 0:
+            if side == "long" and fav_px > entry_px:
+                give_bps = (fav_px - book.mid) / fav_px * 10_000.0
+                if give_bps >= give_need:
+                    return HftDecision(
+                        "giveback", None, False, False, False, False, timeout, vs, "giveback"
+                    )
+            if side == "short" and fav_px < entry_px:
+                give_bps = (book.mid - fav_px) / fav_px * 10_000.0
+                if give_bps >= give_need:
+                    return HftDecision(
+                        "giveback", None, False, False, False, False, timeout, vs, "giveback"
+                    )
+        take_bps = max(min(book.spread_bps * 0.55, 8.0), 2.0)
+        if pnl_bps >= take_bps:
+            if side == "long":
+                return HftDecision(
+                    None, None, False, True, False, True, timeout, vs, "exit long"
+                )
             return HftDecision(
-                None,
-                None,
-                True,
-                False,
-                True,
-                False,
-                timeout,
-                vs,
-                "exit short",
+                None, None, True, False, True, False, timeout, vs, "exit short"
+            )
+        # Underwater leftover: do not rest a maker and hope. Flatten.
+        if pnl_bps < 1.0:
+            return HftDecision(
+                "no_bag", None, False, False, False, False, timeout, vs, "no leftover bag"
             )
 
     if in_pos:
-        # Only the flattening side. Never add when already in.
         if side == "long":
             return HftDecision(
                 None, None, False, True, False, True, timeout, vs, "reduce long"
@@ -334,13 +447,17 @@ def decide(
             None, None, True, False, True, False, timeout, vs, "reduce short"
         )
 
-    # Flat: two-sided unless book/box says one side is toxic.
-    quote_bid = loc < 0.90 and book.imbalance < 0.62
-    quote_ask = loc > 0.10 and book.imbalance > -0.62
-    if loc > 0.88:
+    quote_bid = loc < 0.88 and book.imbalance < 0.55
+    quote_ask = loc > 0.12 and book.imbalance > -0.55
+    if loc > 0.85:
         quote_bid = False
-    if loc < 0.12:
+    if loc < 0.15:
         quote_ask = False
+    if chop is not None and chop.atr_bps >= 40.0:
+        if loc > 0.52:
+            quote_bid = False
+        if loc < 0.48:
+            quote_ask = False
     if not quote_bid and not quote_ask:
         return HftDecision(
             None, "edge", False, False, False, False, timeout, vs, "no safe side"
@@ -391,6 +508,7 @@ class HftStore:
                 last_exit_until=float(raw.get("last_exit_until", 0) or 0),
                 cleared_legacy=bool(raw.get("cleared_legacy", False)),
                 pause_until=float(raw.get("pause_until", 0) or 0),
+                fav_px=float(raw.get("fav_px", 0) or 0),
             )
         except (KeyError, TypeError, ValueError):
             self.state = None
@@ -434,6 +552,19 @@ class HftStore:
         if self.state.opened_at <= 0:
             self.state.opened_at = now
         self.state.last_fill_at = now
+        self.state.fav_px = 0.0
+        self._save()
+
+    def mark_fav(self, mid: float, side: str) -> None:
+        if self.state is None or mid <= 0:
+            return
+        cur = float(self.state.fav_px or 0)
+        if side == "long":
+            self.state.fav_px = mid if cur <= 0 else max(cur, mid)
+        elif side == "short":
+            self.state.fav_px = mid if cur <= 0 else min(cur, mid)
+        else:
+            return
         self._save()
 
     def mark_scored(self, now: float) -> None:

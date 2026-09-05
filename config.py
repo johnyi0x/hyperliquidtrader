@@ -57,24 +57,35 @@ EMA_DEV_MAX_POSITION_HOURS = 3.0
 # EMA-dev and MTF code stay in the repo; this flag just selects the live path.
 # When on, ema_dev_strategy_enabled() is forced off (no EMA entries).
 # One pair, post-only quotes, flatten on trend/box-break/inventory timeout.
-USE_HFT_PINGPONG = False
-HFT_POLL_SECONDS = 4.0
-# One clip as % of equity (maker add). Legacy/large bags only reduce, never add.
-HFT_CLIP_EQUITY_PCT = 2.5
-# Cap leverage used for clip sizing (watchlist lev is still set on the market).
-HFT_MAX_LEVERAGE = 5
+USE_HFT_PINGPONG = True
+HFT_POLL_SECONDS = 3.0
+# One clip: at least Hyperliquid min notional, never a large bag.
+# Small accounts use the exchange minimum (~$10). Bigger accounts still cap here.
+HFT_CLIP_MAX_NOTIONAL_USD = 15.0
+# Cap leverage used for clip sizing (≤ the pair's exchange max). 3x names stay at 3.
+HFT_MAX_LEVERAGE = 3
+# HFT-only: drop markets whose exchange maxLev is ABOVE this.
+# 3 = only quote pairs whose maximum leverage is ≤ 3. Does not change EMA/MTF.
+HFT_MAX_MAX_LEVERAGE = 3
+# When HFT is on, scan at least this many movers/volume names before the ≤3x cut
+# so the watch list is not empty after dropping 10x/20x leaders.
+HFT_SCAN_COUNT = 40
 HFT_LOOKBACK_BARS = 45
-# Kaufman ER above this = trend: do not bid/ask new inventory; flatten if in.
-HFT_MAX_ER = 0.42
-HFT_MIN_SPREAD_BPS = 2.5
-HFT_MAX_SPREAD_BPS = 55.0
-# Flatten inventory if the other side has not completed within this (scaled by vol).
-HFT_INVENTORY_TIMEOUT_S = 28.0
-# Mid outside the lookback box by this many bps → flatten (no leftover bag).
-HFT_BOX_BREAK_BPS = 10.0
-HFT_RESCORE_SECONDS = 180.0
-HFT_UNIVERSE_REFRESH_SECONDS = 900.0
-HFT_COOLDOWN_SECONDS = 120.0
+# Kaufman ER above this = trend: do not add; flatten if in.
+HFT_MAX_ER = 0.32
+# 0.1% spread = 10bps; maker ~0.014%/fill. Require enough width to cover a round-trip.
+HFT_MIN_SPREAD_BPS = 6.0
+# 3x books often sit near 10bps and can print much wider; skip only empty/absurd books.
+HFT_MAX_SPREAD_BPS = 180.0
+# Flatten leftover fast — these books move in seconds.
+HFT_INVENTORY_TIMEOUT_S = 8.0
+HFT_BOX_BREAK_BPS = 5.0
+# Skip names whose 45m range exceeds this (still allow typical 3x swings).
+HFT_MAX_RANGE_BPS = 900.0
+HFT_RESCORE_SECONDS = 90.0
+HFT_UNIVERSE_REFRESH_SECONDS = 600.0
+HFT_COOLDOWN_SECONDS = 30.0
+HFT_MAX_CANDIDATES = 8
 
 
 def hft_pingpong_enabled() -> bool:
@@ -118,12 +129,13 @@ TOP_MOVER_COUNT = 14
 # 0 = off. Movers especially need this — tiny HIP-3 books can print huge 24h %.
 # 1_000_000 ≈ $1M/day. Raise if you still see thin names; lower to include more xyz.
 MIN_DAY_NOTIONAL_USD = 1_000_000
-# Skip markets whose exchange max leverage is below this (e.g. 3x/5x memes).
-# 0 = no filter. 10 = only pairs with maxLev ≥ 10, then take top N among those.
-MIN_MAX_LEVERAGE = 3
+# Skip markets whose exchange max leverage is below this.
+# 1 = include every listed perp (3x memes through high-lev majors).
+# HFT then applies HFT_MAX_MAX_LEVERAGE on top; EMA/MTF use this scan as-is.
+MIN_MAX_LEVERAGE = 1
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
-# 0 = no ceiling. 20 = only pairs with maxLev ≤ 20 (after the min filter).
-MAX_MAX_LEVERAGE = 20
+# 0 = no ceiling. Ping-pong's ≤3x cut is HFT_MAX_MAX_LEVERAGE, not this.
+MAX_MAX_LEVERAGE = 0
 # Which books to scan (volume or 24h movers). Same filter in EMA-dev and MTF.
 #   "native"   = Hyperliquid main perps only (BTC, ETH, …). No HIP-3.
 #                Drops xyz: / para: / 10x: / other builder-dex prefixes.
