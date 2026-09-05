@@ -57,7 +57,7 @@ EMA_DEV_MAX_POSITION_HOURS = 3.0
 # EMA-dev and MTF code stay in the repo; this flag just selects the live path.
 # When on, ema_dev_strategy_enabled() is forced off (no EMA entries).
 # One pair, post-only quotes, flatten on trend/box-break/inventory timeout.
-USE_HFT_PINGPONG = True
+USE_HFT_PINGPONG = False
 HFT_POLL_SECONDS = 4.0
 # One clip as % of equity (maker add). Legacy/large bags only reduce, never add.
 HFT_CLIP_EQUITY_PCT = 2.5
