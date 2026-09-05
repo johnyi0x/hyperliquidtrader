@@ -220,8 +220,8 @@ def chop_reject_reason(
         return f"rng={s.range_bps:.0f}b>{max_range_bps:.0f}"
     if s.atr_bps < 4.0:
         return f"atr={s.atr_bps:.1f}b"
-    if s.atr_bps > 32.0:
-        return f"atr={s.atr_bps:.0f}b>32"
+    if s.atr_bps > 22.0:
+        return f"atr={s.atr_bps:.0f}b>22"
     if s.up_frac < 0.28 or s.up_frac > 0.72:
         return f"one-way={s.up_frac:.0%}"
     return None
@@ -384,24 +384,27 @@ def decide(
             None, "spread_tight", False, False, False, False, timeout, vs, "spread tight"
         )
 
+    # Flat quotes: cancel even if already resting. Holding through a walk to
+    # the box edge is how STRK/HEMI got filled into a dump this session.
+    del holding_quotes
     trending = bool(chop and (chop.er > max_er or chop.burst))
-    if (not in_pos) and (not holding_quotes) and trending:
+    if (not in_pos) and trending:
         return HftDecision(
             None, "trend", False, False, False, False, timeout, vs, "trend pause"
         )
-    if (not in_pos) and (not holding_quotes) and last_bar >= max(18.0, 2.0 * book.spread_bps):
+    if (not in_pos) and last_bar >= max(18.0, 2.0 * book.spread_bps):
         return HftDecision(
             None, "whip_bar", False, False, False, False, timeout, vs, "whip pause"
         )
-    if (not in_pos) and (not holding_quotes) and atr >= 32.0:
+    if (not in_pos) and atr >= 22.0:
         return HftDecision(
             None, "atr_spike", False, False, False, False, timeout, vs, "atr spike"
         )
-    if (not in_pos) and (not holding_quotes) and (loc < 0.22 or loc > 0.78):
+    if (not in_pos) and (loc < 0.35 or loc > 0.65):
         return HftDecision(
             None, "edge", False, False, False, False, timeout, vs, "edge of box"
         )
-    if (not in_pos) and (not holding_quotes) and abs(book.imbalance) > 0.88:
+    if (not in_pos) and abs(book.imbalance) > 0.70:
         return HftDecision(
             None, "imbalance", False, False, False, False, timeout, vs, "one-sided book"
         )
@@ -438,7 +441,8 @@ def decide(
 def quote_px_ok(existing_px: float, target_px: float, tick: float, mid: float) -> bool:
     if existing_px <= 0 or target_px <= 0:
         return False
-    tol = max(tick * 1.1, mid * 4.0e-4)
+    # Stay in queue. Replacing every tick makes us last-in on the toxic print.
+    tol = max(tick * 2.6, mid * 8.0e-4)
     return abs(existing_px - target_px) <= tol
 
 

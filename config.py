@@ -71,8 +71,8 @@ HFT_SCAN_COUNT = 16
 HFT_LOOKBACK_BARS = 45
 # Kaufman ER above this = trend: do not add; flatten if in.
 HFT_MAX_ER = 0.32
-# 2 * 0.014% maker ≈ 2.8bps round-trip. Live 3x books often sit at 1–5bps.
-HFT_MIN_SPREAD_BPS = 2.8
+# Skip 1-tick books (~3.5bps on STRK). Those fill the running side, then cover loses.
+HFT_MIN_SPREAD_BPS = 4.0
 # 0.16% = 16bps. Wider than that is a gap / runaway book, not a ping-pong.
 HFT_MAX_SPREAD_BPS = 16.0
 # Wait for the other maker side. Do not market-dump a clip on this clock.
