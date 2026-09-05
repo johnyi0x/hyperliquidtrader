@@ -67,14 +67,15 @@ HFT_MAX_LEVERAGE = 3
 # HFT-only: drop markets whose exchange maxLev is ABOVE this.
 # 3 = only quote pairs whose maximum leverage is ≤ 3. Does not change EMA/MTF.
 HFT_MAX_MAX_LEVERAGE = 3
-# When HFT is on, scan at least this many movers/volume names before the ≤3x cut
-# so the watch list is not empty after dropping 10x/20x leaders.
-HFT_SCAN_COUNT = 40
+# When HFT is on, mover/volume discover uses HFT_MAX_MAX_LEVERAGE as the ceiling,
+# then keeps this many names. 12 is enough to pick a book without burning IP weight.
+HFT_SCAN_COUNT = 12
 HFT_LOOKBACK_BARS = 45
 # Kaufman ER above this = trend: do not add; flatten if in.
 HFT_MAX_ER = 0.32
-# 0.1% spread = 10bps; maker ~0.014%/fill. Require enough width to cover a round-trip.
-HFT_MIN_SPREAD_BPS = 6.0
+# 2 * 0.014% maker ≈ 2.8bps round-trip. Live 3x books often sit at 1–5bps;
+# requiring 6bps meant the bot armed then immediately paused (never rested).
+HFT_MIN_SPREAD_BPS = 2.8
 # 3x books often sit near 10bps and can print much wider; skip only empty/absurd books.
 HFT_MAX_SPREAD_BPS = 180.0
 # Flatten leftover fast — these books move in seconds.

@@ -196,6 +196,33 @@ def chop_from_candles(coin: str, candles: list[dict], lookback: int) -> ChopSnap
     )
 
 
+def chop_reject_reason(
+    s: ChopSnap,
+    *,
+    max_er: float,
+    max_range_bps: float,
+    skip_coin: str | None = None,
+    skip_until: float = 0.0,
+    now: float = 0.0,
+) -> str | None:
+    """Why this chop snapshot is not quotable, or None if it is eligible."""
+    if skip_coin and s.coin == skip_coin and now < skip_until:
+        return "cooldown"
+    if s.er > max_er + 1e-12:
+        return f"er={s.er:.2f}>{max_er:.2f}"
+    if s.burst:
+        return f"burst last={s.last_bar_bps:.0f}b"
+    if s.range_bps < 10.0:
+        return f"rng={s.range_bps:.0f}b<10"
+    if s.range_bps > max_range_bps:
+        return f"rng={s.range_bps:.0f}b>{max_range_bps:.0f}"
+    if s.atr_bps < 4.0:
+        return f"atr={s.atr_bps:.1f}b"
+    if s.up_frac < 0.22 or s.up_frac > 0.78:
+        return f"one-way={s.up_frac:.0%}"
+    return None
+
+
 def rank_chop(
     snaps: list[ChopSnap],
     *,
@@ -207,17 +234,14 @@ def rank_chop(
 ) -> list[ChopSnap]:
     eligible: list[ChopSnap] = []
     for s in snaps:
-        if skip_coin and s.coin == skip_coin and now < skip_until:
-            continue
-        if s.er > max_er + 1e-12:
-            continue
-        if s.burst:
-            continue
-        if s.range_bps < 10.0 or s.range_bps > max_range_bps:
-            continue
-        if s.atr_bps < 4.0:
-            continue
-        if s.up_frac < 0.22 or s.up_frac > 0.78:
+        if chop_reject_reason(
+            s,
+            max_er=max_er,
+            max_range_bps=max_range_bps,
+            skip_coin=skip_coin,
+            skip_until=skip_until,
+            now=now,
+        ):
             continue
         eligible.append(s)
     eligible.sort(key=lambda s: (-s.score, s.coin))
@@ -308,6 +332,7 @@ def decide(
     base_timeout_s: float,
     clip_sz: float,
     fav_px: float = 0.0,
+    holding_quotes: bool = False,
 ) -> HftDecision:
     del clip_sz
     vs = vol_scale(chop.atr_bps if chop else 16.0)
@@ -326,7 +351,9 @@ def decide(
             None, "spread_wide", False, False, False, False, timeout, vs, "spread wide"
         )
 
-    if (not in_pos) and book.spread_bps + 1e-12 < min_spread_bps:
+    if (not in_pos) and book.spread_bps + 1e-12 < (
+        min_spread_bps * 0.72 if holding_quotes else min_spread_bps
+    ):
         return HftDecision(
             None, "spread_tight", False, False, False, False, timeout, vs, "spread tight"
         )
