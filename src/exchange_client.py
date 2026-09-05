@@ -529,7 +529,7 @@ class HyperliquidClient:
         fill-in so a native-active client still sees xyz:NVDA.
         """
         tagged: list[tuple[str, dict[str, Any]]] = []
-        seen_dexes: set[str] = set()
+        tagged_dexes: set[str] = set()
         try:
             raw = self.info.post(
                 "/info",
@@ -541,12 +541,30 @@ class HyperliquidClient:
             )
             for dex, state in iter_clearinghouse_states(raw):
                 tagged.append((dex, state))
-                seen_dexes.add(dex)
+                tagged_dexes.add(dex)
         except Exception as exc:
             self.logger.debug("ALL_DEXES clearinghouseState failed: %s", exc)
 
+        def _dex_has_open_size(dex: str) -> bool:
+            for tagged_dex, state in tagged:
+                if tagged_dex != dex:
+                    continue
+                for ap in state.get("assetPositions", []):
+                    pos = ap.get("position", ap)
+                    try:
+                        if abs(float(pos.get("szi", 0) or 0)) > 1e-12:
+                            return True
+                    except (TypeError, ValueError):
+                        continue
+            return False
+
+        # ALL_DEXES can return an empty native book while a clip is still open.
+        # Always re-query native + the active dex when they listed zero size.
+        active = self.perp_dex or ""
         for dex in self._position_dexes_to_query():
-            if dex in seen_dexes:
+            if _dex_has_open_size(dex):
+                continue
+            if dex in tagged_dexes and dex not in ("", active):
                 continue
             try:
                 raw = self.info.user_state(self.address, dex=dex)
@@ -556,10 +574,10 @@ class HyperliquidClient:
             extra = iter_clearinghouse_states(raw, default_dex=dex)
             if extra:
                 tagged.extend(extra)
-                seen_dexes.add(dex)
+                tagged_dexes.add(dex)
             elif isinstance(raw, dict) and "assetPositions" in raw:
                 tagged.append((dex, raw))
-                seen_dexes.add(dex)
+                tagged_dexes.add(dex)
         return tagged
 
     def _iter_clearinghouse_states(self) -> list[dict[str, Any]]:

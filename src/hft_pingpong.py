@@ -58,6 +58,7 @@ class HftState:
     cleared_legacy: bool = False
     pause_until: float = 0.0
     fav_px: float = 0.0  # best mid in our favor since fill (give-back flatten)
+    flat_streak: int = 0  # consecutive empty position polls after a fill
 
 
 @dataclass(frozen=True)
@@ -363,6 +364,11 @@ def decide(
             None, None, True, False, True, False, timeout, vs, "reduce short"
         )
 
+    if (not in_pos) and last_fill_at > 0:
+        return HftDecision(
+            None, None, False, False, False, False, timeout, vs, "wait flat"
+        )
+
     if in_pos and book.spread_bps > max_spread_bps:
         return _reduce()
 
@@ -462,6 +468,7 @@ class HftStore:
                 cleared_legacy=bool(raw.get("cleared_legacy", False)),
                 pause_until=float(raw.get("pause_until", 0) or 0),
                 fav_px=float(raw.get("fav_px", 0) or 0),
+                flat_streak=int(raw.get("flat_streak", 0) or 0),
             )
         except (KeyError, TypeError, ValueError):
             self.state = None
@@ -508,6 +515,7 @@ class HftStore:
         if is_buy is not None:
             self.state.last_fill_buy = bool(is_buy)
         self.state.fav_px = 0.0
+        self.state.flat_streak = 0
         self._save()
 
     def mark_fav(self, mid: float, side: str) -> None:
@@ -527,6 +535,22 @@ class HftStore:
             return
         self.state.last_fill_at = 0.0
         self.state.fav_px = 0.0
+        self.state.flat_streak = 0
+        self._save()
+
+    def bump_flat(self) -> int:
+        if self.state is None:
+            return 0
+        self.state.flat_streak = int(self.state.flat_streak or 0) + 1
+        self._save()
+        return self.state.flat_streak
+
+    def reset_flat_streak(self) -> None:
+        if self.state is None:
+            return
+        if int(self.state.flat_streak or 0) == 0:
+            return
+        self.state.flat_streak = 0
         self._save()
 
     def mark_scored(self, now: float) -> None:
