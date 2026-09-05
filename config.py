@@ -73,14 +73,13 @@ HFT_SCAN_COUNT = 12
 HFT_LOOKBACK_BARS = 45
 # Kaufman ER above this = trend: do not add; flatten if in.
 HFT_MAX_ER = 0.32
-# 2 * 0.014% maker ≈ 2.8bps round-trip. Live 3x books often sit at 1–5bps;
-# requiring 6bps meant the bot armed then immediately paused (never rested).
+# 2 * 0.014% maker ≈ 2.8bps round-trip. Live 3x books often sit at 1–5bps.
 HFT_MIN_SPREAD_BPS = 2.8
-# 3x books often sit near 10bps and can print much wider; skip only empty/absurd books.
-HFT_MAX_SPREAD_BPS = 180.0
-# Flatten leftover fast — these books move in seconds.
-HFT_INVENTORY_TIMEOUT_S = 8.0
-HFT_BOX_BREAK_BPS = 5.0
+# 0.16% = 16bps. Wider than that is a gap / runaway book, not a ping-pong.
+HFT_MAX_SPREAD_BPS = 16.0
+# Wait for the other maker side. Market flatten only on a real stop, not this clock.
+HFT_INVENTORY_TIMEOUT_S = 40.0
+HFT_BOX_BREAK_BPS = 8.0
 # Skip names whose 45m range exceeds this (still allow typical 3x swings).
 HFT_MAX_RANGE_BPS = 900.0
 HFT_RESCORE_SECONDS = 90.0

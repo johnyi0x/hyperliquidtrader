@@ -71,7 +71,6 @@ from src.hft_pingpong import (
 )
 from src.pricing import (
     ceil_size,
-    limit_would_take,
     maker_limit_price,
     mid_post_only_price,
     round_size,
@@ -794,9 +793,9 @@ def main() -> None:
             int(getattr(cfg, "HFT_LOOKBACK_BARS", 45) or 45),
             float(getattr(cfg, "HFT_MAX_ER", 0.32) or 0.32),
             float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 2.8) or 2.8),
-            float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 180) or 180),
-            float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 8) or 8),
-            float(getattr(cfg, "HFT_BOX_BREAK_BPS", 5) or 5),
+            float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 16) or 16),
+            float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 40) or 40),
+            float(getattr(cfg, "HFT_BOX_BREAK_BPS", 8) or 8),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 1) or 1),
             universe_max_lev or "off",
             int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 3) or 3),
@@ -2139,7 +2138,7 @@ def main() -> None:
         if size > 1e-12:
             client.cancel_entry_orders_for_coin()
             exit_usd = (book.ask_sz if side == "long" else book.bid_sz) * book.mid
-            if exit_usd < float(cfg.MIN_ORDER_NOTIONAL_USD) * 0.6:
+            if exit_usd < float(cfg.MIN_ORDER_NOTIONAL_USD) * 0.6 and hold >= 15.0 and pnl_bps < 0:
                 logger.info("HFT flatten %s thin_exit | %s", entry.api_coin, _ctx())
                 hft_flatten(entry, "thin_exit")
                 return "flatten"
@@ -2153,10 +2152,10 @@ def main() -> None:
             last_fill_at=last_fill,
             now=now,
             min_spread_bps=float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 2.8) or 2.8),
-            max_spread_bps=float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 180) or 180),
+            max_spread_bps=float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 16) or 16),
             max_er=float(getattr(cfg, "HFT_MAX_ER", 0.32) or 0.32),
-            box_break_bps=float(getattr(cfg, "HFT_BOX_BREAK_BPS", 5) or 5),
-            base_timeout_s=float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 8) or 8),
+            box_break_bps=float(getattr(cfg, "HFT_BOX_BREAK_BPS", 8) or 8),
+            base_timeout_s=float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 40) or 40),
             clip_sz=clip,
             fav_px=float(st.fav_px if st else 0) or 0.0,
             holding_quotes=holding,
@@ -2184,22 +2183,6 @@ def main() -> None:
             return "paused"
         if clip <= 0 and not (position is not None and size > 1e-12):
             return "idle"
-        try:
-            l2 = client.l2_book()
-            if decision.quote_ask and position is not None:
-                tpx = _hft_target_px(book, False, aggressive=True)
-                if limit_would_take(l2, False, tpx):
-                    logger.info("HFT flatten %s would_take_ask | %s", entry.api_coin, _ctx())
-                    hft_flatten(entry, "would_take_ask")
-                    return "flatten"
-            if decision.quote_bid and position is not None:
-                tpx = _hft_target_px(book, True, aggressive=True)
-                if limit_would_take(l2, True, tpx):
-                    logger.info("HFT flatten %s would_take_bid | %s", entry.api_coin, _ctx())
-                    hft_flatten(entry, "would_take_bid")
-                    return "flatten"
-        except Exception:
-            pass
         if st is None or st.coin != entry.api_coin:
             hft_store.set_coin(entry.api_coin, now=now)
             _hft_arm(entry, in_pos=size > 1e-12)
@@ -2335,7 +2318,7 @@ def main() -> None:
         rescore_s = float(getattr(cfg, 'HFT_RESCORE_SECONDS', 90) or 90)
         max_er = float(getattr(cfg, 'HFT_MAX_ER', 0.32) or 0.32)
         min_sp = float(getattr(cfg, 'HFT_MIN_SPREAD_BPS', 2.8) or 2.8)
-        max_sp = float(getattr(cfg, 'HFT_MAX_SPREAD_BPS', 180) or 180)
+        max_sp = float(getattr(cfg, 'HFT_MAX_SPREAD_BPS', 16) or 16)
         max_range = float(getattr(cfg, 'HFT_MAX_RANGE_BPS', 900) or 900)
         max_n = max(1, int(getattr(cfg, 'HFT_MAX_CANDIDATES', 8) or 8))
         prev = hft_store.state
@@ -2400,7 +2383,7 @@ def main() -> None:
                     continue
                 ready.append((book.spread_bps, snap, entry))
                 book_bits.append(f'{snap.coin}:ok spr={book.spread_bps:.1f}b')
-            ready.sort(key=lambda row: -row[0])
+            ready.sort(key=lambda row: abs(row[0] - 6.0))
             for _spr, snap, entry in ready:
                 outcome = run_hft_coin(entry, None)
                 if outcome in ('quoted', 'flatten'):

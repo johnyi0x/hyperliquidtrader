@@ -334,13 +334,31 @@ def decide(
     fav_px: float = 0.0,
     holding_quotes: bool = False,
 ) -> HftDecision:
-    del clip_sz
+    """
+    Flat: two-sided maker quotes on a calm, fee-wide book.
+    In a clip: only reduce-only the other side. Market flatten is a last resort
+    (hard stop / stale loser). Immediate taker exits after a maker fill lose
+    taker fee (0.045%) plus spread and turn MM into a bleed.
+    """
+    del clip_sz, box_break_bps, fav_px
     vs = vol_scale(chop.atr_bps if chop else 16.0)
-    timeout = max(4.0, min(float(base_timeout_s), float(base_timeout_s) / vs))
+    timeout = max(20.0, min(60.0, float(base_timeout_s)))
     in_pos = bool(side) and size > 1e-12
     hold = (now - last_fill_at) if last_fill_at > 0 else 0.0
     last_bar = float(chop.last_bar_bps if chop else 0.0)
     atr = float(chop.atr_bps if chop else 16.0)
+    loc = 0.5
+    if chop is not None and chop.box_high > chop.box_low:
+        loc = (book.mid - chop.box_low) / (chop.box_high - chop.box_low)
+
+    def _reduce() -> HftDecision:
+        if side == "long":
+            return HftDecision(
+                None, None, False, True, False, True, timeout, vs, "reduce long"
+            )
+        return HftDecision(
+            None, None, True, False, True, False, timeout, vs, "reduce short"
+        )
 
     if book.spread_bps > max_spread_bps:
         if in_pos:
@@ -359,52 +377,45 @@ def decide(
         )
 
     trending = bool(chop and (chop.er > max_er or chop.burst))
-    if trending:
-        if in_pos:
-            return HftDecision(
-                "trend", None, False, False, False, False, timeout, vs, "trend flatten"
-            )
+    if (not in_pos) and trending:
         return HftDecision(
             None, "trend", False, False, False, False, timeout, vs, "trend pause"
         )
-
-    # Last 1m bar already moved ~a spread: leftover will become a bag on 3x tape.
-    if in_pos and last_bar >= max(10.0, 1.05 * book.spread_bps):
-        return HftDecision(
-            "whip", None, False, False, False, False, timeout, vs, "whip bar"
-        )
-    if (not in_pos) and last_bar >= max(20.0, 1.8 * book.spread_bps):
+    if (not in_pos) and last_bar >= max(18.0, 2.0 * book.spread_bps):
         return HftDecision(
             None, "whip_bar", False, False, False, False, timeout, vs, "whip pause"
         )
-    if (not in_pos) and atr >= 90.0:
+    if (not in_pos) and atr >= 40.0:
         return HftDecision(
             None, "atr_spike", False, False, False, False, timeout, vs, "atr spike"
         )
+    if (not in_pos) and (loc < 0.22 or loc > 0.78):
+        return HftDecision(
+            None, "edge", False, False, False, False, timeout, vs, "edge of box"
+        )
+    if (not in_pos) and abs(book.imbalance) > 0.80:
+        return HftDecision(
+            None, "imbalance", False, False, False, False, timeout, vs, "one-sided book"
+        )
 
-    if chop is not None and chop.box_high > chop.box_low:
-        span = chop.box_high - chop.box_low
-        pad = book.mid * (box_break_bps / 10_000.0)
-        if book.mid > chop.box_high + pad or book.mid < chop.box_low - pad:
-            if in_pos:
-                return HftDecision(
-                    "box_break", None, False, False, False, False, timeout, vs, "box break"
-                )
-            return HftDecision(
-                None, "box_break", False, False, False, False, timeout, vs, "outside box"
-            )
-        loc = (book.mid - chop.box_low) / span
-    else:
-        loc = 0.5
+    pnl_bps = 0.0
+    if in_pos and entry_px > 0:
+        if side == "long":
+            pnl_bps = (book.mid - entry_px) / entry_px * 10_000.0
+        else:
+            pnl_bps = (entry_px - book.mid) / entry_px * 10_000.0
 
-    if in_pos and chop is not None and chop.box_high_fast > chop.box_low_fast:
-        pad_f = book.mid * (max(3.0, box_break_bps) / 10_000.0)
-        if book.mid > chop.box_high_fast + pad_f or book.mid < chop.box_low_fast - pad_f:
-            return HftDecision(
-                "fast_box", None, False, False, False, False, timeout, vs, "fast box"
-            )
-
-    if in_pos and hold >= timeout:
+    # Hard stop only. Taker fee is 4.5bps — do not market-out for a 1–5bps dip.
+    stop_bps = 12.0
+    if in_pos and pnl_bps <= -stop_bps:
+        return HftDecision(
+            "inv_stop", None, False, False, False, False, timeout, vs, "inv stop"
+        )
+    if in_pos and trending and pnl_bps < 0 and hold >= 8.0:
+        return HftDecision(
+            "trend", None, False, False, False, False, timeout, vs, "trend loser"
+        )
+    if in_pos and hold >= timeout and pnl_bps < 0:
         return HftDecision(
             "inventory_timeout",
             None,
@@ -414,91 +425,21 @@ def decide(
             False,
             timeout,
             vs,
-            "timeout",
+            "timeout loser",
         )
-
-    if in_pos and entry_px > 0:
-        if side == "long":
-            pnl_bps = (book.mid - entry_px) / entry_px * 10_000.0
-        else:
-            pnl_bps = (entry_px - book.mid) / entry_px * 10_000.0
-        # Cap the stop in bps so a 50–100bps meme spread cannot hold a bag.
-        stop_bps = min(14.0, max(7.0, 0.55 * book.spread_bps, 0.16 * atr))
-        if pnl_bps <= -stop_bps:
-            return HftDecision(
-                "inv_stop", None, False, False, False, False, timeout, vs, "inv stop"
-            )
-        if pnl_bps <= -4.0 and hold >= 1.5:
-            return HftDecision(
-                "inv_tick", None, False, False, False, False, timeout, vs, "adverse tick"
-            )
-        if pnl_bps < 0 and hold >= timeout * 0.22:
-            return HftDecision(
-                "inv_bleed", None, False, False, False, False, timeout, vs, "bleed"
-            )
-        give_need = min(8.0, max(4.0, 0.55 * book.spread_bps))
-        if fav_px > 0:
-            if side == "long" and fav_px > entry_px:
-                give_bps = (fav_px - book.mid) / fav_px * 10_000.0
-                if give_bps >= give_need:
-                    return HftDecision(
-                        "giveback", None, False, False, False, False, timeout, vs, "giveback"
-                    )
-            if side == "short" and fav_px < entry_px:
-                give_bps = (book.mid - fav_px) / fav_px * 10_000.0
-                if give_bps >= give_need:
-                    return HftDecision(
-                        "giveback", None, False, False, False, False, timeout, vs, "giveback"
-                    )
-        take_bps = max(min(book.spread_bps * 0.55, 8.0), 2.0)
-        if pnl_bps >= take_bps:
-            if side == "long":
-                return HftDecision(
-                    None, None, False, True, False, True, timeout, vs, "exit long"
-                )
-            return HftDecision(
-                None, None, True, False, True, False, timeout, vs, "exit short"
-            )
-        # Underwater leftover: do not rest a maker and hope. Flatten.
-        if pnl_bps < 1.0:
-            return HftDecision(
-                "no_bag", None, False, False, False, False, timeout, vs, "no leftover bag"
-            )
-
     if in_pos:
-        if side == "long":
-            return HftDecision(
-                None, None, False, True, False, True, timeout, vs, "reduce long"
-            )
-        return HftDecision(
-            None, None, True, False, True, False, timeout, vs, "reduce short"
-        )
+        return _reduce()
 
-    quote_bid = loc < 0.88 and book.imbalance < 0.55
-    quote_ask = loc > 0.12 and book.imbalance > -0.55
-    if loc > 0.85:
-        quote_bid = False
-    if loc < 0.15:
-        quote_ask = False
-    if chop is not None and chop.atr_bps >= 40.0:
-        if loc > 0.52:
-            quote_bid = False
-        if loc < 0.48:
-            quote_ask = False
-    if not quote_bid and not quote_ask:
-        return HftDecision(
-            None, "edge", False, False, False, False, timeout, vs, "no safe side"
-        )
     return HftDecision(
         None,
         None,
-        quote_bid,
-        quote_ask,
+        True,
+        True,
         False,
         False,
         timeout,
         vs,
-        "two-sided" if quote_bid and quote_ask else "one-sided",
+        "two-sided",
     )
 
 
