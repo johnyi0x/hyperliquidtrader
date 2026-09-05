@@ -11,6 +11,7 @@ from __future__ import annotations
 # =============================================================================
 # False = current MTF strategy (tune / backtest, multi-pair).
 # True  = EMA-deviation strategy (no tune). Same PAIR_SELECTION_MODE either way.
+# If USE_HFT_PINGPONG is True, that live path wins and EMA-dev is forced off.
 # This file only -- not profit-meta-follower/config.py.
 USE_EMA_DEV_STRATEGY = True
 
@@ -49,9 +50,45 @@ EMA_DEV_RANK_CROSS_AGE = True
 # Clock is the original fill time (survives restart). Does not change MTF MAX_POSITION_HOURS.
 EMA_DEV_MAX_POSITION_HOURS = 3.0
 
+# =============================================================================
+# HFT PING-PONG  (maker liquidity, Railway-safe)
+# =============================================================================
+# True = live/paper uses ping-pong MM instead of EMA-dev or MTF.
+# EMA-dev and MTF code stay in the repo; this flag just selects the live path.
+# When on, ema_dev_strategy_enabled() is forced off (no EMA entries).
+# One pair, post-only quotes, flatten on trend/box-break/inventory timeout.
+USE_HFT_PINGPONG = True
+HFT_POLL_SECONDS = 4.0
+# One clip as % of equity (maker add). Legacy/large bags only reduce, never add.
+HFT_CLIP_EQUITY_PCT = 2.5
+# Cap leverage used for clip sizing (watchlist lev is still set on the market).
+HFT_MAX_LEVERAGE = 5
+HFT_LOOKBACK_BARS = 45
+# Kaufman ER above this = trend: do not bid/ask new inventory; flatten if in.
+HFT_MAX_ER = 0.42
+HFT_MIN_SPREAD_BPS = 2.5
+HFT_MAX_SPREAD_BPS = 55.0
+# Flatten inventory if the other side has not completed within this (scaled by vol).
+HFT_INVENTORY_TIMEOUT_S = 28.0
+# Mid outside the lookback box by this many bps → flatten (no leftover bag).
+HFT_BOX_BREAK_BPS = 10.0
+HFT_RESCORE_SECONDS = 180.0
+HFT_UNIVERSE_REFRESH_SECONDS = 900.0
+HFT_COOLDOWN_SECONDS = 120.0
+
+
+def hft_pingpong_enabled() -> bool:
+    """True when live/paper should run maker ping-pong instead of EMA-dev/MTF."""
+    try:
+        return bool(USE_HFT_PINGPONG)
+    except NameError:
+        return False
+
 
 def ema_dev_strategy_enabled() -> bool:
     """True when live/paper should use the EMA-deviation path instead of MTF."""
+    if hft_pingpong_enabled():
+        return False
     try:
         return bool(USE_EMA_DEV_STRATEGY)
     except NameError:

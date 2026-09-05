@@ -563,11 +563,17 @@ class PaperHyperliquidClient(HyperliquidClient):
     def _reduce_only_triggers(self) -> list[dict]:
         return []
 
-    def sweep_orphan_orders(self) -> int:
+    def sweep_orphan_orders(self, keep_coins: set[str] | None = None) -> int:
         return 0
 
     def cancel_all_orders_for_coin(self) -> None:
         return
+
+    def cancel_oid(self, oid: int | None) -> None:
+        return
+
+    def working_limit_quotes(self) -> tuple[dict | None, dict | None]:
+        return None, None
 
     def cancel_all_orders_for_coin_named(self, coin: str) -> None:
         return

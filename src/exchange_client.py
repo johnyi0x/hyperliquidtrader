@@ -944,7 +944,7 @@ class HyperliquidClient:
             self.coin = saved_coin
             self.perp_dex = saved_dex
 
-    def sweep_orphan_orders(self) -> int:
+    def sweep_orphan_orders(self, keep_coins: set[str] | None = None) -> int:
         """Cancel open orders on coins that have no position (stale TP/SL)."""
         ok, open_positions = self.fetch_open_positions(force=True)
         if not ok:
@@ -953,6 +953,8 @@ class HyperliquidClient:
             )
             return 0
         positions = {coin for coin, _pos in open_positions}
+        if keep_coins:
+            positions |= {str(c) for c in keep_coins if c}
         cancelled = 0
         for order in self._all_frontend_orders():
             coin = order.get("coin")
@@ -1643,3 +1645,41 @@ class HyperliquidClient:
         self._l2_cache = book
         self._l2_monotonic = now
         return book
+
+    def invalidate_l2(self) -> None:
+        self._l2_cache = None
+
+    def cancel_oid(self, oid: int | None) -> None:
+        if oid is None:
+            return
+        try:
+            self.exchange.cancel(self.coin, int(oid))
+        except Exception as exc:
+            self.logger.debug("Cancel oid=%s: %s", oid, exc)
+        self.invalidate_user_state()
+
+    def working_limit_quotes(self) -> tuple[dict | None, dict | None]:
+        """Highest bid and lowest ask among non-trigger working limits."""
+        bid: dict | None = None
+        ask: dict | None = None
+        for order in self._frontend_orders_for_coin():
+            if order.get("isTrigger"):
+                continue
+            side = str(order.get("side") or "").upper()
+            raw = order.get("limitPx") or order.get("px")
+            if raw is None:
+                continue
+            px = float(raw)
+            if px <= 0:
+                continue
+            is_buy = side in ("B", "BUY")
+            is_sell = side in ("A", "SELL")
+            if is_buy:
+                prev = float((bid or {}).get("limitPx") or (bid or {}).get("px") or 0)
+                if bid is None or px >= prev:
+                    bid = order
+            elif is_sell:
+                prev = float((ask or {}).get("limitPx") or (ask or {}).get("px") or 1e99)
+                if ask is None or px <= prev:
+                    ask = order
+        return bid, ask

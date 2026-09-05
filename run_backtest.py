@@ -34,6 +34,13 @@ def main() -> None:
     if sibling.exists():
         load_dotenv(sibling, override=False)
 
+    if getattr(cfg, "hft_pingpong_enabled", lambda: False)():
+        logger_early = setup_logger("hl-multi-backtest", PROJECT / "logs")
+        logger_early.info(
+            "USE_HFT_PINGPONG is on — this mode has no backtest/tune. "
+            "Run python bot_live.py instead."
+        )
+        return
     if getattr(cfg, "ema_dev_strategy_enabled", lambda: False)():
         logger_early = setup_logger("hl-multi-backtest", PROJECT / "logs")
         logger_early.info(
