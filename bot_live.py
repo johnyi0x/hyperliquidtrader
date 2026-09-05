@@ -73,6 +73,7 @@ from src.pricing import (
     ceil_size,
     maker_limit_price,
     mid_post_only_price,
+    round_price,
     round_size,
 )
 from src.market_resolver import parse_coin_input, sdk_perp_dexs_for_dexes
@@ -784,18 +785,19 @@ def main() -> None:
             )
     if hft_on:
         logger.info(
-            "HFT ping-pong ON | poll=%.0fs clip≤$%.0f notional lev≤%s lookback=%s "
-            "er≤%.2f spread=%.1f–%.1fbps timeout=%.0fs box_break=%.1fbps | "
-            "scan minLev≥%s maxLev≤%s | HFT maxLev≤%sx | EMA-dev and MTF live paths are off",
+            "HFT fade ON | one-sided bid<mid / ask>mid | poll=%.0fs clip≤$%.0f "
+            "lev≤%s er≤%.2f spread=%.1f–%.1fbps take=%.0fbps stop=%.0fbps "
+            "hold≤%.0fs | scan minLev≥%s maxLev≤%s | HFT maxLev≤%sx | "
+            "EMA-dev and MTF live paths are off",
             float(getattr(cfg, "HFT_POLL_SECONDS", 3) or 3),
             float(getattr(cfg, "HFT_CLIP_MAX_NOTIONAL_USD", 15) or 15),
             int(getattr(cfg, "HFT_MAX_LEVERAGE", 20) or 20),
-            int(getattr(cfg, "HFT_LOOKBACK_BARS", 45) or 45),
-            float(getattr(cfg, "HFT_MAX_ER", 0.32) or 0.32),
-            float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 2.8) or 2.8),
-            float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 16) or 16),
-            float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 40) or 40),
-            float(getattr(cfg, "HFT_BOX_BREAK_BPS", 8) or 8),
+            float(getattr(cfg, "HFT_MAX_ER", 0.45) or 0.45),
+            float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 0.8) or 0.8),
+            float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 25) or 25),
+            float(getattr(cfg, "HFT_TAKE_BPS", 10) or 10),
+            float(getattr(cfg, "HFT_STOP_BPS", 55) or 55),
+            float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 720) or 720),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 1) or 1),
             universe_max_lev or "off",
             int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 20) or 20),
@@ -2043,15 +2045,30 @@ def main() -> None:
         return True
 
     def hft_place_quote(
-        is_buy: bool, sz: float, reduce_only: bool, book, *, aggressive: bool = False
+        is_buy: bool,
+        sz: float,
+        reduce_only: bool,
+        book,
+        *,
+        aggressive: bool = False,
+        limit_px: float = 0.0,
     ) -> str:
         """Place one maker quote. Returns 'filled', 'resting', or 'fail'."""
         sz = round_size(sz, client.sz_decimals)
         if sz <= 0:
             return "fail"
+        tick = float(getattr(book, "tick", 0) or 0)
         for nudge in range(0, 6):
             try:
-                px = _hft_target_px(book, is_buy, nudge, aggressive=aggressive)
+                if limit_px > 0:
+                    px = limit_px + ((-nudge if is_buy else nudge) * tick)
+                    px = round_price(px, client.sz_decimals)
+                    if is_buy and book.ask > 0 and px + 1e-12 >= book.ask:
+                        px = round_price(book.ask - max(tick, 1e-12), client.sz_decimals)
+                    if (not is_buy) and book.bid > 0 and px - 1e-12 <= book.bid:
+                        px = round_price(book.bid + max(tick, 1e-12), client.sz_decimals)
+                else:
+                    px = _hft_target_px(book, is_buy, nudge, aggressive=aggressive)
             except Exception as exc:
                 logger.warning("HFT quote px: %s", exc)
                 return "fail"
@@ -2237,14 +2254,16 @@ def main() -> None:
             entry_px=entry_px,
             last_fill_at=last_fill,
             now=now,
-            min_spread_bps=float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 2.8) or 2.8),
-            max_spread_bps=float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 16) or 16),
-            max_er=float(getattr(cfg, "HFT_MAX_ER", 0.32) or 0.32),
+            min_spread_bps=float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 0.8) or 0.8),
+            max_spread_bps=float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 25) or 25),
+            max_er=float(getattr(cfg, "HFT_MAX_ER", 0.45) or 0.45),
             box_break_bps=float(getattr(cfg, "HFT_BOX_BREAK_BPS", 8) or 8),
-            base_timeout_s=float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 90) or 90),
+            base_timeout_s=float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 720) or 720),
             clip_sz=clip,
             fav_px=float(st.fav_px if st else 0) or 0.0,
             holding_quotes=holding,
+            take_bps=float(getattr(cfg, "HFT_TAKE_BPS", 10) or 10),
+            stop_bps=float(getattr(cfg, "HFT_STOP_BPS", 55) or 55),
         )
         if decision.flatten:
             logger.info(
@@ -2276,12 +2295,15 @@ def main() -> None:
         add_sz = clip
         exit_sz = size if (live is not None and size > 1e-12) else clip
 
-        def _keep(order, is_buy: bool, *, aggressive: bool) -> bool:
+        def _keep(order, is_buy: bool, *, aggressive: bool, target_px: float = 0.0) -> bool:
             if order is None:
                 return False
             raw = order.get("limitPx") or order.get("px")
             try:
-                tpx = _hft_target_px(book, is_buy, aggressive=aggressive)
+                if target_px > 0:
+                    tpx = target_px
+                else:
+                    tpx = _hft_target_px(book, is_buy, aggressive=aggressive)
             except Exception:
                 return False
             return quote_px_ok(float(raw or 0), tpx, book.tick, book.mid)
@@ -2289,8 +2311,10 @@ def main() -> None:
         placed = False
         bid_status = ""
         ask_status = ""
+        bid_px = decision.cover_px if decision.bid_reduce else 0.0
+        ask_px = decision.cover_px if decision.ask_reduce else 0.0
         if decision.quote_bid:
-            if not _keep(bid_o, True, aggressive=decision.bid_reduce):
+            if not _keep(bid_o, True, aggressive=False, target_px=bid_px):
                 if bid_o is not None:
                     client.cancel_oid(bid_o.get("oid"))
                 bid_status = hft_place_quote(
@@ -2298,7 +2322,8 @@ def main() -> None:
                     exit_sz if decision.bid_reduce else add_sz,
                     decision.bid_reduce,
                     book,
-                    aggressive=decision.bid_reduce,
+                    aggressive=False,
+                    limit_px=bid_px,
                 )
                 if bid_status != "fail":
                     placed = True
@@ -2308,12 +2333,9 @@ def main() -> None:
         if bid_status == "filled":
             if ask_o is not None:
                 client.cancel_oid(ask_o.get("oid"))
-            if not decision.bid_reduce:
-                hft_place_quote(False, add_sz, True, book, aggressive=True)
-                logger.info("HFT rest %s ask-red (cover buy) | %s", entry.api_coin, _ctx())
             return "quoted"
         if decision.quote_ask:
-            if not _keep(ask_o, False, aggressive=decision.ask_reduce):
+            if not _keep(ask_o, False, aggressive=False, target_px=ask_px):
                 if ask_o is not None:
                     client.cancel_oid(ask_o.get("oid"))
                 ask_status = hft_place_quote(
@@ -2321,7 +2343,8 @@ def main() -> None:
                     exit_sz if decision.ask_reduce else add_sz,
                     decision.ask_reduce,
                     book,
-                    aggressive=decision.ask_reduce,
+                    aggressive=False,
+                    limit_px=ask_px,
                 )
                 if ask_status != "fail":
                     placed = True
@@ -2330,20 +2353,19 @@ def main() -> None:
         if ask_status == "filled":
             if bid_o is not None:
                 client.cancel_oid(bid_o.get("oid"))
-            if not decision.ask_reduce:
-                hft_place_quote(True, add_sz, True, book, aggressive=True)
-                logger.info("HFT rest %s bid-red (cover sell) | %s", entry.api_coin, _ctx())
             return "quoted"
         if placed:
             sides = []
             if decision.quote_bid:
-                sides.append("bid" + ("-red" if decision.bid_reduce else ""))
+                sides.append("bid" + ("-tp" if decision.bid_reduce else "-fade"))
             if decision.quote_ask:
-                sides.append("ask" + ("-red" if decision.ask_reduce else ""))
+                sides.append("ask" + ("-tp" if decision.ask_reduce else "-fade"))
+            extra = f" {decision.note}" if decision.note else ""
             logger.info(
-                "HFT rest %s %s | %s",
+                "HFT rest %s %s%s | %s",
                 entry.api_coin,
                 "+".join(sides) or decision.note,
+                extra,
                 _ctx(),
             )
         return "quoted"
@@ -2413,10 +2435,10 @@ def main() -> None:
         now = time.time()
         by_coin = {e.api_coin: e for e in watch}
         rescore_s = float(getattr(cfg, 'HFT_RESCORE_SECONDS', 90) or 90)
-        max_er = float(getattr(cfg, 'HFT_MAX_ER', 0.32) or 0.32)
-        min_sp = float(getattr(cfg, 'HFT_MIN_SPREAD_BPS', 2.8) or 2.8)
-        max_sp = float(getattr(cfg, 'HFT_MAX_SPREAD_BPS', 16) or 16)
-        max_range = float(getattr(cfg, 'HFT_MAX_RANGE_BPS', 400) or 400)
+        max_er = float(getattr(cfg, 'HFT_MAX_ER', 0.45) or 0.45)
+        min_sp = float(getattr(cfg, 'HFT_MIN_SPREAD_BPS', 0.8) or 0.8)
+        max_sp = float(getattr(cfg, 'HFT_MAX_SPREAD_BPS', 25) or 25)
+        max_range = float(getattr(cfg, 'HFT_MAX_RANGE_BPS', 700) or 700)
         max_n = max(1, int(getattr(cfg, 'HFT_MAX_CANDIDATES', 8) or 8))
         prev = hft_store.state
         skip_coin = prev.last_exit_coin if prev else None
@@ -2478,10 +2500,13 @@ def main() -> None:
                 if clip <= 0:
                     book_bits.append(f'{snap.coin}:no-size')
                     continue
-                ready.append((book.spread_bps, snap, entry))
-                book_bits.append(f'{snap.coin}:ok spr={book.spread_bps:.1f}b')
-            ready.sort(key=lambda row: abs(row[0] - 6.0))
-            for _spr, snap, entry in ready:
+                loc = 0.5
+                if snap.box_high > snap.box_low:
+                    loc = (book.mid - snap.box_low) / (snap.box_high - snap.box_low)
+                ready.append((abs(loc - 0.5), book.spread_bps, snap, entry))
+                book_bits.append(f'{snap.coin}:ok spr={book.spread_bps:.1f}b loc={loc:.2f}')
+            ready.sort(key=lambda row: -row[0])
+            for _fade, _spr, snap, entry in ready:
                 outcome = run_hft_coin(entry, None)
                 if outcome in ('quoted', 'flatten'):
                     return True

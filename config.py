@@ -51,43 +51,38 @@ EMA_DEV_RANK_CROSS_AGE = True
 EMA_DEV_MAX_POSITION_HOURS = 3.0
 
 # =============================================================================
-# HFT PING-PONG  (maker liquidity, Railway-safe)
+# HFT FADE  (one-sided maker, Railway-safe)
 # =============================================================================
-# True = live/paper uses ping-pong MM instead of EMA-dev or MTF.
-# EMA-dev and MTF code stay in the repo; this flag just selects the live path.
-# When on, ema_dev_strategy_enabled() is forced off (no EMA entries).
-# One pair, post-only quotes, flatten on trend/box-break/inventory timeout.
+# True = live/paper uses maker fade instead of EMA-dev or MTF.
+# Two-sided ping-pong on a 3s poll gets picked off; this path buys dips / sells
+# rips in the box and rests a reduce-only take-profit.
 USE_HFT_PINGPONG = True
 HFT_POLL_SECONDS = 3.0
-# One clip: at least Hyperliquid min notional, never a large bag.
-# Small accounts use the exchange minimum (~$10). Bigger accounts still cap here.
 HFT_CLIP_MAX_NOTIONAL_USD = 15.0
-# Cap leverage used for clip sizing (≤ the pair's exchange max).
 HFT_MAX_LEVERAGE = 20
-# HFT-only: drop markets whose exchange maxLev is ABOVE this.
 HFT_MAX_MAX_LEVERAGE = 20
-# Discover this many names among maxLev ≤ HFT_MAX_MAX_LEVERAGE.
 HFT_SCAN_COUNT = 16
 HFT_LOOKBACK_BARS = 45
-# Kaufman ER above this = trend: do not add; flatten if in.
-HFT_MAX_ER = 0.32
-# Skip 1-tick books (~3.5bps on STRK). Those fill the running side, then cover loses.
-HFT_MIN_SPREAD_BPS = 4.0
-# 0.16% = 16bps. Wider than that is a gap / runaway book, not a ping-pong.
-HFT_MAX_SPREAD_BPS = 16.0
-# Wait for the other maker side. Do not market-dump a clip on this clock.
-HFT_INVENTORY_TIMEOUT_S = 90.0
+HFT_MAX_ER = 0.45
+# One-sided fade does not need a fee-wide two-sided spread.
+HFT_MIN_SPREAD_BPS = 0.8
+HFT_MAX_SPREAD_BPS = 25.0
+# Wait for the bounce. Do not dump a clip because 90s of noise.
+HFT_INVENTORY_TIMEOUT_S = 720.0
 HFT_BOX_BREAK_BPS = 8.0
-# Skip names whose 45m range exceeds this.
-HFT_MAX_RANGE_BPS = 400.0
-HFT_RESCORE_SECONDS = 120.0
+HFT_MAX_RANGE_BPS = 700.0
+HFT_RESCORE_SECONDS = 90.0
 HFT_UNIVERSE_REFRESH_SECONDS = 600.0
-HFT_COOLDOWN_SECONDS = 20.0
+HFT_COOLDOWN_SECONDS = 8.0
 HFT_MAX_CANDIDATES = 8
+# Maker round-trip is ~2.8bps. Rest the cover this far through the fill.
+HFT_TAKE_BPS = 10.0
+# 20bps was inside normal 10s noise on 3x names and always dumped.
+HFT_STOP_BPS = 55.0
 
 
 def hft_pingpong_enabled() -> bool:
-    """True when live/paper should run maker ping-pong instead of EMA-dev/MTF."""
+    """True when live/paper should run maker fade instead of EMA-dev/MTF."""
     try:
         return bool(USE_HFT_PINGPONG)
     except NameError:
