@@ -125,7 +125,7 @@ MIN_DAY_NOTIONAL_USD = 1_000_000
 # Skip markets whose exchange max leverage is below this.
 # 1 = include every listed perp (3x memes through high-lev majors).
 # HFT then applies HFT_MAX_MAX_LEVERAGE on top; EMA/MTF use this scan as-is.
-MIN_MAX_LEVERAGE = 1
+MIN_MAX_LEVERAGE = 10
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # Ping-pong's ≤20x cut is HFT_MAX_MAX_LEVERAGE, not this.
 MAX_MAX_LEVERAGE = 0
