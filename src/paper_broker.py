@@ -9,8 +9,8 @@ simulated:
 
   - a persisted cash balance (USD)
   - one or more open paper positions (same-side DCA on a coin still stacks)
-  - exchange-style market fills at the live mid price
-  - simulated exchange TP/SL that auto-closes when the live mark crosses a level
+  - exchange-style market fills at the live ask (buys) / bid (sells)
+  - simulated exchange TP/SL that market-close when the live mark crosses a level
   - taker fees on entry and exit (mirrors the backtest: 0.045% x2 by default)
 
 State is persisted so a restart behaves like reconnecting to an exchange:
@@ -147,6 +147,27 @@ class PaperHyperliquidClient(HyperliquidClient):
                     return None
         return None
 
+    def _taker_px(self, is_buy: bool, *, coin: str | None = None, mark: float = 0.0) -> float:
+        """Market fill: buy the ask / sell the bid. Falls back to mark."""
+        name = coin or self.coin
+        try:
+            book = self.info.l2_snapshot(name) if name != self.coin else self.l2_book()
+            levels = book.get("levels") or []
+            if is_buy:
+                px = float(levels[1][0]["px"])
+            else:
+                px = float(levels[0][0]["px"])
+            if px > 0:
+                return px
+        except Exception:
+            pass
+        if mark > 0:
+            return float(mark)
+        try:
+            return float(self.get_mark_price())
+        except Exception:
+            return 0.0
+
     # ------------------------------------------------------------------ #
     # TP/SL simulation
     # ------------------------------------------------------------------ #
@@ -183,7 +204,9 @@ class PaperHyperliquidClient(HyperliquidClient):
             reason = self._exit_reason_for(pos, mark)
             if reason is None:
                 continue
-            fill_px = pos["tp_px"] if reason == "take_profit" else pos["sl_px"]
+            # Taker, same as a live market close when the trigger fires.
+            cover_buy = str(pos["side"]) == "short"
+            fill_px = self._taker_px(cover_buy, coin=coin, mark=mark)
             self._close_position(float(fill_px), reason, coin=coin)
 
     def _close_position(self, exit_px: float, reason: str, coin: str | None = None) -> None:
@@ -342,7 +365,7 @@ class PaperHyperliquidClient(HyperliquidClient):
         sz = round_size(sz, self.sz_decimals)
         if sz <= 0:
             return {"status": "err", "response": "zero size"}
-        mark = self.get_mark_price()
+        mark = self._taker_px(is_buy)
         if mark <= 0:
             return {"status": "err", "response": "no mark price"}
         side = "long" if is_buy else "short"
@@ -411,7 +434,9 @@ class PaperHyperliquidClient(HyperliquidClient):
         pos = self.positions.get(self.coin)
         if not pos:
             return {"status": "ok", "response": {"data": {"statuses": []}}}
-        mark = self._paper_mark_for(pos["coin"], pos["symbol"], pos.get("perp_dex", ""))
+        mid = self._paper_mark_for(pos["coin"], pos["symbol"], pos.get("perp_dex", ""))
+        cover_buy = str(pos["side"]) == "short"
+        mark = self._taker_px(cover_buy, coin=pos["coin"], mark=float(mid or 0))
         if mark is None or mark <= 0:
             mark = self.get_mark_price()
         close_sz = float(pos["size"]) if sz is None else min(float(sz), float(pos["size"]))
@@ -425,49 +450,20 @@ class PaperHyperliquidClient(HyperliquidClient):
         limit_px: float,
         reduce_only: bool = False,
     ) -> dict[str, Any]:
-        """Simulate a maker limit as an immediate fill at the limit price."""
+        """Paper cannot mimic a maker queue. Fill as a market order at the touch."""
+        del limit_px
         sz = round_size(sz, self.sz_decimals)
         if sz <= 0:
             return {"status": "err", "response": "zero size"}
         if reduce_only:
-            if self.coin in self.positions:
-                self._close_position(float(limit_px), "manual_close", coin=self.coin)
-            return self._fill_result(sz, limit_px)
-        side = "long" if is_buy else "short"
-        existing = self.positions.get(self.coin)
-        if existing is not None:
-            if existing["side"] != side:
-                return {"status": "err", "response": "opposite position exists"}
-            old_sz = float(existing["size"])
-            old_px = float(existing["entry_px"])
-            entry_fee = float(limit_px) * sz * self._fee_frac
-            self.balance -= entry_fee
-            new_sz = old_sz + float(sz)
-            avg_px = (old_px * old_sz + float(limit_px) * float(sz)) / new_sz
-            existing["size"] = new_sz
-            existing["entry_px"] = float(avg_px)
-            existing["entry_fee"] = float(existing.get("entry_fee", 0.0)) + float(entry_fee)
-            existing["tp_px"] = None
-            existing["sl_px"] = None
-            self._save_account()
-            return self._fill_result(sz, limit_px)
-        entry_fee = float(limit_px) * sz * self._fee_frac
-        self.balance -= entry_fee
-        self.positions[self.coin] = {
-            "coin": self.coin,
-            "symbol": self.market.symbol,
-            "perp_dex": self.perp_dex or "",
-            "side": side,
-            "size": float(sz),
-            "entry_px": float(limit_px),
-            "leverage": int(self._paper_leverage),
-            "tp_px": None,
-            "sl_px": None,
-            "entry_fee": float(entry_fee),
-            "opened_at": time.time(),
-        }
-        self._save_account()
-        return self._fill_result(sz, limit_px)
+            pos = self.positions.get(self.coin)
+            if not pos:
+                return self._fill_result(sz, 0.0)
+            cover_buy = str(pos["side"]) == "short"
+            px = self._taker_px(cover_buy, coin=self.coin)
+            self._close_position(float(px), "manual_close", coin=self.coin)
+            return self._fill_result(sz, px)
+        return self.place_market_open(is_buy, sz)
 
     # ------------------------------------------------------------------ #
     # TP/SL attach + order bookkeeping (overrides)
@@ -488,17 +484,20 @@ class PaperHyperliquidClient(HyperliquidClient):
         tp_px, sl_px = self.tp_sl_prices_for_entry(
             pos["side"], entry, take_profit_pct, stop_loss_pct
         )
+        old_tp, old_sl = pos.get("tp_px"), pos.get("sl_px")
         pos["tp_px"] = float(tp_px)
         pos["sl_px"] = float(sl_px)
         self._save_account()
-        self.logger.info(
-            "PAPER TP/SL set %s %s entry=%.8f tp=%.8f sl=%.8f",
-            pos["coin"],
-            pos["side"],
-            entry,
-            tp_px,
-            sl_px,
-        )
+        changed = old_tp != pos["tp_px"] or old_sl != pos["sl_px"]
+        if changed:
+            self.logger.info(
+                "PAPER TP/SL set %s %s entry=%.8f tp=%.8f sl=%.8f",
+                pos["coin"],
+                pos["side"],
+                entry,
+                tp_px,
+                sl_px,
+            )
         # A trigger could already be in the money at attach time.
         self._settle()
         return True

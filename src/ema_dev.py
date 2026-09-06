@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .ema import compute_ema_series
@@ -43,6 +43,9 @@ class EmaDevTrade:
     last_exit_coin: str = ""
     last_exit_bar_t: int = 0
     opened_at: float = 0.0  # unix seconds of fill; 0 = unknown (use bar / trade_store)
+    mfe_pct: float = 0.0  # max favorable excursion from entry, %
+    mae_pct: float = 0.0  # max adverse excursion from entry, %
+    entry_ctx: dict = field(default_factory=dict)
 
 
 def last_ema(closes: list[float], period: int) -> float | None:
@@ -329,6 +332,11 @@ class EmaDevStore:
                 last_exit_coin=str(raw.get("last_exit_coin", "") or ""),
                 last_exit_bar_t=int(raw.get("last_exit_bar_t", 0) or 0),
                 opened_at=float(raw.get("opened_at", 0.0) or 0.0),
+                mfe_pct=float(raw.get("mfe_pct", 0.0) or 0.0),
+                mae_pct=float(raw.get("mae_pct", 0.0) or 0.0),
+                entry_ctx=dict(raw["entry_ctx"])
+                if isinstance(raw.get("entry_ctx"), dict)
+                else {},
             )
         except (KeyError, TypeError, ValueError):
             self.trade = None

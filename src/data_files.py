@@ -168,6 +168,7 @@ def housekeep_data_dir(
         "tuning.jsonl",
         "paper_trades.jsonl",
         "ema_dev_paper_trades.jsonl",
+        "ema_trades.jsonl",
     )
     for name in growing:
         rotate_if_needed(data_dir / name, logger=log)

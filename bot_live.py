@@ -43,6 +43,12 @@ from src.ema_dev import (
     tp_price_from_dev as ema_dev_tp_price_from_dev,
     tp_through_pct as ema_dev_tp_through_pct,
 )
+from src.ema_trade_log import (
+    EmaTradeJournal,
+    reason_kind as ema_reason_kind,
+    scan_top as ema_scan_top,
+    tape_from_candles,
+)
 from src.engine import (
     dca_should_add,
     entry_signal,
@@ -413,6 +419,7 @@ def main() -> None:
 
     trade_store = TradeStateStore(DATA_DIR / "trade_state.json")
     ema_store = EmaDevStore(DATA_DIR / "ema_dev_state.json")
+    ema_journal = EmaTradeJournal(DATA_DIR / "ema_trades.jsonl", logger)
     hft_store = HftStore(DATA_DIR / "hft_pingpong_state.json")
     store = SetupStore(DATA_DIR, logger, refresh_hours=cfg.BACKTEST_REFRESH_HOURS)
 
@@ -494,14 +501,16 @@ def main() -> None:
     universe_built_at = time.time()
     mover_buckets: dict[str, str] = dict(universe.buckets)
 
+    paper_on = bool(cfg.PAPER_TRADING)
     executor = OrderExecutor(
         client,
         wait_seconds=30,
         max_attempts=5,
         logger=logger,
-        use_market_orders=cfg.USE_MARKET_ORDERS,
+        use_market_orders=True if paper_on else cfg.USE_MARKET_ORDERS,
         market_slippage=cfg.MARKET_ORDER_SLIPPAGE,
         mid_limit_then_market=ema_dev_on
+        and (not paper_on)
         and bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)),
         mid_limit_wait_seconds=float(
             getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0
@@ -759,9 +768,8 @@ def main() -> None:
             "EMA-dev strategy ON (no tune) | %s EMA(%s) | entry=%.1f%% of equity now "
             "dca=%s add=%.1f%% of equity at DCA (fits remaining free if smaller) | "
             "one pair | refresh pair list after every close | reverse=%s | "
-            "rank_cross_age=%s | limit_orders=%s "
-            "(%sx mid post-only entry, parked TP limit, %.0fs wait, then market leftover) | "
-            "max_hold=%.1fh from original entry",
+            "rank_cross_age=%s | orders=%s | max_hold=%.1fh from original entry | "
+            "trade journal=%s",
             str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m"),
             int(getattr(cfg, "EMA_DEV_PERIOD", 100) or 100),
             entry_pct,
@@ -774,10 +782,15 @@ def main() -> None:
             % ("newer" if flip_live else "older")
             if bool(getattr(cfg, "EMA_DEV_RANK_CROSS_AGE", False))
             else "off",
-            "on" if bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)) else "off",
-            int(getattr(cfg, "EMA_DEV_LIMIT_ATTEMPTS", 3) or 3),
-            float(getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0),
+            "MARKET only (paper)"
+            if paper_on
+            else (
+                "limit then market"
+                if bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False))
+                else "MARKET"
+            ),
             float(getattr(cfg, "EMA_DEV_MAX_POSITION_HOURS", 0) or 0),
+            ema_journal.path,
         )
         if flip_live:
             logger.info(
@@ -1362,9 +1375,100 @@ def main() -> None:
         ref = float(trade.entry_px or avg or 0)
         return ema_dev_tp_price_from_dev(trade.side, ref, trade.dev_pct)
 
+    def _ema_book_bits() -> tuple[float, float]:
+        try:
+            client.invalidate_l2()
+            l2 = client.l2_book()
+            bids = l2["levels"][0]
+            asks = l2["levels"][1]
+            bid = float(bids[0]["px"])
+            ask = float(asks[0]["px"])
+            mid = (bid + ask) / 2.0
+            if mid <= 0:
+                return 0.0, 0.0
+            spr = (ask - bid) / mid * 10_000.0
+            bsz = float(bids[0].get("sz") or 0)
+            asz = float(asks[0].get("sz") or 0)
+            tot = bsz + asz
+            imb = 0.0 if tot <= 0 else (bsz - asz) / tot
+            return spr, imb
+        except Exception:
+            return 0.0, 0.0
+
+    def _touch_mfe_mae(trade: EmaDevTrade, mark: float) -> None:
+        entry = float(trade.entry_px or 0)
+        if entry <= 0 or mark <= 0:
+            return
+        adv = adverse_pct(trade.side, entry, mark)
+        trade.mfe_pct = max(float(trade.mfe_pct or 0), max(0.0, -adv))
+        trade.mae_pct = max(float(trade.mae_pct or 0), max(0.0, adv))
+
     def flatten_ema(entry: PairSetup, reason: str) -> bool:
         activate_pair_for_trade(client, entry)
-        logger.info("EMA-dev close %s (%s)", entry.api_coin, reason)
+        trade = ema_store.active()
+        pos = client.get_position(force=True)
+        mark = 0.0
+        try:
+            mark = float(client.get_mark_price() or 0)
+        except Exception:
+            mark = 0.0
+        side = str(getattr(pos, "side", "") or (trade.side if trade else "") or "")
+        size = float(getattr(pos, "size", 0) or 0)
+        entry_px = float(
+            getattr(pos, "entry_price", 0) or (trade.entry_px if trade else 0) or 0
+        )
+        if size <= 0 and trade is not None:
+            size = float((trade.entry_ctx or {}).get("size") or 0)
+            if size <= 0:
+                tracked = trade_store.get(entry.api_coin)
+                if tracked is not None:
+                    size = float(tracked.size or 0)
+        if trade is not None and mark > 0:
+            _touch_mfe_mae(trade, mark)
+        candles = client.get_closed_candles_for(
+            entry.api_coin, _ema_iv(), min_bars=_ema_bars_need()
+        )
+        snap = snap_from_candles(entry.api_coin, candles, _ema_period()) if candles else None
+        exit_ema = float(snap.ema) if snap else float(trade.entry_ema if trade else 0)
+        hold_s = 0.0
+        if trade is not None:
+            started = ema_hold_started_at(trade, entry)
+            hold_s = max(0.0, time.time() - started)
+        pnl_pct = 0.0
+        pnl_usd = 0.0
+        if entry_px > 0 and mark > 0 and size > 0:
+            direction = 1.0 if side == "long" else -1.0
+            pnl_pct = (mark - entry_px) / entry_px * 100.0 * direction
+            pnl_usd = (mark - entry_px) * size * direction
+            fee = (entry_px + mark) * size * (float(cfg.TAKER_FEE_PCT) / 100.0)
+            pnl_usd -= fee
+        try:
+            equity = client.get_account_value(force=True)
+        except Exception:
+            equity = 0.0
+        ctx = dict(trade.entry_ctx) if trade is not None and trade.entry_ctx else {}
+        exit_row = {
+            **ctx,
+            "coin": entry.api_coin,
+            "side": side,
+            "fill": entry_px,
+            "exit_px": mark,
+            "size": size,
+            "d_pct": float(trade.dev_pct) if trade else 0.0,
+            "reason": reason,
+            "reason_kind": ema_reason_kind(reason),
+            "hold_s": round(hold_s, 1),
+            "pnl_pct": round(pnl_pct, 4),
+            "pnl_usd": round(pnl_usd, 4),
+            "mfe_pct": round(float(trade.mfe_pct) if trade else 0.0, 4),
+            "mae_pct": round(float(trade.mae_pct) if trade else 0.0, 4),
+            "exit_ema": exit_ema,
+            "exit_signed_dev": round(signed_dev_pct(mark, exit_ema), 4)
+            if exit_ema
+            else 0.0,
+            "equity": round(float(equity), 4),
+            "paper": paper_on,
+        }
         limit_close = executor.mid_limit_then_market and (
             str(reason).startswith("tp_") or str(reason).startswith("exit_ema")
         )
@@ -1375,15 +1479,13 @@ def main() -> None:
         )
         if not closed:
             executor.emergency_flatten(reason)
-        bar_t = 0
-        candles = client.get_closed_candles_for(
-            entry.api_coin, _ema_iv(), min_bars=_ema_bars_need()
-        )
-        if candles:
+        bar_t = int(snap.bar_t) if snap else 0
+        if bar_t <= 0 and candles:
             bar_t = int(candles[-1]["t"])
         finish_close(entry)
         ema_store.close(coin=entry.api_coin, bar_t=bar_t)
         protected_coins.discard(entry.api_coin)
+        ema_journal.record("exit", exit_row)
         return True
 
     def hydrate_ema_trade(entry: PairSetup, position) -> EmaDevTrade:
@@ -1515,6 +1617,12 @@ def main() -> None:
         ema = float(snap.ema) if snap else float(trade.entry_ema or 0)
         bar_t = int(snap.bar_t) if snap else int(trade.opened_bar_t)
         avg = float(getattr(position, "entry_price", 0) or 0) or mark
+        if mark > 0:
+            old_mfe, old_mae = trade.mfe_pct, trade.mae_pct
+            _touch_mfe_mae(trade, mark)
+            if bar_t > 0 and last_manage_bar.get(entry.api_coin) != bar_t:
+                if trade.mfe_pct != old_mfe or trade.mae_pct != old_mae:
+                    ema_store._save()
         hold_h = _ema_max_hold_hours()
         if hold_h > 0:
             started = ema_hold_started_at(trade, entry)
@@ -1667,6 +1775,17 @@ def main() -> None:
         if keep is None and open_positions:
             first = find_watch_entry(watch, open_positions[0][0])
             keep = first.api_coin if first else str(open_positions[0][0])
+        pos_keys: set[str] = set()
+        for raw_coin, _pos in open_positions:
+            found = find_watch_entry(watch, raw_coin)
+            pos_keys.add(found.api_coin if found else str(raw_coin))
+        if keep and keep not in pos_keys and tracked is not None:
+            entry = find_watch_entry(watch, keep)
+            had_open = bool(tracked.entry_ctx) or float(tracked.opened_at or 0) > 0
+            if entry is not None and had_open:
+                flatten_ema(entry, "tpsl_fill")
+                return True
+            ema_store.close(coin=keep, bar_t=int(tracked.opened_bar_t or 0))
         seen: set[str] = set()
         for coin, position in list(open_positions):
             entry = find_watch_entry(watch, coin)
@@ -1714,14 +1833,17 @@ def main() -> None:
                 closed = True
         return closed
 
+    last_ema_scan_log = 0.0
+
     def try_open_ema() -> bool:
+        nonlocal last_ema_scan_log
         if ema_store.active() is not None:
             return False
         period = _ema_period()
         iv = _ema_iv()
         min_dev = float(getattr(cfg, "EMA_DEV_MIN_DEV_PCT", 0) or 0)
         snaps = []
-        parts: list[str] = []
+        candles_by: dict[str, list] = {}
         by_coin = {e.api_coin: e for e in watch}
         for entry in watch:
             candles = client.get_closed_candles_for(
@@ -1729,13 +1851,8 @@ def main() -> None:
             )
             snap = snap_from_candles(entry.api_coin, candles, period)
             if snap is None:
-                parts.append(f"{entry.api_coin} no-ema")
                 continue
-            age = f" {snap.cross_bars}b" if _ema_rank_age() else ""
-            parts.append(
-                f"{entry.api_coin} {snap.abs_dev_pct:.2f}% "
-                f"{'below' if snap.signal_side > 0 else 'above'} ema{age}"
-            )
+            candles_by[entry.api_coin] = candles
             snaps.append(snap)
         prev = ema_store.trade
         skip_coin = prev.last_exit_coin if prev else None
@@ -1748,12 +1865,21 @@ def main() -> None:
             rank_cross_age=_ema_rank_age(),
             reverse=flip_live,
         )
-        logger.info(
-            "EMA-dev scan | %s",
-            " || ".join(parts) if parts else "idle",
-        )
+        now_s = time.time()
         if winner is None:
+            if now_s - last_ema_scan_log >= 600.0:
+                last_ema_scan_log = now_s
+                logger.info("EMA-dev idle — no eligible snap n=%s", len(snaps))
             return False
+        if now_s - last_ema_scan_log >= 600.0:
+            last_ema_scan_log = now_s
+            logger.info(
+                "EMA-dev watching n=%s best=%s D=%.2f%% %sb",
+                len(snaps),
+                winner.coin,
+                winner.abs_dev_pct,
+                winner.cross_bars,
+            )
         entry = by_coin.get(winner.coin)
         if entry is None:
             return False
@@ -1801,25 +1927,8 @@ def main() -> None:
             draft, float(winner.close), float(winner.ema), **_ema_protect_kw()
         )
         if pcts is None:
-            logger.info("Skip %s — D unusable", entry.api_coin)
             return False
         tp_pct, sl_pct = pcts
-        logger.info(
-            "EMA-dev entry %s %s size=%s notional=$%.2f margin=%.2f%% equity "
-            "D=%.2f%% ema=%.6g close=%.6g tpsl=%.2f%%/%.2f%% [%s%s]",
-            entry.api_coin,
-            "LONG" if side > 0 else "SHORT",
-            est.size,
-            est.notional_usd,
-            entry_pct,
-            draft.dev_pct,
-            winner.ema,
-            winner.close,
-            tp_pct,
-            sl_pct,
-            mode,
-            "|REVERSE" if flip_live else "",
-        )
         try:
             ok = executor.execute_protected_entry(
                 is_buy=side > 0,
@@ -1860,34 +1969,60 @@ def main() -> None:
         draft.opened_at = time.time()
         if float(winner.ema) > 0 and float(fill) > 0:
             draft.dev_pct = abs(signed_dev_pct(float(fill), float(winner.ema)))
+        tape = tape_from_candles(candles_by.get(winner.coin) or [])
+        spr, imb = _ema_book_bits()
+        bucket = str(mover_buckets.get(entry.api_coin) or "")
+        try:
+            equity = client.get_account_value(force=True)
+        except Exception:
+            equity = 0.0
+        locked = ema_dev_protect_pcts(
+            draft, float(fill), float(winner.ema), **_ema_protect_kw()
+        )
+        tp_now, sl_now = locked if locked else (tp_pct, sl_pct)
+        ctx = {
+            "coin": entry.api_coin,
+            "side": pos.side,
+            "signal": "LONG" if signal_side > 0 else "SHORT",
+            "reverse": flip_live,
+            "rank_cross_age": _ema_rank_age(),
+            "fill": float(fill),
+            "ema": float(winner.ema),
+            "close": float(winner.close),
+            "d_pct": round(float(draft.dev_pct), 4),
+            "signed_pct": round(signed_dev_pct(float(fill), float(winner.ema)), 4),
+            "xbars": int(winner.cross_bars),
+            "tp_pct": round(float(tp_now), 4),
+            "sl_pct": round(float(sl_now), 4),
+            "size": float(pos.size),
+            "notional": round(float(pos.size) * float(fill), 4),
+            "equity": round(float(equity), 4),
+            "lev": int(entry.leverage),
+            "max_lev": int(getattr(entry.market, "max_leverage", 0) or 0),
+            "spread_bps": round(spr, 2),
+            "imb": round(imb, 3),
+            "bucket": bucket,
+            "hour_utc": int(time.gmtime().tm_hour),
+            "paper": paper_on,
+            "scan_top": ema_scan_top(snaps),
+            **tape,
+        }
+        draft.entry_ctx = ctx
         ema_store.open_trade(draft)
         trade_store.open_trade(
             client.coin,
             pos.side,
             fill,
             pos.size,
-            tp_pct,
-            sl_pct,
-            equity_at_entry=client.get_account_value(force=True),
+            tp_now,
+            sl_now,
+            equity_at_entry=equity,
         )
         last_manage_bar[entry.api_coin] = int(winner.bar_t)
         protected_coins.add(entry.api_coin)
+        ema_journal.record("entry", ctx)
         if refresh_protect(entry, draft, float(fill), float(winner.ema)):
             return True
-        locked = ema_dev_protect_pcts(
-            draft, float(fill), float(winner.ema), **_ema_protect_kw()
-        )
-        tp_now, sl_now = locked if locked else (tp_pct, sl_pct)
-        logger.info(
-            "Opened EMA-dev %s %s size=%s @ %s D=%.2f%% tpsl=%.2f%%/%.2f%%",
-            client.coin,
-            pos.side,
-            pos.size,
-            fill,
-            draft.dev_pct,
-            tp_now,
-            sl_now,
-        )
         return True
 
     def maybe_refresh_ema_universe(*, after_close: bool) -> None:

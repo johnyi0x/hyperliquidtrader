@@ -38,6 +38,7 @@ EMA_DEV_ALLOW_DCA = False
 # True = entry uses post-only at mid (3x, 10s), then market leftover.
 # TP is a resting post-only limit at entry±D (fixed), not a market trigger.
 # SL stays a market stop at entry∓D. False = market in/out + market TP/SL.
+# PAPER_TRADING always uses market (limit fills in sim are not comparable to live).
 EMA_DEV_LIMIT_ORDERS = False
 EMA_DEV_LIMIT_WAIT_SECONDS = 10.0
 EMA_DEV_LIMIT_ATTEMPTS = 3
@@ -125,9 +126,9 @@ TOP_MOVER_COUNT = 14
 # 1_000_000 ≈ $1M/day. Raise if you still see thin names; lower to include more xyz.
 MIN_DAY_NOTIONAL_USD = 1_000_000
 # Skip markets whose exchange max leverage is below this.
-# 1 = include every listed perp (3x memes through high-lev majors).
+# 3 = include 3x names (memes) through high-lev majors. Was 10.
 # HFT then applies HFT_MAX_MAX_LEVERAGE on top; EMA/MTF use this scan as-is.
-MIN_MAX_LEVERAGE = 10
+MIN_MAX_LEVERAGE = 3
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # Ping-pong's ≤20x cut is HFT_MAX_MAX_LEVERAGE, not this.
 MAX_MAX_LEVERAGE = 0
@@ -272,10 +273,11 @@ DCA_MAX_ADDS = 1
 # =============================================================================
 # LIVE / PAPER EXECUTION
 # =============================================================================
-# True  = paper (simulated fills @ live mids, same fees/TP-SL/DCA logic, no real orders)
+# True  = paper (simulated taker fills @ live bid/ask, same fees/TP-SL/DCA, no real orders)
 # False = real Hyperliquid orders
-# Switch only this flag — strategy, sizing, exits, and daily tune stay identical.
-PAPER_TRADING = False
+# Paper uses MARKET orders only (same path as live EMA with EMA_DEV_LIMIT_ORDERS=False).
+# Do not turn limit/maker on in paper — those fills would not match live.
+PAPER_TRADING = True
 PAPER_START_BALANCE = 1000.0
 USE_MARKET_ORDERS = True
 MARKET_ORDER_SLIPPAGE = 0.05
