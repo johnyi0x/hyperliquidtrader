@@ -34,9 +34,11 @@ from src.ema_dev import (
     EmaDevStore,
     EmaDevTrade,
     adverse_pct,
+    ema_entry_reject,
+    exit_map_from_trade,
     fill_pcts as ema_dev_fill_pcts,
-    pick_farthest,
     protect_pcts as ema_dev_protect_pcts,
+    rank_snaps,
     signed_dev_pct,
     snap_from_candles,
     should_tp as ema_dev_should_tp,
@@ -792,6 +794,30 @@ def main() -> None:
             float(getattr(cfg, "EMA_DEV_MAX_POSITION_HOURS", 0) or 0),
             ema_journal.path,
         )
+        logger.info(
+            "EMA-dev filters | minD=%.2f%% xbars≥%s last≤%.0fb er=%.2f–%.2f "
+            "D≥%.1f×ATR box=%sb tch≥%s loc skip %.2f–%.2f chase long>%.2f "
+            "short<%.2f cooldown=%.0fm lev≤%s entry=%.1f%%",
+            float(getattr(cfg, "EMA_DEV_MIN_DEV_PCT", 0) or 0),
+            int(getattr(cfg, "EMA_DEV_MIN_CROSS_BARS", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_MAX_LAST_BAR_BPS", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_MIN_ER", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_MAX_ER", 1) or 1),
+            float(getattr(cfg, "EMA_DEV_MIN_D_ATR_MULT", 0) or 0),
+            int(getattr(cfg, "EMA_DEV_BOX_BARS", 60) or 60),
+            int(getattr(cfg, "EMA_DEV_MIN_TOUCHES", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_SKIP_MID_LO", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_SKIP_MID_HI", 1) or 1),
+            float(getattr(cfg, "EMA_DEV_CHASE_HIGH", 1) or 1),
+            float(getattr(cfg, "EMA_DEV_CHASE_LOW", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_COOLDOWN_MINUTES", 0) or 0),
+            (
+                "%sx" % int(getattr(cfg, "EMA_DEV_MAX_LEVERAGE", 0) or 0)
+                if int(getattr(cfg, "EMA_DEV_MAX_LEVERAGE", 0) or 0) > 0
+                else "off"
+            ),
+            float(cfg.EMA_DEV_ENTRY_PCT),
+        )
         if flip_live:
             logger.info(
                 "REVERSE_STRATEGY on for EMA-dev — momentum, fixed TP/SL ±D% from fill"
@@ -1316,6 +1342,46 @@ def main() -> None:
     def _ema_max_hold_hours() -> float:
         return max(0.0, float(getattr(cfg, "EMA_DEV_MAX_POSITION_HOURS", 0) or 0))
 
+    def _ema_box_bars() -> int:
+        return max(16, int(getattr(cfg, "EMA_DEV_BOX_BARS", 60) or 60))
+
+    def _ema_cooldown_ms() -> int:
+        mins = max(0.0, float(getattr(cfg, "EMA_DEV_COOLDOWN_MINUTES", 0) or 0))
+        return int(mins * 60_000.0)
+
+    def _ema_trade_lev(entry: PairSetup) -> int:
+        cap = int(getattr(cfg, "EMA_DEV_MAX_LEVERAGE", 0) or 0)
+        lev = max(1, int(entry.leverage))
+        if cap > 0:
+            lev = min(lev, cap)
+        return lev
+
+    def _ema_reject_kw() -> dict:
+        return {
+            "min_dev_pct": float(getattr(cfg, "EMA_DEV_MIN_DEV_PCT", 0) or 0),
+            "min_cross_bars": int(getattr(cfg, "EMA_DEV_MIN_CROSS_BARS", 0) or 0),
+            "max_last_bar_bps": float(getattr(cfg, "EMA_DEV_MAX_LAST_BAR_BPS", 0) or 0),
+            "min_er": float(getattr(cfg, "EMA_DEV_MIN_ER", 0) or 0),
+            "max_er": float(getattr(cfg, "EMA_DEV_MAX_ER", 1) or 1),
+            "min_d_atr_mult": float(getattr(cfg, "EMA_DEV_MIN_D_ATR_MULT", 0) or 0),
+            "min_touches": int(getattr(cfg, "EMA_DEV_MIN_TOUCHES", 0) or 0),
+            "skip_mid_lo": float(getattr(cfg, "EMA_DEV_SKIP_MID_LO", 0) or 0),
+            "skip_mid_hi": float(getattr(cfg, "EMA_DEV_SKIP_MID_HI", 1) or 1),
+            "chase_high": float(getattr(cfg, "EMA_DEV_CHASE_HIGH", 1) or 1),
+            "chase_low": float(getattr(cfg, "EMA_DEV_CHASE_LOW", 0) or 0),
+        }
+
+    last_ema_skip_log: dict[str, float] = {}
+
+    def _ema_log_skip(coin: str, reason: str) -> None:
+        now_l = time.time()
+        key = "%s:%s" % (coin, reason)
+        prev_l = last_ema_skip_log.get(key, 0.0)
+        if now_l - prev_l < 600.0:
+            return
+        last_ema_skip_log[key] = now_l
+        logger.info("EMA-dev skip %s — %s", coin, reason)
+
     def ema_hold_started_at(trade: EmaDevTrade, entry: PairSetup) -> float:
         """Earliest known fill time so a restart does not reset the 3h clock."""
         cands: list[float] = []
@@ -1664,9 +1730,17 @@ def main() -> None:
                 )
                 if dca_pct <= 0:
                     return flatten_ema(entry, "sl_dca_size_zero")
-                activate_pair_for_trade(client, entry)
+                activate_pair(client, entry)
+                try:
+                    client.set_leverage(
+                        _ema_trade_lev(entry), is_cross=entry.use_cross_margin
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "EMA-dev DCA leverage %s: %s", entry.api_coin, exc
+                    )
                 size_kw = dict(
-                    leverage=entry.leverage,
+                    leverage=_ema_trade_lev(entry),
                     sz_decimals=entry.market.sz_decimals,
                     min_notional_usd=cfg.MIN_ORDER_NOTIONAL_USD,
                 )
@@ -1857,28 +1931,60 @@ def main() -> None:
         prev = ema_store.trade
         skip_coin = prev.last_exit_coin if prev else None
         skip_bar = prev.last_exit_bar_t if prev else 0
-        winner = pick_farthest(
+        ranked = rank_snaps(
             snaps,
             min_dev_pct=min_dev,
             skip_coin=skip_coin or None,
             skip_bar_t=skip_bar,
+            last_exit_by_coin=exit_map_from_trade(prev),
+            cooldown_ms=_ema_cooldown_ms(),
             rank_cross_age=_ema_rank_age(),
             reverse=flip_live,
         )
         now_s = time.time()
+        winner = None
+        winner_tape: dict = {}
+        for cand in ranked:
+            order_side = (
+                "short"
+                if (flip_live and int(cand.signal_side) > 0)
+                or (not flip_live and int(cand.signal_side) < 0)
+                else "long"
+            )
+            tape = tape_from_candles(
+                candles_by.get(cand.coin) or [], box_bars=_ema_box_bars()
+            )
+            why = ema_entry_reject(
+                d_pct=float(cand.abs_dev_pct),
+                cross_bars=int(cand.cross_bars),
+                order_side=order_side,
+                tape=tape,
+                **_ema_reject_kw(),
+            )
+            if why:
+                _ema_log_skip(cand.coin, why)
+                continue
+            winner = cand
+            winner_tape = tape
+            break
         if winner is None:
             if now_s - last_ema_scan_log >= 600.0:
                 last_ema_scan_log = now_s
-                logger.info("EMA-dev idle — no eligible snap n=%s", len(snaps))
+                logger.info(
+                    "EMA-dev idle — no eligible snap n=%s ranked=%s",
+                    len(snaps),
+                    len(ranked),
+                )
             return False
         if now_s - last_ema_scan_log >= 600.0:
             last_ema_scan_log = now_s
             logger.info(
-                "EMA-dev watching n=%s best=%s D=%.2f%% %sb",
+                "EMA-dev watching n=%s best=%s D=%.2f%% %sb loc=%.2f",
                 len(snaps),
                 winner.coin,
                 winner.abs_dev_pct,
                 winner.cross_bars,
+                float(winner_tape.get("loc") or 0),
             )
         entry = by_coin.get(winner.coin)
         if entry is None:
@@ -1890,10 +1996,15 @@ def main() -> None:
             float(cfg.EMA_DEV_TOTAL_PCT),
             dca_on=_ema_dca_on(),
         )
-        activate_pair_for_trade(client, entry)
+        lev = _ema_trade_lev(entry)
+        activate_pair(client, entry)
+        try:
+            client.set_leverage(lev, is_cross=entry.use_cross_margin)
+        except Exception as exc:
+            logger.warning("EMA-dev leverage %s %sx: %s", entry.api_coin, lev, exc)
         est = client.estimate_order_size(
             entry_pct,
-            entry.leverage,
+            lev,
             sz_decimals=entry.market.sz_decimals,
             min_notional_usd=cfg.MIN_ORDER_NOTIONAL_USD,
             margin_from="equity",
@@ -1969,7 +2080,9 @@ def main() -> None:
         draft.opened_at = time.time()
         if float(winner.ema) > 0 and float(fill) > 0:
             draft.dev_pct = abs(signed_dev_pct(float(fill), float(winner.ema)))
-        tape = tape_from_candles(candles_by.get(winner.coin) or [])
+        tape = winner_tape or tape_from_candles(
+            candles_by.get(winner.coin) or [], box_bars=_ema_box_bars()
+        )
         spr, imb = _ema_book_bits()
         bucket = str(mover_buckets.get(entry.api_coin) or "")
         try:
@@ -1997,7 +2110,7 @@ def main() -> None:
             "size": float(pos.size),
             "notional": round(float(pos.size) * float(fill), 4),
             "equity": round(float(equity), 4),
-            "lev": int(entry.leverage),
+            "lev": int(lev),
             "max_lev": int(getattr(entry.market, "max_leverage", 0) or 0),
             "spread_bps": round(spr, 2),
             "imb": round(imb, 3),

@@ -14,8 +14,11 @@ from typing import Any
 from .data_files import append_jsonl
 
 
-def tape_from_candles(candles: list[dict]) -> dict[str, float]:
+def tape_from_candles(
+    candles: list[dict], *, box_bars: int = 60
+) -> dict[str, float]:
     """Closed-bar tape stats used to filter entries later. Empty if too short."""
+    look = max(8, int(box_bars or 60))
     if len(candles) < 8:
         return {}
     closes = [float(c["c"]) for c in candles]
@@ -37,8 +40,22 @@ def tape_from_candles(candles: list[dict]) -> dict[str, float]:
     ret5 = 0.0
     if len(closes) >= 6 and closes[-6] > 0:
         ret5 = (closes[-1] - closes[-6]) / closes[-6] * 10_000.0
-    look = min(45, len(highs))
-    rng = (max(highs[-look:]) - min(lows[-look:])) / close * 10_000.0
+    rng_n = min(45, len(highs))
+    rng = (max(highs[-rng_n:]) - min(lows[-rng_n:])) / close * 10_000.0
+    box_n = min(look, len(highs))
+    box_hi = max(highs[-box_n:])
+    box_lo = min(lows[-box_n:])
+    span = box_hi - box_lo
+    loc = 0.5
+    box_bps = 0.0
+    touches = 0
+    if span > 1e-12 and close > 0:
+        loc = min(1.0, max(0.0, (close - box_lo) / span))
+        box_bps = span / close * 10_000.0
+        near = 0.12 * span
+        for hi, lo in zip(highs[-box_n:], lows[-box_n:]):
+            if hi >= box_hi - near or lo <= box_lo + near:
+                touches += 1
     er_n = min(20, len(closes) - 1)
     path = 0.0
     up = 0
@@ -58,6 +75,9 @@ def tape_from_candles(candles: list[dict]) -> dict[str, float]:
         "last_bar_bps": round(last_bps, 2),
         "ret_5_bps": round(ret5, 2),
         "range_45_bps": round(rng, 1),
+        "box_bps": round(box_bps, 1),
+        "loc": round(loc, 3),
+        "touches": float(touches),
         "er_20": round(er, 3),
         "up_frac": round((up / sides) if sides else 0.5, 3),
     }
@@ -100,7 +120,8 @@ def compact_line(event: str, row: dict[str, Any]) -> str:
         return (
             "EMA_TRADE entry %(coin)s %(side)s fill=%(fill)s D=%(d_pct).2f%% "
             "ema=%(ema)s xbars=%(xbars)s atr=%(atr_pct).3f%% er=%(er_20).2f "
-            "last=%(last_bar_bps)+.0fb rng=%(range_45_bps).0fb spr=%(spread_bps).1fb "
+            "last=%(last_bar_bps)+.0fb loc=%(loc).2f tch=%(touches).0f "
+            "rng=%(range_45_bps).0fb spr=%(spread_bps).1fb "
             "tp=%(tp_pct).2f sl=%(sl_pct).2f ntl=$%(notional).1f eq=$%(equity).1f "
             "lev=%(lev)sx bucket=%(bucket)s"
             % {
@@ -113,6 +134,8 @@ def compact_line(event: str, row: dict[str, Any]) -> str:
                 "atr_pct": float(row.get("atr_pct") or 0),
                 "er_20": float(row.get("er_20") or 0),
                 "last_bar_bps": float(row.get("last_bar_bps") or 0),
+                "loc": float(row.get("loc") or 0),
+                "touches": float(row.get("touches") or 0),
                 "range_45_bps": float(row.get("range_45_bps") or 0),
                 "spread_bps": float(row.get("spread_bps") or 0),
                 "tp_pct": float(row.get("tp_pct") or 0),

@@ -31,9 +31,33 @@ USE_EMA_DEV_STRATEGY = True
 # If Y% of current equity does not fit in free margin, add with remaining free.
 EMA_DEV_INTERVAL = "1m"
 EMA_DEV_PERIOD = 100
-EMA_DEV_MIN_DEV_PCT = 0.0
-EMA_DEV_ENTRY_PCT = 50.0
-EMA_DEV_TOTAL_PCT = 50.0
+# Skip noise clips (UNI 0.64% / XPL 0.30% / HEMI 0.33% in paper). SL = D, so D
+# inside one 1m bar is a coin-flip after taker fees.
+EMA_DEV_MIN_DEV_PCT = 0.80
+EMA_DEV_ENTRY_PCT = 30.0
+EMA_DEV_TOTAL_PCT = 30.0
+# Cap used leverage for EMA sizing (scan still uses exchange max). Paper ARB/UNI
+# at 10x × 50% equity was $4.5k notional — one 1.3% SL ≈ −$65.
+EMA_DEV_MAX_LEVERAGE = 5
+# Fresh 1-bar poke (UNI xbars=1) is not a channel. Prefer a stretch on this side.
+EMA_DEV_MIN_CROSS_BARS = 6
+# Skip if the last closed 1m bar already ran a large fraction of D (chase).
+EMA_DEV_MAX_LAST_BAR_BPS = 45.0
+# Chop (er=0.03 UNI) and one-way already-spent (er=0.67–0.76 PONS/JUP).
+EMA_DEV_MIN_ER = 0.10
+EMA_DEV_MAX_ER = 0.65
+# D must also clear this × ATR so TP/SL are outside typical 1m noise.
+EMA_DEV_MIN_D_ATR_MULT = 1.6
+# 60-bar high/low = the two rails. Enter near a rail, not mid-box, and do not
+# momentum-chase the far rail (PONS long at the top / short at the bottom).
+EMA_DEV_BOX_BARS = 60
+EMA_DEV_MIN_TOUCHES = 3
+EMA_DEV_SKIP_MID_LO = 0.38
+EMA_DEV_SKIP_MID_HI = 0.62
+EMA_DEV_CHASE_HIGH = 0.78
+EMA_DEV_CHASE_LOW = 0.22
+# Same coin cannot re-enter for this long after any close (HEMI flipped 4×).
+EMA_DEV_COOLDOWN_MINUTES = 20.0
 EMA_DEV_ALLOW_DCA = False
 # True = entry uses post-only at mid (3x, 10s), then market leftover.
 # TP is a resting post-only limit at entry±D (fixed), not a market trigger.

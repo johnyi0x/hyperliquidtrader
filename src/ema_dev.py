@@ -42,10 +42,136 @@ class EmaDevTrade:
     opened_bar_t: int
     last_exit_coin: str = ""
     last_exit_bar_t: int = 0
+    last_exit_by_coin: dict = field(default_factory=dict)
     opened_at: float = 0.0  # unix seconds of fill; 0 = unknown (use bar / trade_store)
     mfe_pct: float = 0.0  # max favorable excursion from entry, %
     mae_pct: float = 0.0  # max adverse excursion from entry, %
     entry_ctx: dict = field(default_factory=dict)
+
+
+def bar_t_to_ms(t: int) -> int:
+    raw = int(t or 0)
+    if raw > 10_000_000_000:
+        return raw
+    if raw > 1_000_000_000:
+        return raw * 1000
+    return raw
+
+
+def exit_map_from_trade(trade: EmaDevTrade | None) -> dict[str, int]:
+    if trade is None:
+        return {}
+    out: dict[str, int] = {}
+    for key, val in (trade.last_exit_by_coin or {}).items():
+        coin = str(key or "")
+        if not coin:
+            continue
+        try:
+            out[coin] = int(val)
+        except (TypeError, ValueError):
+            continue
+    coin = str(trade.last_exit_coin or "")
+    bar = int(trade.last_exit_bar_t or 0)
+    if coin and bar > 0:
+        out.setdefault(coin, bar)
+    return out
+
+
+def _load_exit_map(raw: dict) -> dict[str, int]:
+    out: dict[str, int] = {}
+    blob = raw.get("last_exit_by_coin")
+    if isinstance(blob, dict):
+        for key, val in blob.items():
+            coin = str(key or "")
+            if not coin:
+                continue
+            try:
+                out[coin] = int(val)
+            except (TypeError, ValueError):
+                continue
+    coin = str(raw.get("last_exit_coin", "") or "")
+    try:
+        bar = int(raw.get("last_exit_bar_t", 0) or 0)
+    except (TypeError, ValueError):
+        bar = 0
+    if coin and bar > 0:
+        out.setdefault(coin, bar)
+    return out
+
+
+def coin_on_cooldown(
+    coin: str,
+    bar_t: int,
+    last_exit_by_coin: dict[str, int] | None,
+    cooldown_ms: int,
+) -> bool:
+    if cooldown_ms <= 0 or not coin:
+        return False
+    prev = int((last_exit_by_coin or {}).get(coin, 0) or 0)
+    if prev <= 0:
+        return False
+    return abs(bar_t_to_ms(bar_t) - bar_t_to_ms(prev)) < cooldown_ms
+
+
+def ema_entry_reject(
+    *,
+    d_pct: float,
+    cross_bars: int,
+    order_side: str,
+    tape: dict,
+    min_dev_pct: float = 0.0,
+    min_cross_bars: int = 0,
+    max_last_bar_bps: float = 0.0,
+    min_er: float = 0.0,
+    max_er: float = 1.0,
+    min_d_atr_mult: float = 0.0,
+    min_touches: int = 0,
+    skip_mid_lo: float = 0.0,
+    skip_mid_hi: float = 1.0,
+    chase_high: float = 1.0,
+    chase_low: float = 0.0,
+) -> str | None:
+    """Why this EMA snap should not be taken. None = ok.
+
+    Rails = last N-bar high/low (tape loc / touches). Momentum still uses EMA
+    side; this only blocks mid-range and chasing the far rail after a spike.
+    """
+    d = float(d_pct)
+    if d + 1e-12 < float(min_dev_pct):
+        return "d"
+    atr = float(tape.get("atr_pct") or 0.0)
+    if min_d_atr_mult > 0 and atr > 0 and d + 1e-12 < float(min_d_atr_mult) * atr:
+        return "d<atr"
+    if int(cross_bars) < int(min_cross_bars):
+        return "xbars"
+    last_bps = abs(float(tape.get("last_bar_bps") or 0.0))
+    if max_last_bar_bps > 0 and last_bps > float(max_last_bar_bps) + 1e-12:
+        return "last"
+    er = float(tape.get("er_20") or 0.0)
+    if er + 1e-12 < float(min_er):
+        return "er_low"
+    if er > float(max_er) + 1e-12:
+        return "er_high"
+    touches = int(tape.get("touches") or 0)
+    if min_touches > 0 and touches < int(min_touches):
+        return "touches"
+    box_bps = float(tape.get("box_bps") or tape.get("range_45_bps") or 0.0)
+    if box_bps + 1e-12 < 50.0:
+        return "box"
+    loc = tape.get("loc")
+    if loc is None:
+        return None
+    loc_f = float(loc)
+    if loc_f < 0.08 or loc_f > 0.92:
+        return "through_rail"
+    if float(skip_mid_lo) < loc_f < float(skip_mid_hi):
+        return "mid"
+    side = str(order_side or "").lower()
+    if side == "long" and loc_f > float(chase_high) + 1e-12:
+        return "chase_high"
+    if side == "short" and loc_f + 1e-12 < float(chase_low):
+        return "chase_low"
+    return None
 
 
 def last_ema(closes: list[float], period: int) -> float | None:
@@ -131,52 +257,63 @@ def _dense_ranks(values: list[float], *, higher_is_better: bool) -> list[int]:
     return [rank_of[v] for v in values]
 
 
-def pick_farthest(
+def rank_snaps(
     snaps: list[EmaDevSnap],
     *,
     min_dev_pct: float = 0.0,
     skip_coin: str | None = None,
     skip_bar_t: int = 0,
+    last_exit_by_coin: dict[str, int] | None = None,
+    cooldown_ms: int = 0,
     rank_cross_age: bool = False,
     reverse: bool = False,
-) -> EmaDevSnap | None:
+) -> list[EmaDevSnap]:
     eligible: list[EmaDevSnap] = []
     for snap in snaps:
         if skip_coin and snap.coin == skip_coin and snap.bar_t == skip_bar_t:
+            continue
+        if coin_on_cooldown(snap.coin, snap.bar_t, last_exit_by_coin, cooldown_ms):
             continue
         if snap.abs_dev_pct + 1e-12 < min_dev_pct:
             continue
         eligible.append(snap)
     if not eligible:
-        return None
+        return []
     if not rank_cross_age:
-        best = eligible[0]
-        for snap in eligible[1:]:
-            if snap.abs_dev_pct > best.abs_dev_pct + 1e-12:
-                best = snap
-            elif (
-                abs(snap.abs_dev_pct - best.abs_dev_pct) <= 1e-12
-                and snap.coin < best.coin
-            ):
-                best = snap
-        return best
+        return sorted(eligible, key=lambda s: (-float(s.abs_dev_pct), s.coin))
     # Equal-weight ranks: 1 is best. Mean-revert wants old crosses; momentum wants new.
     dev_ranks = _dense_ranks([s.abs_dev_pct for s in eligible], higher_is_better=True)
     age_ranks = _dense_ranks(
         [float(s.cross_bars) for s in eligible],
         higher_is_better=not reverse,
     )
-    best = eligible[0]
-    best_score = dev_ranks[0] + age_ranks[0]
-    for i, snap in enumerate(eligible[1:], start=1):
-        score = dev_ranks[i] + age_ranks[i]
-        if score < best_score - 1e-12:
-            best = snap
-            best_score = score
-        elif abs(score - best_score) <= 1e-12 and snap.coin < best.coin:
-            best = snap
-            best_score = score
-    return best
+    scored = list(zip(eligible, dev_ranks, age_ranks))
+    scored.sort(key=lambda row: (row[1] + row[2], row[0].coin))
+    return [row[0] for row in scored]
+
+
+def pick_farthest(
+    snaps: list[EmaDevSnap],
+    *,
+    min_dev_pct: float = 0.0,
+    skip_coin: str | None = None,
+    skip_bar_t: int = 0,
+    last_exit_by_coin: dict[str, int] | None = None,
+    cooldown_ms: int = 0,
+    rank_cross_age: bool = False,
+    reverse: bool = False,
+) -> EmaDevSnap | None:
+    ranked = rank_snaps(
+        snaps,
+        min_dev_pct=min_dev_pct,
+        skip_coin=skip_coin,
+        skip_bar_t=skip_bar_t,
+        last_exit_by_coin=last_exit_by_coin,
+        cooldown_ms=cooldown_ms,
+        rank_cross_age=rank_cross_age,
+        reverse=reverse,
+    )
+    return ranked[0] if ranked else None
 
 
 def adverse_pct(side: str, from_px: float, now: float) -> float:
@@ -331,6 +468,7 @@ class EmaDevStore:
                 opened_bar_t=int(raw.get("opened_bar_t", 0)),
                 last_exit_coin=str(raw.get("last_exit_coin", "") or ""),
                 last_exit_bar_t=int(raw.get("last_exit_bar_t", 0) or 0),
+                last_exit_by_coin=_load_exit_map(raw),
                 opened_at=float(raw.get("opened_at", 0.0) or 0.0),
                 mfe_pct=float(raw.get("mfe_pct", 0.0) or 0.0),
                 mae_pct=float(raw.get("mae_pct", 0.0) or 0.0),
@@ -369,6 +507,7 @@ class EmaDevStore:
         if prev is not None:
             trade.last_exit_coin = prev.last_exit_coin
             trade.last_exit_bar_t = prev.last_exit_bar_t
+            trade.last_exit_by_coin = exit_map_from_trade(prev)
         self.trade = trade
         self._save()
         return trade
@@ -383,10 +522,13 @@ class EmaDevStore:
     def close(self, *, coin: str, bar_t: int) -> None:
         exit_coin = coin
         exit_bar = bar_t
+        exits = exit_map_from_trade(self.trade)
         if self.trade is not None:
             exit_coin = self.trade.coin or coin
             if exit_bar <= 0:
                 exit_bar = self.trade.opened_bar_t
+        if exit_coin and int(exit_bar) > 0:
+            exits[str(exit_coin)] = int(exit_bar)
         self.trade = EmaDevTrade(
             coin="",
             side="",
@@ -398,6 +540,7 @@ class EmaDevStore:
             opened_bar_t=0,
             last_exit_coin=exit_coin,
             last_exit_bar_t=int(exit_bar),
+            last_exit_by_coin=exits,
         )
         self._save()
 
