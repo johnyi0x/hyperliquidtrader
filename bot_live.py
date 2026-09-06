@@ -795,22 +795,29 @@ def main() -> None:
             ema_journal.path,
         )
         logger.info(
-            "EMA-dev filters | minD=%.2f%% xbars≥%s last≤%.0fb er=%.2f–%.2f "
-            "D≥%.1f×ATR box=%sb tch≥%s loc skip %.2f–%.2f chase long>%.2f "
-            "short<%.2f cooldown=%.0fm lev≤%s entry=%.1f%%",
+            "EMA-dev filters | minD=%.2f%% xbars≥%s last≤%.0fb adv≤%.0fb er=%.2f–%.2f "
+            "D≥%.1f×ATR box=%sb tch≥%s rng≤%.0fb loc skip %.2f–%.2f chase long>%.2f "
+            "short<%.2f gainer_long=%s gainer_short_loc≥%.2f cooldown=%.0fm "
+            "dead=%.0fm/%.2fD lev≤%s entry=%.1f%%",
             float(getattr(cfg, "EMA_DEV_MIN_DEV_PCT", 0) or 0),
             int(getattr(cfg, "EMA_DEV_MIN_CROSS_BARS", 0) or 0),
             float(getattr(cfg, "EMA_DEV_MAX_LAST_BAR_BPS", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_MAX_ADVERSE_LAST_BPS", 0) or 0),
             float(getattr(cfg, "EMA_DEV_MIN_ER", 0) or 0),
             float(getattr(cfg, "EMA_DEV_MAX_ER", 1) or 1),
             float(getattr(cfg, "EMA_DEV_MIN_D_ATR_MULT", 0) or 0),
             int(getattr(cfg, "EMA_DEV_BOX_BARS", 60) or 60),
             int(getattr(cfg, "EMA_DEV_MIN_TOUCHES", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_MAX_RANGE_BPS", 0) or 0),
             float(getattr(cfg, "EMA_DEV_SKIP_MID_LO", 0) or 0),
             float(getattr(cfg, "EMA_DEV_SKIP_MID_HI", 1) or 1),
             float(getattr(cfg, "EMA_DEV_CHASE_HIGH", 1) or 1),
             float(getattr(cfg, "EMA_DEV_CHASE_LOW", 0) or 0),
+            "skip" if bool(getattr(cfg, "EMA_DEV_SKIP_GAINER_LONG", False)) else "on",
+            float(getattr(cfg, "EMA_DEV_GAINER_SHORT_MIN_LOC", 0) or 0),
             float(getattr(cfg, "EMA_DEV_COOLDOWN_MINUTES", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_DEAD_HOLD_MINUTES", 0) or 0),
+            float(getattr(cfg, "EMA_DEV_DEAD_MFE_FRAC", 0) or 0),
             (
                 "%sx" % int(getattr(cfg, "EMA_DEV_MAX_LEVERAGE", 0) or 0)
                 if int(getattr(cfg, "EMA_DEV_MAX_LEVERAGE", 0) or 0) > 0
@@ -1369,6 +1376,14 @@ def main() -> None:
             "skip_mid_hi": float(getattr(cfg, "EMA_DEV_SKIP_MID_HI", 1) or 1),
             "chase_high": float(getattr(cfg, "EMA_DEV_CHASE_HIGH", 1) or 1),
             "chase_low": float(getattr(cfg, "EMA_DEV_CHASE_LOW", 0) or 0),
+            "skip_gainer_long": bool(getattr(cfg, "EMA_DEV_SKIP_GAINER_LONG", False)),
+            "gainer_short_min_loc": float(
+                getattr(cfg, "EMA_DEV_GAINER_SHORT_MIN_LOC", 0) or 0
+            ),
+            "max_adverse_last_bps": float(
+                getattr(cfg, "EMA_DEV_MAX_ADVERSE_LAST_BPS", 0) or 0
+            ),
+            "max_range_bps": float(getattr(cfg, "EMA_DEV_MAX_RANGE_BPS", 0) or 0),
         }
 
     last_ema_skip_log: dict[str, float] = {}
@@ -1701,6 +1716,17 @@ def main() -> None:
                     entry,
                     f"max_hold {hold_h:.1f}h ({hold_s / 3600.0:.2f}h since entry)",
                 )
+        dead_m = max(0.0, float(getattr(cfg, "EMA_DEV_DEAD_HOLD_MINUTES", 0) or 0))
+        dead_frac = max(0.0, float(getattr(cfg, "EMA_DEV_DEAD_MFE_FRAC", 0) or 0))
+        if dead_m > 0 and dead_frac > 0:
+            started = ema_hold_started_at(trade, entry)
+            hold_s = max(0.0, time.time() - started)
+            need = dead_frac * max(0.0, float(trade.dev_pct))
+            if hold_s >= dead_m * 60.0 and float(trade.mfe_pct or 0) + 1e-12 < need:
+                return flatten_ema(
+                    entry,
+                    f"dead_trade hold={hold_s / 60.0:.0f}m mfe={trade.mfe_pct:.2f}<{need:.2f}",
+                )
         tp_target = ema_tp_target(trade, avg, ema)
         if tp_target > 0 and should_chase_maker_tp(trade.side, mark, tp_target):
             return flatten_ema(
@@ -1959,6 +1985,7 @@ def main() -> None:
                 cross_bars=int(cand.cross_bars),
                 order_side=order_side,
                 tape=tape,
+                bucket=str(mover_buckets.get(cand.coin) or ""),
                 **_ema_reject_kw(),
             )
             if why:

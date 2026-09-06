@@ -130,11 +130,17 @@ def ema_entry_reject(
     skip_mid_hi: float = 1.0,
     chase_high: float = 1.0,
     chase_low: float = 0.0,
+    bucket: str = "",
+    skip_gainer_long: bool = False,
+    gainer_short_min_loc: float = 0.0,
+    max_adverse_last_bps: float = 0.0,
+    max_range_bps: float = 0.0,
 ) -> str | None:
     """Why this EMA snap should not be taken. None = ok.
 
     Rails = last N-bar high/low (tape loc / touches). Momentum still uses EMA
-    side; this only blocks mid-range and chasing the far rail after a spike.
+    side; this only blocks mid-range, chasing the far rail, and 24h-gainer
+    longs / dip-shorts that the paper log stopped out.
     """
     d = float(d_pct)
     if d + 1e-12 < float(min_dev_pct):
@@ -144,9 +150,16 @@ def ema_entry_reject(
         return "d<atr"
     if int(cross_bars) < int(min_cross_bars):
         return "xbars"
-    last_bps = abs(float(tape.get("last_bar_bps") or 0.0))
-    if max_last_bar_bps > 0 and last_bps > float(max_last_bar_bps) + 1e-12:
+    last_bps = float(tape.get("last_bar_bps") or 0.0)
+    if max_last_bar_bps > 0 and abs(last_bps) > float(max_last_bar_bps) + 1e-12:
         return "last"
+    side = str(order_side or "").lower()
+    if max_adverse_last_bps > 0:
+        lim = float(max_adverse_last_bps)
+        if side == "long" and last_bps < -lim:
+            return "last_adv"
+        if side == "short" and last_bps > lim:
+            return "last_adv"
     er = float(tape.get("er_20") or 0.0)
     if er + 1e-12 < float(min_er):
         return "er_low"
@@ -158,6 +171,9 @@ def ema_entry_reject(
     box_bps = float(tape.get("box_bps") or tape.get("range_45_bps") or 0.0)
     if box_bps + 1e-12 < 50.0:
         return "box"
+    rng = float(tape.get("range_45_bps") or box_bps or 0.0)
+    if max_range_bps > 0 and rng > float(max_range_bps) + 1e-12:
+        return "range"
     loc = tape.get("loc")
     if loc is None:
         return None
@@ -166,11 +182,16 @@ def ema_entry_reject(
         return "through_rail"
     if float(skip_mid_lo) < loc_f < float(skip_mid_hi):
         return "mid"
-    side = str(order_side or "").lower()
     if side == "long" and loc_f > float(chase_high) + 1e-12:
         return "chase_high"
     if side == "short" and loc_f + 1e-12 < float(chase_low):
         return "chase_low"
+    bkt = str(bucket or "").lower()
+    if bkt == "gainer":
+        if skip_gainer_long and side == "long":
+            return "gainer_long"
+        if side == "short" and loc_f + 1e-12 < float(gainer_short_min_loc):
+            return "gainer_low"
     return None
 
 

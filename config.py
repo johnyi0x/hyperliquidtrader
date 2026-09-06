@@ -36,9 +36,9 @@ EMA_DEV_PERIOD = 100
 EMA_DEV_MIN_DEV_PCT = 0.80
 EMA_DEV_ENTRY_PCT = 30.0
 EMA_DEV_TOTAL_PCT = 30.0
-# Cap used leverage for EMA sizing (scan still uses exchange max). Paper ARB/UNI
-# at 10x × 50% equity was $4.5k notional — one 1.3% SL ≈ −$65.
-EMA_DEV_MAX_LEVERAGE = 5
+# Cap used leverage for EMA sizing (scan still uses exchange max). Paper ZEC
+# at 5x × 30% equity was $1.4k notional — one 3% SL ≈ −$43.
+EMA_DEV_MAX_LEVERAGE = 3
 # Fresh 1-bar poke (UNI xbars=1) is not a channel. Prefer a stretch on this side.
 EMA_DEV_MIN_CROSS_BARS = 6
 # Skip if the last closed 1m bar already ran a large fraction of D (chase).
@@ -54,10 +54,21 @@ EMA_DEV_BOX_BARS = 60
 EMA_DEV_MIN_TOUCHES = 3
 EMA_DEV_SKIP_MID_LO = 0.38
 EMA_DEV_SKIP_MID_HI = 0.62
-EMA_DEV_CHASE_HIGH = 0.78
+EMA_DEV_CHASE_HIGH = 0.62
 EMA_DEV_CHASE_LOW = 0.22
 # Same coin cannot re-enter for this long after any close (HEMI flipped 4×).
 EMA_DEV_COOLDOWN_MINUTES = 20.0
+# 24h gainer longs at the top of the box (PONS/ZEC/TIA/JUP) were the bleed.
+# 24h gainer shorts at the bottom (JUP) sold the dip in a strong coin.
+EMA_DEV_SKIP_GAINER_LONG = True
+EMA_DEV_GAINER_SHORT_MIN_LOC = 0.40
+# Last bar against the trade (CHIP/JUP shorts after a bounce; PONS long into a dump).
+EMA_DEV_MAX_ADVERSE_LAST_BPS = 20.0
+# CASHCAT 826bps box vs 2.5% stop — SL is noise inside a wide range.
+EMA_DEV_MAX_RANGE_BPS = 500.0
+# Flatten if the trade never worked. ZEC sat 2h with mfe=0.20 then −$43.
+EMA_DEV_DEAD_HOLD_MINUTES = 30.0
+EMA_DEV_DEAD_MFE_FRAC = 0.25
 EMA_DEV_ALLOW_DCA = False
 # True = entry uses post-only at mid (3x, 10s), then market leftover.
 # TP is a resting post-only limit at entry±D (fixed), not a market trigger.
