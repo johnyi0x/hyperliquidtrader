@@ -56,7 +56,7 @@ EMA_DEV_MAX_POSITION_HOURS = 3.0
 # True = live/paper uses maker fade instead of EMA-dev or MTF.
 # Two-sided ping-pong on a 3s poll gets picked off; this path buys dips / sells
 # rips in the box and rests a reduce-only take-profit.
-USE_HFT_PINGPONG = True
+USE_HFT_PINGPONG = False
 HFT_POLL_SECONDS = 3.0
 HFT_CLIP_MAX_NOTIONAL_USD = 15.0
 HFT_MAX_LEVERAGE = 20
