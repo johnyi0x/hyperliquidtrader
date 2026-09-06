@@ -51,12 +51,13 @@ EMA_DEV_RANK_CROSS_AGE = True
 EMA_DEV_MAX_POSITION_HOURS = 3.0
 
 # =============================================================================
-# HFT FADE  (one-sided maker, Railway-safe)
+# HFT PING-PONG  (two-sided maker, Railway-safe)
 # =============================================================================
-# True = live/paper uses maker fade instead of EMA-dev or MTF.
-# Two-sided ping-pong on a 3s poll gets picked off; this path buys dips / sells
-# rips in the box and rests a reduce-only take-profit.
-USE_HFT_PINGPONG = False
+# True = live/paper uses maker ping-pong instead of EMA-dev or MTF.
+# Rest bid AND ask at mid ± half, where half ≥ maker fees + edge (and scales
+# with ATR). A completed clip is the other side, not a 1-tick scratch.
+# Market-exit only on a dollar-capped runaway, never on 5–25bps noise.
+USE_HFT_PINGPONG = True
 HFT_POLL_SECONDS = 3.0
 HFT_CLIP_MAX_NOTIONAL_USD = 15.0
 HFT_MAX_LEVERAGE = 20
@@ -64,25 +65,26 @@ HFT_MAX_MAX_LEVERAGE = 20
 HFT_SCAN_COUNT = 16
 HFT_LOOKBACK_BARS = 45
 HFT_MAX_ER = 0.45
-# One-sided fade does not need a fee-wide two-sided spread.
-HFT_MIN_SPREAD_BPS = 0.8
-HFT_MAX_SPREAD_BPS = 25.0
-# Wait for the bounce. Do not dump a clip because 90s of noise.
-HFT_INVENTORY_TIMEOUT_S = 720.0
+# Book spread can be tight; we quote our own width, not the touch.
+HFT_MIN_SPREAD_BPS = 0.5
+HFT_MAX_SPREAD_BPS = 40.0
+# Hold for the other side. 11min winners are the model, not 9s dumps.
+HFT_INVENTORY_TIMEOUT_S = 1800.0
 HFT_BOX_BREAK_BPS = 8.0
-HFT_MAX_RANGE_BPS = 700.0
+HFT_MAX_RANGE_BPS = 500.0
 HFT_RESCORE_SECONDS = 90.0
 HFT_UNIVERSE_REFRESH_SECONDS = 600.0
 HFT_COOLDOWN_SECONDS = 8.0
 HFT_MAX_CANDIDATES = 8
-# Maker round-trip is ~2.8bps. Rest the cover this far through the fill.
-HFT_TAKE_BPS = 10.0
-# 20bps was inside normal 10s noise on 3x names and always dumped.
-HFT_STOP_BPS = 55.0
+# Half-width from mid (bps). Round-trip = 2× this, must clear ~2.8bps maker RT.
+HFT_TAKE_BPS = 14.0
+# Runaway cap. ~$0.045 on a $11 clip ≈ 41bps — tighter than STRK −81bps.
+HFT_STOP_BPS = 42.0
+HFT_MAX_LOSS_USD = 0.045
 
 
 def hft_pingpong_enabled() -> bool:
-    """True when live/paper should run maker fade instead of EMA-dev/MTF."""
+    """True when live/paper should run maker ping-pong instead of EMA-dev/MTF."""
     try:
         return bool(USE_HFT_PINGPONG)
     except NameError:
@@ -125,7 +127,7 @@ MIN_DAY_NOTIONAL_USD = 1_000_000
 # Skip markets whose exchange max leverage is below this.
 # 1 = include every listed perp (3x memes through high-lev majors).
 # HFT then applies HFT_MAX_MAX_LEVERAGE on top; EMA/MTF use this scan as-is.
-MIN_MAX_LEVERAGE = 10
+MIN_MAX_LEVERAGE = 1
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # Ping-pong's ≤20x cut is HFT_MAX_MAX_LEVERAGE, not this.
 MAX_MAX_LEVERAGE = 0

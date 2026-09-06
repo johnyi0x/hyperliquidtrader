@@ -1,10 +1,9 @@
 """
-Maker fade for Hyperliquid perps (Railway-safe, REST poll).
+Maker ping-pong for Hyperliquid perps (Railway-safe, REST poll).
 
-A 3s poll cannot two-sided market-make: the queue is stale and the running
-side fills. Quote ONE side (buy dips / sell rips in the 45m box), rest a
-reduce-only take-profit above fees, and only market-exit on a real stop or
-box break. Do not immediately join the far touch after a fill.
+Do not join the 1-tick touch. Rest bid AND ask at mid ± half, where half is
+maker fees + a profit edge (and grows with ATR). After one side fills, the
+other side is the exit. Market-flatten only on a dollar-capped one-way run.
 """
 
 from __future__ import annotations
@@ -74,6 +73,8 @@ class HftDecision:
     vol_scale: float
     note: str
     cover_px: float = 0.0
+    bid_px: float = 0.0
+    ask_px: float = 0.0
 
 
 def book_from_l2(l2: dict, sz_decimals: int) -> BookSnap | None:
@@ -170,8 +171,7 @@ def chop_from_candles(coin: str, candles: list[dict], lookback: int) -> ChopSnap
     fast_n = min(12, len(highs))
     box_high_fast = max(highs[-fast_n:])
     box_low_fast = min(lows[-fast_n:])
-    # Prefer a box with room to fade. Calm two-sided tape is not the edge
-    # a 3s poll can capture.
+    # Prefer two-sided chop with enough range to complete mid±half.
     balance = 1.0 - abs(up_frac - 0.5) * 2.0
     score = (
         min(path_over_net, 8.0)
@@ -217,14 +217,14 @@ def chop_reject_reason(
         return f"er={s.er:.2f}>{max_er:.2f}"
     if s.burst:
         return f"burst last={s.last_bar_bps:.0f}b"
-    if s.range_bps < 15.0:
-        return f"rng={s.range_bps:.0f}b<15"
+    if s.range_bps < 24.0:
+        return f"rng={s.range_bps:.0f}b<24"
     if s.range_bps > max_range_bps:
         return f"rng={s.range_bps:.0f}b>{max_range_bps:.0f}"
-    if s.atr_bps < 5.0:
+    if s.atr_bps < 8.0:
         return f"atr={s.atr_bps:.1f}b"
-    if s.atr_bps > 48.0:
-        return f"atr={s.atr_bps:.0f}b>48"
+    if s.atr_bps > 40.0:
+        return f"atr={s.atr_bps:.0f}b>40"
     if s.up_frac < 0.22 or s.up_frac > 0.78:
         return f"one-way={s.up_frac:.0%}"
     return None
@@ -319,8 +319,41 @@ def target_clip_notional(
     return None
 
 
+MAKER_RT_BPS = 2.8  # two maker fills on Hyperliquid (~0.014% each)
+MIN_EDGE_BPS = 8.0  # profit on top of fees, one side of mid
+HALF_CAP_BPS = 18.0  # keep round-trip inside the dollar stop
+
+
 def vol_scale(atr_bps: float) -> float:
     return max(0.70, min(2.8, (max(4.0, atr_bps) / 16.0)))
+
+
+def ping_half_bps(atr_bps: float, take_bps: float) -> float:
+    """One-side distance from mid. Round-trip fill-to-fill is 2× this."""
+    floor = max(float(take_bps), MAKER_RT_BPS + MIN_EDGE_BPS)
+    vol = 0.40 * max(0.0, float(atr_bps))
+    return min(HALF_CAP_BPS, max(floor, vol))
+
+
+def ping_quote_px(book: BookSnap, is_buy: bool, half_bps: float) -> float:
+    """Post-only price at mid ± half. Does not join the far touch."""
+    if book.mid <= 0:
+        return 0.0
+    tick = max(float(book.tick or 0), 1e-12)
+    half = max(4.0, float(half_bps))
+    if is_buy:
+        raw = book.mid * (1.0 - half / 10_000.0)
+        cap = book.ask - tick
+        px = min(raw, cap)
+        if px <= 0 or px >= book.ask:
+            return 0.0
+        return px
+    raw = book.mid * (1.0 + half / 10_000.0)
+    floor = book.bid + tick
+    px = max(raw, floor)
+    if px <= book.bid:
+        return 0.0
+    return px
 
 
 def cover_limit_px(
@@ -331,8 +364,8 @@ def cover_limit_px(
     take_bps: float,
 ) -> float:
     """
-    Reduce-only price that waits for a bounce. Never join the far touch when
-    that would lock in a loss vs entry + take.
+    Reduce-only at entry ± take. Never join the far touch when that would
+    lock a loss vs the ping target.
     """
     take = max(4.0, float(take_bps))
     if entry_px <= 0:
@@ -361,17 +394,18 @@ def decide(
     clip_sz: float,
     fav_px: float = 0.0,
     holding_quotes: bool = False,
-    take_bps: float = 10.0,
-    stop_bps: float = 55.0,
+    take_bps: float = 14.0,
+    stop_bps: float = 42.0,
+    max_loss_usd: float = 0.045,
 ) -> HftDecision:
     """
-    Flat: one-sided fade (bid below box mid, ask above). Never two-sided.
-    In a clip: rest reduce-only at a take-profit; market-exit only on stop,
-    box break, or a long stale loser.
+    Flat: two-sided maker quotes at mid ± half (fee + edge + vol).
+    In a clip: rest the other side as reduce-only. Flatten only if the
+    clip is a true one-way run past the dollar cap — never on loc/noise.
     """
     del clip_sz, box_break_bps, fav_px, holding_quotes
     vs = vol_scale(chop.atr_bps if chop else 16.0)
-    timeout = max(120.0, min(900.0, float(base_timeout_s)))
+    timeout = max(300.0, min(2400.0, float(base_timeout_s)))
     in_pos = bool(side) and size > 1e-12
     hold = (now - last_fill_at) if last_fill_at > 0 else 0.0
     last_bar = float(chop.last_bar_bps if chop else 0.0)
@@ -379,24 +413,59 @@ def decide(
     loc = 0.5
     if chop is not None and chop.box_high > chop.box_low:
         loc = (book.mid - chop.box_low) / (chop.box_high - chop.box_low)
-    take = max(4.0, float(take_bps))
-    stop = max(take + 20.0, float(stop_bps), 1.6 * atr)
+    half = ping_half_bps(atr, take_bps)
+    rt = 2.0 * half
+    notional = max(0.0, float(size) * float(entry_px or 0))
+    usd_stop = (
+        (max(0.01, float(max_loss_usd)) / notional) * 10_000.0
+        if notional > 1e-9
+        else float(stop_bps)
+    )
+    stop = max(rt * 1.15, min(float(stop_bps), usd_stop))
 
-    def _idle(pause: str, note: str) -> HftDecision:
+    def _idle(pause: str | None, note: str) -> HftDecision:
         return HftDecision(
-            None, pause, False, False, False, False, timeout, vs, note, 0.0
+            flatten=None,
+            pause=pause,
+            quote_bid=False,
+            quote_ask=False,
+            bid_reduce=False,
+            ask_reduce=False,
+            timeout_s=timeout,
+            vol_scale=vs,
+            note=note,
         )
 
     def _reduce() -> HftDecision:
         px = cover_limit_px(
-            side=side or "", entry_px=entry_px, book=book, take_bps=take
+            side=side or "", entry_px=entry_px, book=book, take_bps=rt
         )
         if side == "long":
             return HftDecision(
-                None, None, False, True, False, True, timeout, vs, "tp long", px
+                flatten=None,
+                pause=None,
+                quote_bid=False,
+                quote_ask=True,
+                bid_reduce=False,
+                ask_reduce=True,
+                timeout_s=timeout,
+                vol_scale=vs,
+                note=f"tp long +{rt:.0f}bps",
+                cover_px=px,
+                ask_px=px,
             )
         return HftDecision(
-            None, None, True, False, True, False, timeout, vs, "tp short", px
+            flatten=None,
+            pause=None,
+            quote_bid=True,
+            quote_ask=False,
+            bid_reduce=True,
+            ask_reduce=False,
+            timeout_s=timeout,
+            vol_scale=vs,
+            note=f"tp short +{rt:.0f}bps",
+            cover_px=px,
+            bid_px=px,
         )
 
     if (not in_pos) and last_fill_at > 0:
@@ -409,21 +478,31 @@ def decide(
         else:
             pnl_bps = (entry_px - book.mid) / entry_px * 10_000.0
 
+    # Only flatten a real runaway. 5–25bps against is the bounce we wait for.
     if in_pos and pnl_bps <= -stop:
         return HftDecision(
-            "inv_stop", None, False, False, False, False, timeout, vs, "inv stop", 0.0
+            flatten="inv_stop",
+            pause=None,
+            quote_bid=False,
+            quote_ask=False,
+            bid_reduce=False,
+            ask_reduce=False,
+            timeout_s=timeout,
+            vol_scale=vs,
+            note=f"runaway {pnl_bps:.0f}bps",
         )
-    if in_pos and side == "long" and loc < 0.0:
+    # Stuck clip: free capital only after a long hold still nowhere near TP.
+    if in_pos and hold >= timeout and pnl_bps < rt * 0.25:
         return HftDecision(
-            "box_break", None, False, False, False, False, timeout, vs, "box break", 0.0
-        )
-    if in_pos and side == "short" and loc > 1.0:
-        return HftDecision(
-            "box_break", None, False, False, False, False, timeout, vs, "box break", 0.0
-        )
-    if in_pos and hold >= timeout and pnl_bps < take * 0.4:
-        return HftDecision(
-            "inv_timeout", None, False, False, False, False, timeout, vs, "stale", 0.0
+            flatten="inv_timeout",
+            pause=None,
+            quote_bid=False,
+            quote_ask=False,
+            bid_reduce=False,
+            ask_reduce=False,
+            timeout_s=timeout,
+            vol_scale=vs,
+            note="stale",
         )
     if in_pos:
         return _reduce()
@@ -436,33 +515,39 @@ def decide(
     trending = bool(chop and (chop.er > max_er or chop.burst))
     if trending:
         return _idle("trend", "trend pause")
-    if last_bar >= max(22.0, 2.4 * book.spread_bps):
+    if last_bar >= max(18.0, 1.2 * half):
         return _idle("whip_bar", "whip pause")
-    if loc < 0.0 or loc > 1.0:
-        return _idle("breakout", "box breakout")
+    if loc < 0.12 or loc > 0.88:
+        return _idle("breakout", "box edge")
+    if abs(book.imbalance) > 0.88:
+        return _idle("imbalance", "one-sided book")
 
-    want_bid = loc < 0.50
-    if abs(loc - 0.50) < 1e-6:
-        want_bid = book.imbalance >= 0.0
-    if want_bid and book.imbalance < -0.82:
-        return _idle("imbalance", "ask-heavy, skip bid")
-    if (not want_bid) and book.imbalance > 0.82:
-        return _idle("imbalance", "bid-heavy, skip ask")
+    bid_px = ping_quote_px(book, True, half)
+    ask_px = ping_quote_px(book, False, half)
+    tick = max(float(book.tick or 0), 1e-12)
+    if bid_px <= 0 or ask_px <= 0 or bid_px + tick >= ask_px:
+        return _idle("width", "quotes would cross")
 
-    if want_bid:
-        return HftDecision(
-            None, None, True, False, False, False, timeout, vs, "fade bid", 0.0
-        )
     return HftDecision(
-        None, None, False, True, False, False, timeout, vs, "fade ask", 0.0
+        flatten=None,
+        pause=None,
+        quote_bid=True,
+        quote_ask=True,
+        bid_reduce=False,
+        ask_reduce=False,
+        timeout_s=timeout,
+        vol_scale=vs,
+        note=f"ping ±{half:.0f}bps rt={rt:.0f}bps",
+        bid_px=bid_px,
+        ask_px=ask_px,
     )
 
 
 def quote_px_ok(existing_px: float, target_px: float, tick: float, mid: float) -> bool:
     if existing_px <= 0 or target_px <= 0:
         return False
-    # Stay in queue. Replacing every tick makes us last-in on the toxic print.
-    tol = max(tick * 2.6, mid * 8.0e-4)
+    # Stay in queue. Width quotes should not chase every 3s mid tick.
+    tol = max(tick * 3.0, mid * 10.0e-4)
     return abs(existing_px - target_px) <= tol
 
 

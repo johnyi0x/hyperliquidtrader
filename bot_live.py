@@ -785,19 +785,20 @@ def main() -> None:
             )
     if hft_on:
         logger.info(
-            "HFT fade ON | one-sided bid<mid / ask>mid | poll=%.0fs clip≤$%.0f "
-            "lev≤%s er≤%.2f spread=%.1f–%.1fbps take=%.0fbps stop=%.0fbps "
-            "hold≤%.0fs | scan minLev≥%s maxLev≤%s | HFT maxLev≤%sx | "
-            "EMA-dev and MTF live paths are off",
+            "HFT ping-pong ON | two-sided mid±half (fee+edge+vol) | poll=%.0fs "
+            "clip≤$%.0f lev≤%s er≤%.2f spread=%.1f–%.1fbps half≥%.0fbps "
+            "stop=%.0fbps maxloss=$%.3f hold≤%.0fs | scan minLev≥%s maxLev≤%s | "
+            "HFT maxLev≤%sx | EMA-dev and MTF live paths are off",
             float(getattr(cfg, "HFT_POLL_SECONDS", 3) or 3),
             float(getattr(cfg, "HFT_CLIP_MAX_NOTIONAL_USD", 15) or 15),
             int(getattr(cfg, "HFT_MAX_LEVERAGE", 20) or 20),
             float(getattr(cfg, "HFT_MAX_ER", 0.45) or 0.45),
-            float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 0.8) or 0.8),
-            float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 25) or 25),
-            float(getattr(cfg, "HFT_TAKE_BPS", 10) or 10),
-            float(getattr(cfg, "HFT_STOP_BPS", 55) or 55),
-            float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 720) or 720),
+            float(getattr(cfg, "HFT_MIN_SPREAD_BPS", 0.5) or 0.5),
+            float(getattr(cfg, "HFT_MAX_SPREAD_BPS", 40) or 40),
+            float(getattr(cfg, "HFT_TAKE_BPS", 14) or 14),
+            float(getattr(cfg, "HFT_STOP_BPS", 42) or 42),
+            float(getattr(cfg, "HFT_MAX_LOSS_USD", 0.045) or 0.045),
+            float(getattr(cfg, "HFT_INVENTORY_TIMEOUT_S", 1800) or 1800),
             int(getattr(cfg, "MIN_MAX_LEVERAGE", 1) or 1),
             universe_max_lev or "off",
             int(getattr(cfg, "HFT_MAX_MAX_LEVERAGE", 20) or 20),
@@ -2064,9 +2065,9 @@ def main() -> None:
                     px = limit_px + ((-nudge if is_buy else nudge) * tick)
                     px = round_price(px, client.sz_decimals)
                     if is_buy and book.ask > 0 and px + 1e-12 >= book.ask:
-                        px = round_price(book.ask - max(tick, 1e-12), client.sz_decimals)
+                        continue
                     if (not is_buy) and book.bid > 0 and px - 1e-12 <= book.bid:
-                        px = round_price(book.bid + max(tick, 1e-12), client.sz_decimals)
+                        continue
                 else:
                     px = _hft_target_px(book, is_buy, nudge, aggressive=aggressive)
             except Exception as exc:
@@ -2262,8 +2263,9 @@ def main() -> None:
             clip_sz=clip,
             fav_px=float(st.fav_px if st else 0) or 0.0,
             holding_quotes=holding,
-            take_bps=float(getattr(cfg, "HFT_TAKE_BPS", 10) or 10),
-            stop_bps=float(getattr(cfg, "HFT_STOP_BPS", 55) or 55),
+            take_bps=float(getattr(cfg, "HFT_TAKE_BPS", 14) or 14),
+            stop_bps=float(getattr(cfg, "HFT_STOP_BPS", 42) or 42),
+            max_loss_usd=float(getattr(cfg, "HFT_MAX_LOSS_USD", 0.045) or 0.045),
         )
         if decision.flatten:
             logger.info(
@@ -2311,8 +2313,12 @@ def main() -> None:
         placed = False
         bid_status = ""
         ask_status = ""
-        bid_px = decision.cover_px if decision.bid_reduce else 0.0
-        ask_px = decision.cover_px if decision.ask_reduce else 0.0
+        bid_px = decision.bid_px if decision.bid_px > 0 else (
+            decision.cover_px if decision.bid_reduce else 0.0
+        )
+        ask_px = decision.ask_px if decision.ask_px > 0 else (
+            decision.cover_px if decision.ask_reduce else 0.0
+        )
         if decision.quote_bid:
             if not _keep(bid_o, True, aggressive=False, target_px=bid_px):
                 if bid_o is not None:
@@ -2331,7 +2337,17 @@ def main() -> None:
             client.cancel_oid(bid_o.get("oid"))
             bid_o = None
         if bid_status == "filled":
-            if ask_o is not None:
+            if decision.quote_ask and not decision.bid_reduce:
+                live2 = client.get_position(force=True)
+                exit_now = float(getattr(live2, "size", 0) or 0) or add_sz
+                ping_ask = ask_px or decision.ask_px
+                if ask_o is not None:
+                    client.cancel_oid(ask_o.get("oid"))
+                if ping_ask > 0 and exit_now > 0:
+                    hft_place_quote(
+                        False, exit_now, True, book, aggressive=False, limit_px=ping_ask
+                    )
+            elif ask_o is not None:
                 client.cancel_oid(ask_o.get("oid"))
             return "quoted"
         if decision.quote_ask:
@@ -2351,15 +2367,25 @@ def main() -> None:
         elif ask_o is not None:
             client.cancel_oid(ask_o.get("oid"))
         if ask_status == "filled":
-            if bid_o is not None:
+            if decision.quote_bid and not decision.ask_reduce:
+                live2 = client.get_position(force=True)
+                exit_now = float(getattr(live2, "size", 0) or 0) or add_sz
+                ping_bid = bid_px or decision.bid_px
+                if bid_o is not None:
+                    client.cancel_oid(bid_o.get("oid"))
+                if ping_bid > 0 and exit_now > 0:
+                    hft_place_quote(
+                        True, exit_now, True, book, aggressive=False, limit_px=ping_bid
+                    )
+            elif bid_o is not None:
                 client.cancel_oid(bid_o.get("oid"))
             return "quoted"
         if placed:
             sides = []
             if decision.quote_bid:
-                sides.append("bid" + ("-tp" if decision.bid_reduce else "-fade"))
+                sides.append("bid" + ("-tp" if decision.bid_reduce else "-ping"))
             if decision.quote_ask:
-                sides.append("ask" + ("-tp" if decision.ask_reduce else "-fade"))
+                sides.append("ask" + ("-tp" if decision.ask_reduce else "-ping"))
             extra = f" {decision.note}" if decision.note else ""
             logger.info(
                 "HFT rest %s %s%s | %s",
@@ -2435,7 +2461,7 @@ def main() -> None:
                 )
                 _hft_arm(entry, in_pos=True)
                 logger.info(
-                    "HFT adopted %s %s size=%s @ %s (take-profit until flat)",
+                    "HFT adopted %s %s size=%s @ %s (ping other side until flat)",
                     entry.api_coin,
                     position.side,
                     position.size,
@@ -2451,8 +2477,8 @@ def main() -> None:
         by_coin = {e.api_coin: e for e in watch}
         rescore_s = float(getattr(cfg, 'HFT_RESCORE_SECONDS', 90) or 90)
         max_er = float(getattr(cfg, 'HFT_MAX_ER', 0.45) or 0.45)
-        min_sp = float(getattr(cfg, 'HFT_MIN_SPREAD_BPS', 0.8) or 0.8)
-        max_sp = float(getattr(cfg, 'HFT_MAX_SPREAD_BPS', 25) or 25)
+        min_sp = float(getattr(cfg, 'HFT_MIN_SPREAD_BPS', 0.5) or 0.5)
+        max_sp = float(getattr(cfg, 'HFT_MAX_SPREAD_BPS', 40) or 40)
         max_range = float(getattr(cfg, 'HFT_MAX_RANGE_BPS', 700) or 700)
         max_n = max(1, int(getattr(cfg, 'HFT_MAX_CANDIDATES', 8) or 8))
         prev = hft_store.state
@@ -2518,10 +2544,13 @@ def main() -> None:
                 loc = 0.5
                 if snap.box_high > snap.box_low:
                     loc = (book.mid - snap.box_low) / (snap.box_high - snap.box_low)
-                ready.append((abs(loc - 0.5), book.spread_bps, snap, entry))
+                if loc < 0.18 or loc > 0.82:
+                    book_bits.append(f'{snap.coin}:edge-loc={loc:.2f}')
+                    continue
+                ready.append((snap.score, book.spread_bps, snap, entry))
                 book_bits.append(f'{snap.coin}:ok spr={book.spread_bps:.1f}b loc={loc:.2f}')
             ready.sort(key=lambda row: -row[0])
-            for _fade, _spr, snap, entry in ready:
+            for _score, _spr, snap, entry in ready:
                 outcome = run_hft_coin(entry, None)
                 if outcome in ('quoted', 'flatten'):
                     return True
