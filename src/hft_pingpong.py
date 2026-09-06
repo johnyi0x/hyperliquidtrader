@@ -413,11 +413,11 @@ def decide(
         return HftDecision(
             "inv_stop", None, False, False, False, False, timeout, vs, "inv stop", 0.0
         )
-    if in_pos and side == "long" and loc < 0.10:
+    if in_pos and side == "long" and loc < 0.0:
         return HftDecision(
             "box_break", None, False, False, False, False, timeout, vs, "box break", 0.0
         )
-    if in_pos and side == "short" and loc > 0.90:
+    if in_pos and side == "short" and loc > 1.0:
         return HftDecision(
             "box_break", None, False, False, False, False, timeout, vs, "box break", 0.0
         )
@@ -438,7 +438,7 @@ def decide(
         return _idle("trend", "trend pause")
     if last_bar >= max(22.0, 2.4 * book.spread_bps):
         return _idle("whip_bar", "whip pause")
-    if loc < 0.10 or loc > 0.90:
+    if loc < 0.0 or loc > 1.0:
         return _idle("breakout", "box breakout")
 
     want_bid = loc < 0.50

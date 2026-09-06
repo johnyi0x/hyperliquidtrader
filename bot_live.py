@@ -2375,6 +2375,10 @@ def main() -> None:
         seen: set[str] = set()
         st = hft_store.active()
         keep = st.coin if st else None
+        pos_keys: set[str] = set()
+        for raw_coin, _pos in open_positions:
+            found = find_watch_entry(watch, raw_coin)
+            pos_keys.add(found.api_coin if found else str(raw_coin))
         if keep is None and open_positions:
             first = find_watch_entry(watch, open_positions[0][0])
             keep = first.api_coin if first else str(open_positions[0][0])
@@ -2385,22 +2389,30 @@ def main() -> None:
                 continue
             seen.add(key)
             if keep and key != keep:
-                logger.warning("HFT is one pair — flattening extra %s", key)
-                if entry is None:
-                    client.configure_coin(str(coin))
-                    executor.emergency_flatten("hft_extra_position")
-                    wait_until_flat(
-                        client,
-                        trade_store,
-                        logger,
-                        coin=client.coin,
-                        coin_names=frozenset({client.coin, str(coin)}),
-                    )
-                    drop_local(client.coin)
-                else:
-                    hft_flatten(entry, "hft_one_pair_only")
-                closed = True
-                continue
+                if keep in pos_keys:
+                    logger.warning("HFT is one pair — flattening extra %s", key)
+                    if entry is None:
+                        client.configure_coin(str(coin))
+                        executor.emergency_flatten("hft_extra_position")
+                        wait_until_flat(
+                            client,
+                            trade_store,
+                            logger,
+                            coin=client.coin,
+                            coin_names=frozenset({client.coin, str(coin)}),
+                        )
+                        drop_local(client.coin)
+                    else:
+                        hft_flatten(entry, "hft_one_pair_only")
+                    closed = True
+                    continue
+                logger.info(
+                    "HFT adopt %s position (was quoting %s) — inventory wins",
+                    key,
+                    keep,
+                )
+                client.cancel_all_orders_for_coin_named(keep)
+                keep = key
             if entry is None:
                 logger.warning("HFT position on %s outside watch — flattening", coin)
                 client.configure_coin(str(coin))
@@ -2415,12 +2427,15 @@ def main() -> None:
                 drop_local(client.coin)
                 closed = True
                 continue
+            st = hft_store.active()
             if st is None or st.coin != entry.api_coin:
                 hft_store.set_coin(entry.api_coin, now=time.time())
-                hft_store.touch_fill(now=time.time())
+                hft_store.touch_fill(
+                    now=time.time(), is_buy=(position.side == "long")
+                )
                 _hft_arm(entry, in_pos=True)
                 logger.info(
-                    "HFT adopted %s %s size=%s @ %s (reduce-only until flat)",
+                    "HFT adopted %s %s size=%s @ %s (take-profit until flat)",
                     entry.api_coin,
                     position.side,
                     position.size,
@@ -2533,6 +2548,10 @@ def main() -> None:
             live = client.get_position(force=True)
             if live is not None:
                 run_hft_coin(entry, live)
+                return
+            bid_w, ask_w = client.working_limit_quotes()
+            if bid_w is not None or ask_w is not None:
+                run_hft_coin(entry, None)
                 return
             if now - float(st.last_score_at or 0) >= rescore_s:
                 snaps, why = _scan_snaps()
