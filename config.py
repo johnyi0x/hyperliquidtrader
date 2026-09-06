@@ -57,7 +57,7 @@ EMA_DEV_MAX_POSITION_HOURS = 3.0
 # Rest bid AND ask at mid ± half, where half ≥ maker fees + edge (and scales
 # with ATR). A completed clip is the other side, not a 1-tick scratch.
 # Market-exit only on a dollar-capped runaway, never on 5–25bps noise.
-USE_HFT_PINGPONG = True
+USE_HFT_PINGPONG = False
 HFT_POLL_SECONDS = 3.0
 HFT_CLIP_MAX_NOTIONAL_USD = 15.0
 HFT_MAX_LEVERAGE = 20
@@ -127,7 +127,7 @@ MIN_DAY_NOTIONAL_USD = 1_000_000
 # Skip markets whose exchange max leverage is below this.
 # 1 = include every listed perp (3x memes through high-lev majors).
 # HFT then applies HFT_MAX_MAX_LEVERAGE on top; EMA/MTF use this scan as-is.
-MIN_MAX_LEVERAGE = 1
+MIN_MAX_LEVERAGE = 10
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # Ping-pong's ≤20x cut is HFT_MAX_MAX_LEVERAGE, not this.
 MAX_MAX_LEVERAGE = 0
