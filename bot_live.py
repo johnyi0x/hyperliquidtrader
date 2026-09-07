@@ -45,6 +45,21 @@ from src.ema_dev import (
     tp_price_from_dev as ema_dev_tp_price_from_dev,
     tp_through_pct as ema_dev_tp_through_pct,
 )
+from src.ema_race import (
+    RaceLearner,
+    RaceStore,
+    RaceTrade,
+    board_rows as race_board_rows,
+    margin_pct_for_risk,
+    pick_race,
+    race_candidates,
+    tp_sl_price_pct,
+)
+from src.ema_race_log import (
+    RaceJournal,
+    compact_board as race_compact_board,
+    compact_learn as race_compact_learn,
+)
 from src.ema_trade_log import (
     EmaTradeJournal,
     reason_kind as ema_reason_kind,
@@ -315,10 +330,14 @@ def pos_side_int(side: str) -> int:
 
 def main() -> None:
     hft_on = bool(getattr(cfg, "hft_pingpong_enabled", lambda: False)())
+    race_on = bool(getattr(cfg, "ema_race_strategy_enabled", lambda: False)())
     ema_dev_on = bool(cfg.ema_dev_strategy_enabled())
     if hft_on:
+        race_on = False
         ema_dev_on = False
-    if not ema_dev_on and not hft_on:
+    if race_on:
+        ema_dev_on = False
+    if not ema_dev_on and not hft_on and not race_on:
         if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
             raise ValueError("Enable at least one of USE_TP_SL, USE_EXIT_SIGNAL, USE_MAX_HOLD")
     elif ema_dev_on:
@@ -335,6 +354,17 @@ def main() -> None:
             raise ValueError("EMA_DEV_ENTRY_PCT must be in (0, 99]")
         if total_pct <= 0 or total_pct > 99:
             raise ValueError("EMA_DEV_TOTAL_PCT must be in (0, 99]")
+    if race_on:
+        race_iv = str(getattr(cfg, "EMA_RACE_INTERVAL", "1m") or "1m")
+        if race_iv not in INTERVAL_MS:
+            raise ValueError(
+                f"Unknown EMA_RACE_INTERVAL {race_iv!r}; known={list(INTERVAL_MS)}"
+            )
+        if int(getattr(cfg, "EMA_RACE_PERIOD", 0) or 0) < 2:
+            raise ValueError("EMA_RACE_PERIOD must be >= 2")
+        risk = float(getattr(cfg, "EMA_RACE_EQUITY_RISK_PCT", 0) or 0)
+        if risk <= 0 or risk > 40:
+            raise ValueError("EMA_RACE_EQUITY_RISK_PCT must be in (0, 40]")
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
     if pair_mode != "manual" and not is_auto_pair_mode(pair_mode):
         raise ValueError(
@@ -422,6 +452,9 @@ def main() -> None:
     trade_store = TradeStateStore(DATA_DIR / "trade_state.json")
     ema_store = EmaDevStore(DATA_DIR / "ema_dev_state.json")
     ema_journal = EmaTradeJournal(DATA_DIR / "ema_trades.jsonl", logger)
+    race_store = RaceStore(DATA_DIR / "ema_race_state.json")
+    race_learn = RaceLearner(DATA_DIR / "ema_race_learn.json")
+    race_journal = RaceJournal(DATA_DIR / "ema_race_trades.jsonl", logger)
     hft_store = HftStore(DATA_DIR / "hft_pingpong_state.json")
     store = SetupStore(DATA_DIR, logger, refresh_hours=cfg.BACKTEST_REFRESH_HOURS)
 
@@ -509,10 +542,11 @@ def main() -> None:
         wait_seconds=30,
         max_attempts=5,
         logger=logger,
-        use_market_orders=True if paper_on else cfg.USE_MARKET_ORDERS,
+        use_market_orders=True if (paper_on or race_on) else cfg.USE_MARKET_ORDERS,
         market_slippage=cfg.MARKET_ORDER_SLIPPAGE,
         mid_limit_then_market=ema_dev_on
         and (not paper_on)
+        and (not race_on)
         and bool(getattr(cfg, "EMA_DEV_LIMIT_ORDERS", False)),
         mid_limit_wait_seconds=float(
             getattr(cfg, "EMA_DEV_LIMIT_WAIT_SECONDS", 10.0) or 10.0
@@ -731,7 +765,7 @@ def main() -> None:
     )
     concurrent = bool(getattr(cfg, "ALLOW_CONCURRENT_POSITIONS", True))
     max_concurrent = int(getattr(cfg, "MAX_CONCURRENT_POSITIONS", 0) or 0)
-    if ema_dev_on or hft_on:
+    if ema_dev_on or hft_on or race_on:
         concurrent = False
         max_concurrent = 1
     n_iv = len(cfg.INTERVALS)
@@ -829,6 +863,34 @@ def main() -> None:
             logger.info(
                 "REVERSE_STRATEGY on for EMA-dev — momentum, fixed TP/SL ±D% from fill"
             )
+    if race_on:
+        logger.info(
+            "EMA-race ON (no tune) | %s EMA(%s) | 24h movers vs each other | "
+            "pick max stretch * learned ctx | follow=long above/short below "
+            "fade=opposite | 1:1 TP/SL | risk=%.1f%% equity after lev "
+            "(price TP/SL = risk/lev, min %.2f%%) | margin cap=%.0f%% lev<=%sx | "
+            "same-coin cooldown=%.0fs | max_hold=%.1fh | orders=MARKET "
+            "(paper and live) | journal=%s learn=%s",
+            str(getattr(cfg, "EMA_RACE_INTERVAL", "1m") or "1m"),
+            int(getattr(cfg, "EMA_RACE_PERIOD", 100) or 100),
+            float(getattr(cfg, "EMA_RACE_EQUITY_RISK_PCT", 10) or 10),
+            float(getattr(cfg, "EMA_RACE_MIN_TP_SL_PCT", 0.5) or 0.5),
+            float(getattr(cfg, "EMA_RACE_MARGIN_CAP_PCT", 88) or 88),
+            int(getattr(cfg, "EMA_RACE_MAX_LEVERAGE", 10) or 10),
+            float(getattr(cfg, "EMA_RACE_SAME_COIN_COOLDOWN_S", 45) or 45),
+            float(getattr(cfg, "EMA_RACE_MAX_POSITION_HOURS", 0) or 0),
+            race_journal.path,
+            race_learn.path,
+        )
+        if race_learn.trades:
+            logger.info(
+                "%s",
+                race_compact_learn(
+                    race_learn.board(),
+                    trades=race_learn.trades,
+                    best=race_learn.best_ctx(),
+                ),
+            )
     if hft_on:
         logger.info(
             "HFT ping-pong ON | two-sided mid±half (fee+edge+vol) | poll=%.0fs "
@@ -920,7 +982,7 @@ def main() -> None:
         cfg.reverse_orders_enabled(),
         mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
     )
-    if not ema_dev_on and not hft_on and mismatch0 and pos_ok and open_positions:
+    if not ema_dev_on and not hft_on and not race_on and mismatch0 and pos_ok and open_positions:
         logger.warning(
             "Saved setups stale (%s) but positions are open — will retune once flat",
             mismatch0,
@@ -928,6 +990,8 @@ def main() -> None:
     if pos_ok and not open_positions:
         if hft_on:
             logger.info("Flat — HFT ping-pong will pick a choppy book and quote (no tune)")
+        elif race_on:
+            logger.info("Flat — EMA-race will scan 24h movers vs EMA (no tune)")
         elif ema_dev_on:
             logger.info("Flat — EMA-dev will scan the pair list (no tune)")
         else:
@@ -956,13 +1020,25 @@ def main() -> None:
     def wake_seconds() -> float:
         if hft_on:
             return max(2.0, float(getattr(cfg, "HFT_POLL_SECONDS", 3.0) or 3.0))
-        if ema_dev_on:
-            wait = seconds_until_next_candle(
-                str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m")
+        if ema_dev_on or race_on:
+            iv = (
+                str(getattr(cfg, "EMA_RACE_INTERVAL", "1m") or "1m")
+                if race_on
+                else str(getattr(cfg, "EMA_DEV_INTERVAL", "1m") or "1m")
             )
+            wait = seconds_until_next_candle(iv)
             if trade_store.trades:
                 wait = min(wait, max(1.0, float(cfg.POSITION_POLL_SECONDS)))
-            hold_h = float(getattr(cfg, "EMA_DEV_MAX_POSITION_HOURS", 0) or 0)
+            hold_h = float(
+                getattr(
+                    cfg,
+                    "EMA_RACE_MAX_POSITION_HOURS"
+                    if race_on
+                    else "EMA_DEV_MAX_POSITION_HOURS",
+                    0,
+                )
+                or 0
+            )
             if hold_h > 0 and trade_store.trades:
                 now = time.time()
                 upcoming = [
@@ -2171,6 +2247,477 @@ def main() -> None:
         logger.info("EMA-dev refreshing pair list after close (then pick farthest from EMA)")
         refresh_universe_if_needed(force=True)
 
+    last_race_scan_log = 0.0
+
+    def _race_iv() -> str:
+        return str(getattr(cfg, "EMA_RACE_INTERVAL", "1m") or "1m")
+
+    def _race_period() -> int:
+        return int(getattr(cfg, "EMA_RACE_PERIOD", 100) or 100)
+
+    def _race_lev(entry: PairSetup) -> int:
+        cap = int(getattr(cfg, "EMA_RACE_MAX_LEVERAGE", 0) or 0)
+        lev = max(1, int(entry.leverage))
+        if cap > 0:
+            lev = min(lev, cap)
+        return lev
+
+    def _race_hold_started(trade: RaceTrade, entry: PairSetup) -> float:
+        cands: list[float] = []
+        if float(trade.opened_at or 0) > 0:
+            cands.append(float(trade.opened_at))
+        tracked = trade_store.get(entry.api_coin)
+        if (
+            tracked is not None
+            and tracked.side == trade.side
+            and float(tracked.opened_at or 0) > 0
+        ):
+            cands.append(float(tracked.opened_at))
+        bar = int(trade.opened_bar_t or 0)
+        if bar > 10_000_000_000:
+            cands.append(bar / 1000.0)
+        elif bar > 1_000_000_000:
+            cands.append(float(bar))
+        return min(cands) if cands else time.time()
+
+    def flatten_race(entry: PairSetup, reason: str) -> bool:
+        activate_pair(client, entry)
+        trade = race_store.active()
+        pos = client.get_position(force=True)
+        mark = 0.0
+        try:
+            mark = float(client.get_mark_price() or 0)
+        except Exception:
+            mark = 0.0
+        side = str(getattr(pos, "side", "") or (trade.side if trade else "") or "")
+        size = float(getattr(pos, "size", 0) or 0)
+        entry_px = float(
+            getattr(pos, "entry_price", 0) or (trade.entry_px if trade else 0) or 0
+        )
+        if size <= 0 and trade is not None:
+            size = float((trade.entry_ctx or {}).get("size") or 0)
+        if trade is not None and mark > 0 and entry_px > 0:
+            adv = adverse_pct(trade.side, entry_px, mark)
+            trade.mfe_pct = max(float(trade.mfe_pct or 0), max(0.0, -adv))
+            trade.mae_pct = max(float(trade.mae_pct or 0), max(0.0, adv))
+        hold_s = 0.0
+        if trade is not None:
+            hold_s = max(0.0, time.time() - _race_hold_started(trade, entry))
+        pnl_pct = 0.0
+        pnl_usd = 0.0
+        if entry_px > 0 and mark > 0 and size > 0:
+            direction = 1.0 if side == "long" else -1.0
+            pnl_pct = (mark - entry_px) / entry_px * 100.0 * direction
+            pnl_usd = (mark - entry_px) * size * direction
+            fee = (entry_px + mark) * size * (float(cfg.TAKER_FEE_PCT) / 100.0)
+            pnl_usd -= fee
+        try:
+            equity = client.get_account_value(force=True)
+        except Exception:
+            equity = 0.0
+        ctx = dict(trade.entry_ctx) if trade is not None and trade.entry_ctx else {}
+        win = pnl_usd > 0
+        if str(reason) == "tpsl_fill":
+            reason = "take_profit" if win else "stop_loss"
+        exit_row = {
+            **ctx,
+            "coin": entry.api_coin,
+            "side": side,
+            "policy": trade.policy if trade else ctx.get("policy"),
+            "ctx": trade.ctx if trade else ctx.get("ctx"),
+            "fill": entry_px,
+            "exit_px": mark,
+            "size": size,
+            "reason": reason,
+            "reason_kind": ema_reason_kind(reason),
+            "hold_s": round(hold_s, 1),
+            "pnl_pct": round(pnl_pct, 4),
+            "pnl_usd": round(pnl_usd, 4),
+            "mfe_pct": round(float(trade.mfe_pct) if trade else 0.0, 4),
+            "mae_pct": round(float(trade.mae_pct) if trade else 0.0, 4),
+            "equity": round(float(equity), 4),
+            "paper": paper_on,
+            "win": win,
+        }
+        if pos is not None:
+            closed = executor.execute_rsi_exit()
+            if not closed:
+                executor.emergency_flatten(reason)
+        finish_close(entry)
+        race_store.close(coin=entry.api_coin, bar_t=int(trade.opened_bar_t if trade else 0))
+        protected_coins.discard(entry.api_coin)
+        race_journal.record("exit", exit_row)
+        learn_ctx = str(exit_row.get("ctx") or "")
+        if learn_ctx and trade is not None:
+            race_learn.observe(
+                ctx=learn_ctx,
+                coin=entry.api_coin,
+                win=win,
+                pnl_usd=float(pnl_usd),
+            )
+            race_journal.record(
+                "learn",
+                {
+                    "line": race_compact_learn(
+                        race_learn.board(),
+                        trades=race_learn.trades,
+                        best=race_learn.best_ctx(),
+                    ),
+                    "bins": race_learn.board(),
+                    "trades": race_learn.trades,
+                    "best": race_learn.best_ctx(),
+                    "last_ctx": learn_ctx,
+                    "last_win": win,
+                    "last_pnl": round(float(pnl_usd), 4),
+                    "coin_mult": race_learn.coin_mult(entry.api_coin),
+                },
+            )
+        return True
+
+    def hydrate_race_trade(entry: PairSetup, position) -> RaceTrade:
+        existing = race_store.active()
+        side = str(getattr(position, "side", "") or "")
+        fill = float(getattr(position, "entry_price", 0) or 0) or client.get_mark_price()
+        if (
+            existing is not None
+            and existing.coin == entry.api_coin
+            and existing.side == side
+        ):
+            return existing
+        lev = _race_lev(entry)
+        tp_sl = tp_sl_price_pct(
+            lev,
+            float(getattr(cfg, "EMA_RACE_EQUITY_RISK_PCT", 10) or 10),
+            float(getattr(cfg, "EMA_RACE_MIN_TP_SL_PCT", 0.5) or 0.5),
+        )
+        trade = RaceTrade(
+            coin=entry.api_coin,
+            side=side,
+            policy=str((existing.policy if existing else "") or "follow"),
+            ctx=str((existing.ctx if existing else "") or ""),
+            bucket=str(mover_buckets.get(entry.api_coin) or ""),
+            abs_dev_pct=float(existing.abs_dev_pct) if existing else 0.0,
+            signed_dev_pct=0.0,
+            entry_px=fill,
+            entry_ema=float(existing.entry_ema) if existing else 0.0,
+            tp_sl_pct=float(existing.tp_sl_pct) if existing else tp_sl,
+            leverage=lev,
+            opened_at=time.time(),
+        )
+        race_store.open_trade(trade)
+        logger.warning("EMA-race rehydrated %s %s @ %s", entry.api_coin, side, fill)
+        return trade
+
+    def manage_race_one(entry: PairSetup, position) -> bool:
+        activate_pair(client, entry)
+        trade = hydrate_race_trade(entry, position)
+        mark = client.get_mark_price()
+        avg = float(getattr(position, "entry_price", 0) or 0) or mark
+        if mark > 0 and avg > 0:
+            adv = adverse_pct(trade.side, float(trade.entry_px or avg), mark)
+            trade.mfe_pct = max(float(trade.mfe_pct or 0), max(0.0, -adv))
+            trade.mae_pct = max(float(trade.mae_pct or 0), max(0.0, adv))
+            race_store.save()
+        hold_h = max(0.0, float(getattr(cfg, "EMA_RACE_MAX_POSITION_HOURS", 0) or 0))
+        if hold_h > 0:
+            hold_s = max(0.0, time.time() - _race_hold_started(trade, entry))
+            if hold_s >= hold_h * 3600.0:
+                return flatten_race(
+                    entry,
+                    f"max_hold {hold_h:.1f}h ({hold_s / 3600.0:.2f}h since entry)",
+                )
+        sl = max(0.05, float(trade.tp_sl_pct or 0))
+        if adverse_pct(trade.side, float(trade.entry_px or avg), mark) + 1e-12 >= sl:
+            return flatten_race(entry, f"stop_loss {sl:.2f}%")
+        fav = -adverse_pct(trade.side, float(trade.entry_px or avg), mark)
+        if fav + 1e-12 >= sl:
+            return flatten_race(entry, f"take_profit {sl:.2f}%")
+        if not client.has_exchange_tpsl():
+            ok = client.attach_position_tpsl(position, sl, sl, max_attempts=3)
+            if not ok:
+                return flatten_race(entry, "tpsl_attach_failed")
+            protected_coins.add(entry.api_coin)
+        return False
+
+    def manage_race_positions(open_positions: list) -> bool:
+        closed = False
+        tracked = race_store.active()
+        keep = tracked.coin if tracked else None
+        if keep is None and open_positions:
+            first = find_watch_entry(watch, open_positions[0][0])
+            keep = first.api_coin if first else str(open_positions[0][0])
+        pos_keys: set[str] = set()
+        for raw_coin, _pos in open_positions:
+            found = find_watch_entry(watch, raw_coin)
+            pos_keys.add(found.api_coin if found else str(raw_coin))
+        if keep and keep not in pos_keys and tracked is not None:
+            entry = find_watch_entry(watch, keep)
+            had_open = bool(tracked.entry_ctx) or float(tracked.opened_at or 0) > 0
+            if entry is not None and had_open:
+                flatten_race(entry, "tpsl_fill")
+                return True
+            race_store.close(coin=keep, bar_t=int(tracked.opened_bar_t or 0))
+        seen: set[str] = set()
+        for coin, position in list(open_positions):
+            entry = find_watch_entry(watch, coin)
+            key = entry.api_coin if entry else str(coin)
+            if key in seen:
+                continue
+            seen.add(key)
+            if keep and key != keep:
+                logger.warning("EMA-race is one pair — flattening extra %s", key)
+                if entry is None:
+                    client.configure_coin(str(coin))
+                    executor.emergency_flatten("ema_race_extra_position")
+                    wait_until_flat(
+                        client,
+                        trade_store,
+                        logger,
+                        coin=client.coin,
+                        coin_names=frozenset({client.coin, str(coin)}),
+                    )
+                    drop_local(client.coin)
+                    closed = True
+                    continue
+                flatten_race(entry, "extra_position")
+                closed = True
+                continue
+            if entry is None:
+                continue
+            if manage_race_one(entry, position):
+                closed = True
+        return closed
+
+    def try_open_race() -> bool:
+        nonlocal last_race_scan_log
+        if race_store.active() is not None:
+            return False
+        period = _race_period()
+        iv = _race_iv()
+        min_dev = float(getattr(cfg, "EMA_RACE_MIN_DEV_PCT", 0.25) or 0)
+        snaps = []
+        by_coin = {e.api_coin: e for e in watch}
+        for entry in watch:
+            candles = client.get_closed_candles_for(
+                entry.api_coin, iv, min_bars=max(40, period + 30)
+            )
+            snap = snap_from_candles(entry.api_coin, candles, period)
+            if snap is None:
+                continue
+            snaps.append(snap)
+        skip_coin = None
+        prev = race_store.trade
+        cool = float(getattr(cfg, "EMA_RACE_SAME_COIN_COOLDOWN_S", 45) or 0)
+        if (
+            prev is not None
+            and prev.last_exit_coin
+            and cool > 0
+            and time.time() - float(prev.last_exit_at or 0) < cool
+        ):
+            skip_coin = prev.last_exit_coin
+        cands = race_candidates(
+            snaps,
+            buckets=mover_buckets,
+            learner=race_learn,
+            min_dev_pct=min_dev,
+            skip_coin=skip_coin,
+        )
+        winner = pick_race(cands)
+        now_s = time.time()
+        board = race_board_rows(cands, n=8)
+        board_txt = race_compact_board(board, n=8)
+        if winner is None:
+            if now_s - last_race_scan_log >= 120.0:
+                last_race_scan_log = now_s
+                logger.info(
+                    "RACE_SCAN idle n=%s skip=%s (no stretch >= %.2f%%)",
+                    len(snaps),
+                    skip_coin or "-",
+                    min_dev,
+                )
+            return False
+        tried: set[str] = set()
+        for cand in cands:
+            if cand.coin in tried:
+                continue
+            tried.add(cand.coin)
+            entry = by_coin.get(cand.coin)
+            if entry is None:
+                continue
+            lev = _race_lev(entry)
+            risk = float(getattr(cfg, "EMA_RACE_EQUITY_RISK_PCT", 10) or 10)
+            tp_sl = tp_sl_price_pct(
+                lev,
+                risk,
+                float(getattr(cfg, "EMA_RACE_MIN_TP_SL_PCT", 0.5) or 0.5),
+            )
+            margin_pct = margin_pct_for_risk(
+                leverage=lev,
+                tp_sl_pct=tp_sl,
+                risk_pct=risk,
+                cap_pct=float(getattr(cfg, "EMA_RACE_MARGIN_CAP_PCT", 88) or 88),
+            )
+            activate_pair(client, entry)
+            try:
+                client.set_leverage(lev, is_cross=entry.use_cross_margin)
+            except Exception as exc:
+                logger.warning("EMA-race leverage %s %sx: %s", entry.api_coin, lev, exc)
+            est = client.estimate_order_size(
+                margin_pct,
+                lev,
+                sz_decimals=entry.market.sz_decimals,
+                min_notional_usd=cfg.MIN_ORDER_NOTIONAL_USD,
+                margin_from="equity",
+            )
+            if not est.ok:
+                logger.info("RACE skip size %s — %s", cand.coin, est.reason)
+                continue
+            try:
+                equity = client.get_account_value(force=True)
+            except Exception:
+                equity = 0.0
+            if equity > 0 and est.available_margin < equity * cfg.MIN_FREE_MARGIN_FRAC:
+                logger.info(
+                    "RACE skip %s — free margin $%.2f low vs equity $%.2f",
+                    cand.coin,
+                    est.available_margin,
+                    equity,
+                )
+                continue
+            is_buy = cand.side == "long"
+            try:
+                ok = executor.execute_protected_entry(
+                    is_buy=is_buy,
+                    target_sz=est.size,
+                    take_profit_pct=tp_sl,
+                    stop_loss_pct=tp_sl,
+                    attach_protect=True,
+                )
+            except RuntimeError as exc:
+                if "insufficient margin" in str(exc).lower():
+                    logger.warning("RACE insufficient margin %s", cand.coin)
+                    continue
+                raise
+            if not ok:
+                cleanup_closed_coin(client, trade_store, entry.api_coin)
+                continue
+            pos = client.get_position(force=True)
+            if pos is None:
+                cleanup_closed_coin(client, trade_store, entry.api_coin)
+                continue
+            if not client.has_exchange_tpsl():
+                executor.emergency_flatten("unprotected")
+                cleanup_closed_coin(client, trade_store, entry.api_coin)
+                continue
+            fill = pos.entry_price or client.get_mark_price()
+            actual_risk = 0.0
+            ntl = float(pos.size) * float(fill)
+            if equity > 0:
+                actual_risk = ntl * (tp_sl / 100.0) / equity * 100.0
+            tape = tape_from_candles([])
+            try:
+                candles = client.get_closed_candles_for(
+                    entry.api_coin, iv, min_bars=max(40, period + 30)
+                )
+                tape = tape_from_candles(candles)
+            except Exception:
+                tape = {}
+            ctx = {
+                "coin": entry.api_coin,
+                "side": pos.side,
+                "policy": cand.policy,
+                "ctx": cand.ctx,
+                "signal": "LONG" if cand.signed_dev_pct < 0 else "SHORT",
+                "fill": float(fill),
+                "ema": float(cand.ema),
+                "close": float(cand.close),
+                "d_pct": round(float(cand.abs_dev_pct), 4),
+                "signed_pct": round(float(cand.signed_dev_pct), 4),
+                "z": cand.z,
+                "rel": cand.rel,
+                "rank": cand.rank,
+                "n_watch": len(snaps),
+                "xbars": int(cand.cross_bars),
+                "tp_sl_pct": round(float(tp_sl), 4),
+                "tp_pct": round(float(tp_sl), 4),
+                "sl_pct": round(float(tp_sl), 4),
+                "size": float(pos.size),
+                "notional": round(ntl, 4),
+                "equity": round(float(equity), 4),
+                "lev": int(lev),
+                "max_lev": int(getattr(entry.market, "max_leverage", 0) or 0),
+                "risk_pct": round(actual_risk, 3),
+                "target_risk_pct": risk,
+                "margin_pct": round(margin_pct, 2),
+                "weight": cand.weight,
+                "coin_mult": cand.coin_mult,
+                "bucket": cand.bucket,
+                "board": board,
+                "board_txt": board_txt,
+                "paper": paper_on,
+                **tape,
+            }
+            draft = RaceTrade(
+                coin=entry.api_coin,
+                side=pos.side,
+                policy=cand.policy,
+                ctx=cand.ctx,
+                bucket=cand.bucket,
+                abs_dev_pct=float(cand.abs_dev_pct),
+                signed_dev_pct=float(cand.signed_dev_pct),
+                entry_px=float(fill),
+                entry_ema=float(cand.ema),
+                tp_sl_pct=float(tp_sl),
+                leverage=lev,
+                opened_bar_t=int(cand.bar_t),
+                opened_at=time.time(),
+                entry_ctx=ctx,
+            )
+            race_store.open_trade(draft)
+            trade_store.open_trade(
+                client.coin,
+                pos.side,
+                fill,
+                pos.size,
+                tp_sl,
+                tp_sl,
+                equity_at_entry=equity,
+            )
+            last_manage_bar[entry.api_coin] = int(cand.bar_t)
+            protected_coins.add(entry.api_coin)
+            race_journal.record("entry", ctx)
+            if now_s - last_race_scan_log >= 1.0:
+                last_race_scan_log = now_s
+                race_journal.record(
+                    "scan",
+                    {
+                        "n_watch": len(snaps),
+                        "leader": "%s %s D=%+.2f%%" % (
+                            cand.coin,
+                            cand.policy,
+                            cand.signed_dev_pct,
+                        ),
+                        "board_txt": board_txt,
+                        "board": board,
+                    },
+                )
+            return True
+        if now_s - last_race_scan_log >= 120.0:
+            last_race_scan_log = now_s
+            logger.info(
+                "RACE_SCAN no fill n=%s leader=%s | %s",
+                len(snaps),
+                winner.coin if winner else "-",
+                board_txt,
+            )
+        return False
+
+    def maybe_refresh_race_universe(*, after_close: bool) -> None:
+        if not after_close:
+            return
+        logger.info("EMA-race refreshing 24h mover list after close")
+        refresh_universe_if_needed(force=True)
+
     last_hft_universe = time.time()
     _hft_log_last: dict[str, tuple[str, float]] = {}
     _hft_chop_cache: dict[str, tuple[float, object]] = {}
@@ -2913,6 +3460,8 @@ def main() -> None:
             closed_any = False
             if hft_on:
                 closed_any = manage_hft_positions(open_positions)
+            elif race_on:
+                closed_any = manage_race_positions(open_positions)
             elif ema_dev_on:
                 closed_any = manage_ema_positions(open_positions)
             else:
@@ -2975,6 +3524,17 @@ def main() -> None:
                         bar_t = 0
                     ema_store.close(coin=tracked.coin, bar_t=bar_t)
                     drop_local(tracked.coin)
+            if race_on:
+                tracked_r = race_store.active()
+                if tracked_r is not None and tracked_r.coin not in occupied:
+                    logger.info(
+                        "EMA-race %s closed on exchange — clearing local state",
+                        tracked_r.coin,
+                    )
+                    race_store.close(
+                        coin=tracked_r.coin, bar_t=int(tracked_r.opened_bar_t or 0)
+                    )
+                    drop_local(tracked_r.coin)
 
             if not occupied:
                 just_closed = bool(was_in_position)
@@ -2988,6 +3548,8 @@ def main() -> None:
                     was_in_position = False
                 if ema_dev_on:
                     maybe_refresh_ema_universe(after_close=just_closed)
+                elif race_on:
+                    maybe_refresh_race_universe(after_close=just_closed)
                 else:
                     maybe_tune(force=not store.setups())
             else:
@@ -2996,6 +3558,10 @@ def main() -> None:
             if ema_dev_on:
                 if not occupied:
                     try_open_ema()
+                continue
+            if race_on:
+                if not occupied:
+                    try_open_race()
                 continue
 
             can_scan = concurrent or not occupied

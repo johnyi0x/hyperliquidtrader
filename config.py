@@ -9,11 +9,30 @@ from __future__ import annotations
 # =============================================================================
 # WHICH STRATEGY  (set this first)
 # =============================================================================
-# False = current MTF strategy (tune / backtest, multi-pair).
-# True  = EMA-deviation strategy (no tune). Same PAIR_SELECTION_MODE either way.
-# If USE_HFT_PINGPONG is True, that live path wins and EMA-dev is forced off.
+# One live path at a time. First True wins: HFT > EMA_RACE > EMA_DEV > MTF.
 # This file only -- not profit-meta-follower/config.py.
-USE_EMA_DEV_STRATEGY = True
+# False = MTF (tune / backtest) when the three flags below are all False.
+USE_EMA_DEV_STRATEGY = False
+
+# EMA race (relative stretch vs the 24h gainer/loser basket).
+# True  = live/paper uses race instead of EMA-dev / MTF (HFT still wins if on).
+# Watches every selected pair's distance from EMA, picks the standout,
+# 1:1 market TP/SL sized so a fill is ~EMA_RACE_EQUITY_RISK_PCT of equity
+# after leverage. Learns pick weights from every close.
+USE_EMA_RACE_STRATEGY = True
+EMA_RACE_INTERVAL = "1m"
+EMA_RACE_PERIOD = 100
+EMA_RACE_MIN_DEV_PCT = 0.25
+# Account risk at TP and at SL (1:1). Price % = this / leverage used.
+# Example 10x → 1.0% price TP/SL; 3x → 3.33% price TP/SL.
+EMA_RACE_EQUITY_RISK_PCT = 10.0
+EMA_RACE_MIN_TP_SL_PCT = 0.50
+EMA_RACE_MARGIN_CAP_PCT = 88.0
+EMA_RACE_MAX_LEVERAGE = 10
+# Do not re-enter the same coin this soon; other names still enter immediately.
+EMA_RACE_SAME_COIN_COOLDOWN_S = 45.0
+# Flatten if a fill never happens (safety). 0 = hold until TP/SL only.
+EMA_RACE_MAX_POSITION_HOURS = 6.0
 
 # EMA-dev knobs (ignored when USE_EMA_DEV_STRATEGY is False).
 # Pick the watch-list coin whose last closed 1m close is farthest from EMA(100)
@@ -127,9 +146,19 @@ def hft_pingpong_enabled() -> bool:
         return False
 
 
+def ema_race_strategy_enabled() -> bool:
+    """True when live/paper should run the EMA race path."""
+    if hft_pingpong_enabled():
+        return False
+    try:
+        return bool(USE_EMA_RACE_STRATEGY)
+    except NameError:
+        return False
+
+
 def ema_dev_strategy_enabled() -> bool:
     """True when live/paper should use the EMA-deviation path instead of MTF."""
-    if hft_pingpong_enabled():
+    if hft_pingpong_enabled() or ema_race_strategy_enabled():
         return False
     try:
         return bool(USE_EMA_DEV_STRATEGY)

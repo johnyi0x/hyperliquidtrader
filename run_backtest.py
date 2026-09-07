@@ -41,6 +41,13 @@ def main() -> None:
             "Run python bot_live.py instead."
         )
         return
+    if getattr(cfg, "ema_race_strategy_enabled", lambda: False)():
+        logger_early = setup_logger("hl-multi-backtest", PROJECT / "logs")
+        logger_early.info(
+            "USE_EMA_RACE_STRATEGY is on — this mode has no backtest/tune. "
+            "Run python bot_live.py instead."
+        )
+        return
     if getattr(cfg, "ema_dev_strategy_enabled", lambda: False)():
         logger_early = setup_logger("hl-multi-backtest", PROJECT / "logs")
         logger_early.info(
