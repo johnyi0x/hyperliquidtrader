@@ -107,6 +107,7 @@ class RaceTrade:
     last_exit_coin: str = ""
     last_exit_bar_t: int = 0
     last_exit_at: float = 0.0
+    last_exit_win: bool = True
     entry_ctx: dict = field(default_factory=dict)
 
 
@@ -318,6 +319,27 @@ def race_candidates(
     return out
 
 
+def race_entry_reject(
+    cand: RaceCandidate,
+    *,
+    tp_sl_pct: float,
+    min_d_to_sl: float = 1.2,
+    max_follow_dev_pct: float = 9.0,
+) -> str | None:
+    """Skip setups the paper+live log stopped out. None = ok."""
+    d = float(cand.abs_dev_pct)
+    sl = max(0.05, float(tp_sl_pct))
+    if cand.policy == "follow" and cand.bucket == "loser" and cand.side == "long":
+        return "loser_long"
+    if cand.policy == "follow" and cand.bucket == "gainer" and cand.side == "short":
+        return "gainer_short"
+    if d + 1e-12 < float(min_d_to_sl) * sl:
+        return "d<sl"
+    if cand.policy == "follow" and d > float(max_follow_dev_pct) + 1e-12:
+        return "d_ext"
+    return None
+
+
 def pick_race(cands: list[RaceCandidate]) -> RaceCandidate | None:
     return cands[0] if cands else None
 
@@ -389,6 +411,7 @@ class RaceStore:
                 last_exit_coin=str(raw.get("last_exit_coin", "") or ""),
                 last_exit_bar_t=int(raw.get("last_exit_bar_t", 0) or 0),
                 last_exit_at=float(raw.get("last_exit_at", 0) or 0),
+                last_exit_win=bool(raw.get("last_exit_win", True)),
                 entry_ctx=dict(raw["entry_ctx"])
                 if isinstance(raw.get("entry_ctx"), dict)
                 else {},
@@ -424,11 +447,12 @@ class RaceStore:
             trade.last_exit_coin = prev.last_exit_coin
             trade.last_exit_bar_t = prev.last_exit_bar_t
             trade.last_exit_at = prev.last_exit_at
+            trade.last_exit_win = bool(prev.last_exit_win)
         self.trade = trade
         self._save()
         return trade
 
-    def close(self, *, coin: str, bar_t: int) -> None:
+    def close(self, *, coin: str, bar_t: int, win: bool = True) -> None:
         exit_coin = coin
         exit_bar = int(bar_t or 0)
         prev_at = 0.0
@@ -452,6 +476,7 @@ class RaceStore:
             last_exit_coin=exit_coin,
             last_exit_bar_t=exit_bar,
             last_exit_at=time.time() if exit_coin else prev_at,
+            last_exit_win=bool(win),
         )
         self._save()
 

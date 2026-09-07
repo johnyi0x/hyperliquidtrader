@@ -17,20 +17,27 @@ USE_EMA_DEV_STRATEGY = False
 # EMA race (relative stretch vs the 24h gainer/loser basket).
 # True  = live/paper uses race instead of EMA-dev / MTF (HFT still wins if on).
 # Watches every selected pair's distance from EMA, picks the standout,
-# 1:1 market TP/SL sized so a fill is ~EMA_RACE_EQUITY_RISK_PCT of equity
-# after leverage. Learns pick weights from every close.
+# 1:1 market TP/SL. Size is EMA_RACE_MARGIN_PCT of equity (not ~90%).
+# Learns pick weights from every close.
 USE_EMA_RACE_STRATEGY = True
 EMA_RACE_INTERVAL = "1m"
 EMA_RACE_PERIOD = 100
 EMA_RACE_MIN_DEV_PCT = 0.25
-# Account risk at TP and at SL (1:1). Price % = this / leverage used.
-# Example 10x → 1.0% price TP/SL; 3x → 3.33% price TP/SL.
+# Sets 1:1 price TP/SL (= this / leverage). 10x → 1.0% price; 3x → 3.33%.
+# Dollar risk is margin × that price stop, not this number by itself.
+# With 50% margin: SL ≈ 5% of equity (was ~9% when margin was ~88%).
 EMA_RACE_EQUITY_RISK_PCT = 10.0
 EMA_RACE_MIN_TP_SL_PCT = 0.50
-EMA_RACE_MARGIN_CAP_PCT = 88.0
+# % of equity posted as margin. Live was using ~88%. 50 = half the book.
+EMA_RACE_MARGIN_PCT = 50.0
 EMA_RACE_MAX_LEVERAGE = 10
-# Do not re-enter the same coin this soon; other names still enter immediately.
-EMA_RACE_SAME_COIN_COOLDOWN_S = 45.0
+# Same coin after a TP. After an SL this is replaced by EMA_RACE_SL_COOLDOWN_S.
+EMA_RACE_SAME_COIN_COOLDOWN_S = 180.0
+EMA_RACE_SL_COOLDOWN_S = 900.0
+# Follow only when |close-EMA| is at least this × the stop (CHIP/CASHCAT D < SL).
+EMA_RACE_MIN_D_TO_SL = 1.2
+# Follow already-spent dumps (live HEMI −11.56% then bounce SL).
+EMA_RACE_MAX_FOLLOW_DEV_PCT = 9.0
 # Flatten if a fill never happens (safety). 0 = hold until TP/SL only.
 EMA_RACE_MAX_POSITION_HOURS = 6.0
 
