@@ -264,6 +264,7 @@ def race_candidates(
     learner: RaceLearner,
     min_dev_pct: float,
     skip_coin: str | None = None,
+    policies: tuple[str, ...] = ("follow", "fade"),
 ) -> list[RaceCandidate]:
     """One candidate per (coin, policy). Ranked later by score."""
     usable = [
@@ -286,7 +287,7 @@ def race_candidates(
         bucket = str(buckets.get(snap.coin) or "na")
         rank = int(rank_of.get(snap.coin, 99))
         cm = learner.coin_mult(snap.coin)
-        for policy in ("follow", "fade"):
+        for policy in policies:
             ctx = ctx_key(policy, bucket, ema_s)
             w = learner.weight(ctx)
             # Farthest vs basket (rel, z) * learned context * coin memory.
@@ -323,20 +324,54 @@ def race_entry_reject(
     cand: RaceCandidate,
     *,
     tp_sl_pct: float,
-    min_d_to_sl: float = 1.2,
+    min_d_to_sl: float = 1.0,
     max_follow_dev_pct: float = 9.0,
+    max_follow_d_to_sl: float = 2.6,
+    allow_fade: bool = False,
+    min_rel_gainer: float = 2.0,
+    min_rel_loser: float = 1.20,
+    min_cross_bars: int = 8,
+    tape: dict | None = None,
+    max_adverse_last_bps: float = 25.0,
+    max_last_bar_sl_frac: float = 0.45,
 ) -> str | None:
-    """Skip setups the paper+live log stopped out. None = ok."""
+    """Skip setups the paper+live log stopped out. None = ok.
+
+    All checks are stretch / 24h-bucket / tape traits — not coin names.
+    """
     d = float(cand.abs_dev_pct)
     sl = max(0.05, float(tp_sl_pct))
+    if cand.policy == "fade" and not allow_fade:
+        return "no_fade"
     if cand.policy == "follow" and cand.bucket == "loser" and cand.side == "long":
         return "loser_long"
     if cand.policy == "follow" and cand.bucket == "gainer" and cand.side == "short":
         return "gainer_short"
     if d + 1e-12 < float(min_d_to_sl) * sl:
         return "d<sl"
-    if cand.policy == "follow" and d > float(max_follow_dev_pct) + 1e-12:
-        return "d_ext"
+    ratio = d / sl
+    if cand.policy == "follow":
+        if d > float(max_follow_dev_pct) + 1e-12:
+            return "d_ext"
+        if ratio > float(max_follow_d_to_sl) + 1e-12:
+            return "d_ext"
+        if cand.bucket == "gainer" and float(cand.rel) + 1e-12 < float(min_rel_gainer):
+            return "rel"
+        if cand.bucket == "loser" and float(cand.rel) + 1e-12 < float(min_rel_loser):
+            return "rel"
+    if int(cand.cross_bars) < int(min_cross_bars):
+        return "xbars"
+    row = tape if isinstance(tape, dict) else {}
+    last_bps = float(row.get("last_bar_bps") or 0.0)
+    if float(max_adverse_last_bps) > 0:
+        lim = float(max_adverse_last_bps)
+        if cand.side == "long" and last_bps < -lim:
+            return "last_vs"
+        if cand.side == "short" and last_bps > lim:
+            return "last_vs"
+    if float(max_last_bar_sl_frac) > 0:
+        if abs(last_bps) / 100.0 > float(max_last_bar_sl_frac) * sl + 1e-12:
+            return "last_bar"
     return None
 
 

@@ -50,7 +50,6 @@ from src.ema_race import (
     RaceStore,
     RaceTrade,
     board_rows as race_board_rows,
-    pick_race,
     race_candidates,
     race_entry_reject,
     tp_sl_price_pct,
@@ -866,8 +865,8 @@ def main() -> None:
     if race_on:
         logger.info(
             "EMA-race ON (no tune) | %s EMA(%s) | 24h movers vs each other | "
-            "pick max stretch * learned ctx | follow=long above/short below "
-            "fade=opposite | 1:1 TP/SL (price=risk/lev, min %.2f%%) | "
+            "pick max stretch among filters | follow only (no fade) | "
+            "1:1 TP/SL (price=risk/lev, min %.2f%%) | "
             "margin=%.0f%% of equity lev<=%sx | "
             "same-coin cooldown=%.0fs sl-cool=%.0fs | max_hold=%.1fh | orders=MARKET "
             "(paper and live) | journal=%s learn=%s",
@@ -877,7 +876,7 @@ def main() -> None:
             float(getattr(cfg, "EMA_RACE_MARGIN_PCT", 50) or 50),
             int(getattr(cfg, "EMA_RACE_MAX_LEVERAGE", 10) or 10),
             float(getattr(cfg, "EMA_RACE_SAME_COIN_COOLDOWN_S", 180) or 180),
-            float(getattr(cfg, "EMA_RACE_SL_COOLDOWN_S", 900) or 900),
+            float(getattr(cfg, "EMA_RACE_SL_COOLDOWN_S", 2700) or 2700),
             float(getattr(cfg, "EMA_RACE_MAX_POSITION_HOURS", 0) or 0),
             race_journal.path,
             race_learn.path,
@@ -2501,6 +2500,7 @@ def main() -> None:
         iv = _race_iv()
         min_dev = float(getattr(cfg, "EMA_RACE_MIN_DEV_PCT", 0.25) or 0)
         snaps = []
+        tapes: dict[str, dict] = {}
         by_coin = {e.api_coin: e for e in watch}
         for entry in watch:
             candles = client.get_closed_candles_for(
@@ -2510,12 +2510,13 @@ def main() -> None:
             if snap is None:
                 continue
             snaps.append(snap)
+            tapes[entry.api_coin] = tape_from_candles(candles)
         skip_coin = None
         prev = race_store.trade
         cool = float(getattr(cfg, "EMA_RACE_SAME_COIN_COOLDOWN_S", 180) or 0)
         if prev is not None and not bool(getattr(prev, "last_exit_win", True)):
             cool = max(
-                cool, float(getattr(cfg, "EMA_RACE_SL_COOLDOWN_S", 900) or 0)
+                cool, float(getattr(cfg, "EMA_RACE_SL_COOLDOWN_S", 2700) or 0)
             )
         if (
             prev is not None
@@ -2524,18 +2525,19 @@ def main() -> None:
             and time.time() - float(prev.last_exit_at or 0) < cool
         ):
             skip_coin = prev.last_exit_coin
+        allow_fade = bool(getattr(cfg, "EMA_RACE_ALLOW_FADE", False))
         cands = race_candidates(
             snaps,
             buckets=mover_buckets,
             learner=race_learn,
             min_dev_pct=min_dev,
             skip_coin=skip_coin,
+            policies=("follow", "fade") if allow_fade else ("follow",),
         )
-        winner = pick_race(cands)
         now_s = time.time()
         board = race_board_rows(cands, n=8)
         board_txt = race_compact_board(board, n=8)
-        if winner is None:
+        if not cands:
             if now_s - last_race_scan_log >= 120.0:
                 last_race_scan_log = now_s
                 logger.info(
@@ -2545,17 +2547,34 @@ def main() -> None:
                     min_dev,
                 )
             return False
-        tried: set[str] = set()
+        risk = float(getattr(cfg, "EMA_RACE_EQUITY_RISK_PCT", 10) or 10)
+        reject_kw = dict(
+            min_d_to_sl=float(getattr(cfg, "EMA_RACE_MIN_D_TO_SL", 1.0) or 1.0),
+            max_follow_dev_pct=float(
+                getattr(cfg, "EMA_RACE_MAX_FOLLOW_DEV_PCT", 9.0) or 9.0
+            ),
+            max_follow_d_to_sl=float(
+                getattr(cfg, "EMA_RACE_MAX_FOLLOW_D_TO_SL", 2.6) or 2.6
+            ),
+            allow_fade=allow_fade,
+            min_rel_gainer=float(getattr(cfg, "EMA_RACE_MIN_REL_GAINER", 2.0) or 2.0),
+            min_rel_loser=float(getattr(cfg, "EMA_RACE_MIN_REL_LOSER", 1.2) or 1.2),
+            min_cross_bars=int(getattr(cfg, "EMA_RACE_MIN_CROSS_BARS", 8) or 8),
+            max_adverse_last_bps=float(
+                getattr(cfg, "EMA_RACE_MAX_ADVERSE_LAST_BPS", 25) or 25
+            ),
+            max_last_bar_sl_frac=float(
+                getattr(cfg, "EMA_RACE_MAX_LAST_BAR_SL_FRAC", 0.45) or 0.45
+            ),
+        )
+        passed: list[tuple] = []
         for cand in cands:
-            if cand.coin in tried:
-                continue
             if now_s < float(last_race_fail.get(cand.coin, 0) or 0):
                 continue
             entry = by_coin.get(cand.coin)
             if entry is None:
                 continue
             lev = _race_lev(entry)
-            risk = float(getattr(cfg, "EMA_RACE_EQUITY_RISK_PCT", 10) or 10)
             tp_sl = tp_sl_price_pct(
                 lev,
                 risk,
@@ -2564,21 +2583,36 @@ def main() -> None:
             why = race_entry_reject(
                 cand,
                 tp_sl_pct=tp_sl,
-                min_d_to_sl=float(getattr(cfg, "EMA_RACE_MIN_D_TO_SL", 1.2) or 1.2),
-                max_follow_dev_pct=float(
-                    getattr(cfg, "EMA_RACE_MAX_FOLLOW_DEV_PCT", 9.0) or 9.0
-                ),
+                tape=tapes.get(cand.coin) or {},
+                **reject_kw,
             )
             if why:
-                logger.info(
-                    "RACE skip %s — %s D=%.2f%% sl=%.2f%% %s",
-                    cand.coin,
-                    why,
-                    cand.abs_dev_pct,
-                    tp_sl,
-                    cand.ctx,
-                )
+                if int(cand.rank) <= 3:
+                    logger.info(
+                        "RACE skip %s — %s D=%.2f%% sl=%.2f%% rel=%.2f %s",
+                        cand.coin,
+                        why,
+                        cand.abs_dev_pct,
+                        tp_sl,
+                        cand.rel,
+                        cand.ctx,
+                    )
                 continue
+            passed.append((cand, entry, lev, tp_sl))
+        passed.sort(key=lambda t: (-t[0].abs_dev_pct, -t[0].score, t[0].coin))
+        winner = passed[0][0] if passed else None
+        if winner is None:
+            if now_s - last_race_scan_log >= 120.0:
+                last_race_scan_log = now_s
+                logger.info(
+                    "RACE_SCAN idle n=%s skip=%s (no setup passed) | %s",
+                    len(snaps),
+                    skip_coin or "-",
+                    board_txt,
+                )
+            return False
+        tried: set[str] = set()
+        for cand, entry, lev, tp_sl in passed:
             if cand.coin in tried:
                 continue
             tried.add(cand.coin)
@@ -2643,14 +2677,7 @@ def main() -> None:
             ntl = float(pos.size) * float(fill)
             if equity > 0:
                 actual_risk = ntl * (tp_sl / 100.0) / equity * 100.0
-            tape = tape_from_candles([])
-            try:
-                candles = client.get_closed_candles_for(
-                    entry.api_coin, iv, min_bars=max(40, period + 30)
-                )
-                tape = tape_from_candles(candles)
-            except Exception:
-                tape = {}
+            tape = tapes.get(entry.api_coin) or {}
             ctx = {
                 "coin": entry.api_coin,
                 "side": pos.side,

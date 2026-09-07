@@ -33,11 +33,25 @@ EMA_RACE_MARGIN_PCT = 50.0
 EMA_RACE_MAX_LEVERAGE = 10
 # Same coin after a TP. After an SL this is replaced by EMA_RACE_SL_COOLDOWN_S.
 EMA_RACE_SAME_COIN_COOLDOWN_S = 180.0
-EMA_RACE_SL_COOLDOWN_S = 900.0
-# Follow only when |close-EMA| is at least this × the stop (CHIP/CASHCAT D < SL).
-EMA_RACE_MIN_D_TO_SL = 1.2
-# Follow already-spent dumps (live HEMI −11.56% then bounce SL).
+EMA_RACE_SL_COOLDOWN_S = 2700.0
+# Follow only when |close-EMA| clears the stop. 1.0 = D >= SL (3x names with
+# D just over a 3.33% stop can still follow; D below the stop cannot).
+EMA_RACE_MIN_D_TO_SL = 1.0
+# Follow already-spent extension vs the stop (D / SL). Scales with leverage:
+# 10x 1% stop → skip if D > 2.6%; 3x 3.33% stop → skip if D > ~8.7%.
+EMA_RACE_MAX_FOLLOW_D_TO_SL = 2.6
 EMA_RACE_MAX_FOLLOW_DEV_PCT = 9.0
+# Fade (fade-short a 24h gainer / fade-long a dump) was net negative live.
+EMA_RACE_ALLOW_FADE = False
+# 24h-gainer follow-longs need a real standout vs the basket (rel = D / mean D).
+# Loser follow-shorts can be a bit less stretched (continuation, not chase).
+EMA_RACE_MIN_REL_GAINER = 2.0
+EMA_RACE_MIN_REL_LOSER = 1.20
+EMA_RACE_MIN_CROSS_BARS = 8
+# Last closed 1m bar: skip if it already ran against the trade, or ate a
+# large fraction of the stop in one minute (chop / spike).
+EMA_RACE_MAX_ADVERSE_LAST_BPS = 25.0
+EMA_RACE_MAX_LAST_BAR_SL_FRAC = 0.45
 # Flatten if a fill never happens (safety). 0 = hold until TP/SL only.
 EMA_RACE_MAX_POSITION_HOURS = 6.0
 
