@@ -341,7 +341,7 @@ DCA_MAX_ADDS = 1
 # False = real Hyperliquid orders
 # Paper uses MARKET orders only (same path as live EMA with EMA_DEV_LIMIT_ORDERS=False).
 # Do not turn limit/maker on in paper — those fills would not match live.
-PAPER_TRADING = True
+PAPER_TRADING = False
 PAPER_START_BALANCE = 1000.0
 USE_MARKET_ORDERS = True
 MARKET_ORDER_SLIPPAGE = 0.05
