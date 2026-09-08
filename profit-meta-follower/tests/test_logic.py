@@ -2090,7 +2090,7 @@ class MajorityHoldTests(unittest.TestCase):
                 "MAJORITY_MAX_PAIR_SHARE": 1.0,
                 "MAJORITY_STICKY": False,
                 "MAJORITY_SINGLE_PAIR": False,
-                "MAJORITY_SINGLE_GROSS_PCT": 98.0,
+                "MAJORITY_SINGLE_GROSS_PCT": 95.0,
                 "MAX_COINS_IN_BOOK": 4,
                 "OUR_GROSS_MARGIN_PCT": 95.0,
                 "OUR_MIN_LEVERAGE": 2,
@@ -2166,11 +2166,11 @@ class MajorityHoldTests(unittest.TestCase):
 
         from pmf.majority import pick_majority_targets, tally_holds
         from pmf.rebalancer import plan_actions
-        from pmf.types import OurPos
+        from pmf.types import OurPos, TargetPos
 
         cfg = self._cfg()
         cfg.MAJORITY_SINGLE_PAIR = True
-        cfg.MAJORITY_SINGLE_GROSS_PCT = 98.0
+        cfg.MAJORITY_SINGLE_GROSS_PCT = 95.0
         cfg.MAJORITY_STICKY = True
         snaps = []
         n = 0
@@ -2189,7 +2189,7 @@ class MajorityHoldTests(unittest.TestCase):
             markets={},
         )
         self.assertEqual([t.coin for t in targets], ["ZEC"])
-        self.assertAlmostEqual(targets[0].margin_pct, 98.0, places=2)
+        self.assertAlmostEqual(targets[0].margin_pct, 95.0, places=2)
         self.assertTrue(meta["single"])
         self.assertEqual(meta["max_pairs"], 1)
 
@@ -2219,6 +2219,20 @@ class MajorityHoldTests(unittest.TestCase):
         self.assertEqual(closed, {"ETH", "NEAR", "ARB"})
         self.assertNotIn("ZEC", closed)
         self.assertNotIn("ZEC", opened)
+        zec_tgt = TargetPos("ZEC", "long", 9, 95.0, 1.0)
+        acts_force = plan_actions(
+            [ours[0]],
+            [zec_tgt],
+            20.56,
+            plan_cfg,
+            managed={"ZEC"},
+            flatten_foreign=True,
+            open_largest_first=True,
+            force_resize=True,
+        )
+        self.assertTrue(any(a.kind == "resize" and a.coin == "ZEC" for a in acts_force))
+        self.assertFalse(any(a.kind == "open" for a in acts_force))
+        self.assertFalse(any(a.kind == "close" and a.coin == "ZEC" for a in acts_force))
 
     def test_next_open_uses_current_free_not_stale_equity(self) -> None:
         from pmf.majority import next_open_margin_usd

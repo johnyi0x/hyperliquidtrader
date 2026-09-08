@@ -47,7 +47,7 @@ from .swing_exec import SwingTrader
 from .strategy_spec import strategy_from_cfg
 from .telemetry import TelemetryWriter, compact_votes
 from .tracker import BasketTracker
-from .types import QualifiedWallet, WalletSnapshot
+from .types import QualifiedWallet, TargetPos, WalletSnapshot
 
 
 def _basket_from_state(raw: list[Any]) -> list[QualifiedWallet]:
@@ -1272,6 +1272,99 @@ class ProfitMetaRunner:
             or 2.5
         )
 
+    def _force_resize_token(self) -> str:
+        return str(getattr(self.cfg, "MAJORITY_FORCE_RESIZE_ID", "") or "").strip()
+
+    def _force_resize_pending(self) -> bool:
+        if not bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False)):
+            return False
+        if not bool(getattr(self.cfg, "MAJORITY_FORCE_RESIZE_ONCE", False)):
+            return False
+        token = self._force_resize_token()
+        if not token:
+            return False
+        return str(self.store.data.get("majority_force_resize_id") or "") != token
+
+    def _majority_fast_topup(self, now: float) -> bool:
+        """Add to the live keep at 95% without a 200-wallet snap or close/reopen."""
+        try:
+            ours, equity = self.rebalancer.current_book()
+        except Exception as exc:
+            self.log.warning("MAJORITY one-shot — cannot read book: %s", exc)
+            return False
+        if equity <= 0 or not ours:
+            self.log.info("MAJORITY one-shot — no live position to add to")
+            return False
+        last = self.store.data.get("last_targets") or []
+        keep = ""
+        if isinstance(last, list) and last and isinstance(last[0], dict):
+            keep = str(last[0].get("coin") or "")
+        have = {p.coin: p for p in ours}
+        if keep not in have:
+            keep = max(ours, key=lambda p: p.notional).coin
+        pos = have[keep]
+        lev = max(1, int(pos.leverage or 1))
+        if isinstance(last, list):
+            for row in last:
+                if isinstance(row, dict) and str(row.get("coin") or "") == keep:
+                    lev = max(1, int(row.get("leverage") or lev))
+                    break
+        gross = majority_gross_pct(self.cfg)
+        target = TargetPos(
+            coin=pos.coin,
+            side=pos.side,
+            leverage=lev,
+            margin_pct=gross,
+            conviction=0.0,
+        )
+        self.log.info(
+            "MAJORITY one-shot add %s %s — %.0f%% of $%.2f (have ntl=$%.2f, no close/reopen)",
+            pos.side,
+            pos.coin,
+            gross,
+            equity,
+            pos.notional,
+        )
+        managed = set(str(x) for x in (self.store.data.get("managed_coins") or []))
+        managed.add(pos.coin)
+        result = self.rebalancer.run([target], managed, 0.0, now, force_resize=True)
+        if not isinstance(result, tuple) or len(result) != 2:
+            return False
+        new_managed, attempted = result
+        new_managed.add(pos.coin)
+        tgt_n = (gross / 100.0) * equity * max(1, lev)
+        try:
+            ours2, _ = self.rebalancer.current_book()
+            p2 = next((p for p in ours2 if p.coin == pos.coin), pos)
+        except Exception:
+            p2 = pos
+        close_enough = tgt_n <= 1e-9 or p2.notional >= 0.80 * tgt_n
+        if attempted or close_enough:
+            self.store.data["majority_force_resize_id"] = self._force_resize_token()
+        self.store.data["majority_single_pair"] = True
+        self.store.data["managed_coins"] = sorted(new_managed)
+        self.store.data["majority_board_txt"] = f"{pos.side}:{pos.coin}"
+        self.store.data["last_targets"] = [
+            {
+                "coin": target.coin,
+                "side": target.side,
+                "leverage": target.leverage,
+                "margin_pct": target.margin_pct,
+                "conviction": target.conviction,
+            }
+        ]
+        if attempted:
+            self.store.data["last_rebalance_at"] = now
+        self.store.save()
+        self._save_paper()
+        self.log.info(
+            "MAJORITY one-shot done | keep=%s attempted=%s managed=%s",
+            pos.coin,
+            attempted,
+            ",".join(sorted(new_managed)) or "-",
+        )
+        return True
+
     def cycle_majority(self) -> None:
         """Hold the crowd's most-held (coin, side) book. Rebuild every N hours."""
         now = time.time()
@@ -1296,6 +1389,12 @@ class ProfitMetaRunner:
                     "MAJORITY single-pair — flatten extras now | have=%s",
                     ",".join(sorted(managed)) or "-",
                 )
+        if self._force_resize_pending():
+            due = True
+            self.log.info(
+                "MAJORITY one-shot top-up to %.0f%% — skip 2.5h wait",
+                majority_gross_pct(self.cfg),
+            )
         if not due:
             if now - float(self.store.data.get("majority_idle_log_at") or 0) >= 300.0:
                 left_h = refresh_h - (now - last_meta) / 3600.0
@@ -1315,6 +1414,10 @@ class ProfitMetaRunner:
                     }
                 )
                 self.store.save()
+            return
+
+        if want_single and self._force_resize_pending():
+            self._majority_fast_topup(now)
             return
 
         listed = len(self.tracker.addrs)
@@ -1443,7 +1546,13 @@ class ProfitMetaRunner:
         )
 
         last_reb = float(self.store.data.get("last_rebalance_at") or 0)
-        result = self.rebalancer.run(targets, managed, last_reb, now)
+        result = self.rebalancer.run(
+            targets,
+            managed,
+            last_reb,
+            now,
+            force_resize=self._force_resize_pending(),
+        )
         if not isinstance(result, tuple) or len(result) != 2:
             self.log.error("rebalancer.run returned %r — skip apply", result)
             new_managed, attempted = managed, False
@@ -1453,6 +1562,8 @@ class ProfitMetaRunner:
         held_keys = [f"{t.side}:{t.coin}" for t in held]
         self.store.data["majority_meta_at"] = now
         self.store.data["majority_single_pair"] = bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False))
+        if self._force_resize_pending() and any(t.coin in new_managed for t in targets):
+            self.store.data["majority_force_resize_id"] = self._force_resize_token()
         self.store.data["majority_board_txt"] = ", ".join(held_keys) or "-"
         self.store.data["majority_stats"] = stats
         self.store.data["last_targets"] = [

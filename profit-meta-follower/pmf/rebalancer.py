@@ -101,10 +101,13 @@ def plan_actions(
     *,
     flatten_foreign: bool = False,
     open_largest_first: bool = False,
+    force_resize: bool = False,
 ) -> list[Action]:
     have = {p.coin: p for p in ours}
     want = {t.coin: t for t in targets}
     drift = float(cfg.REBALANCE_DRIFT_PCT) / 100.0
+    if force_resize:
+        drift = min(drift, 0.02)
     actions: list[Action] = []
     margin_of = {t.coin: float(t.margin_pct) for t in targets}
 
@@ -171,6 +174,11 @@ class Rebalancer:
         )
 
     def _margin_buffer(self) -> float:
+        if bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False)):
+            return min(
+                0.95,
+                max(0.70, float(getattr(self.cfg, "MAJORITY_SINGLE_MARGIN_BUFFER", 0.90) or 0.90)),
+            )
         return min(0.90, max(0.50, float(getattr(self.cfg, "MAJORITY_MARGIN_BUFFER", 0.70) or 0.70)))
 
     def _free_margin(self, equity: float) -> float:
@@ -531,6 +539,8 @@ class Rebalancer:
         managed: set[str],
         last_rebalance_at: float,
         now: float,
+        *,
+        force_resize: bool = False,
     ) -> tuple[set[str], bool]:
         try:
             ours, equity = self.current_book()
@@ -551,9 +561,11 @@ class Rebalancer:
             managed,
             flatten_foreign=majority,
             open_largest_first=majority,
+            force_resize=force_resize,
         )
         if not actions:
-            return managed, False
+            live_keep = {p.coin for p in ours} & {t.coin for t in targets}
+            return managed | live_keep, False
         cooldown = float(self.cfg.REBALANCE_COOLDOWN_S)
         on_cooldown = cooldown > 0 and (now - last_rebalance_at) < cooldown
         if on_cooldown:
@@ -643,5 +655,12 @@ class Rebalancer:
                     self.log.error("Action open %s crashed: %s", act.coin, exc)
         if did:
             self.log.info("Rebalance applied %s/%s", did, len(actions))
+        try:
+            live, _ = self.current_book()
+            for p in live:
+                if p.coin in target_map:
+                    new_managed.add(p.coin)
+        except Exception:
+            pass
         # Only start the cooldown after a fill. Failed opens retry next tick.
         return new_managed, did > 0

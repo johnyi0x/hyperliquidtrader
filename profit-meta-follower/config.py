@@ -47,7 +47,12 @@ MAJORITY_SNAP_SLEEP_S = 0.12
 # Toggle live: PMF_MAJORITY_SINGLE_PAIR=0|1 (cloud default on).
 MAJORITY_SINGLE_PAIR = False
 # Gross margin when single-pair is on (falls back to OUR_GROSS_MARGIN_PCT if 0).
-MAJORITY_SINGLE_GROSS_PCT = 98.0
+MAJORITY_SINGLE_GROSS_PCT = 95.0
+# One-shot add on the live keep (ignore 40% drift). Token in store so it runs once.
+MAJORITY_FORCE_RESIZE_ONCE = False
+MAJORITY_FORCE_RESIZE_ID = ""
+# Single-pair add uses more of free IM than the 4-name sequential buffer.
+MAJORITY_SINGLE_MARGIN_BUFFER = 0.90
 # Fraction of *current* free margin used for the remaining book (HL IM > notional/lev).
 # HL initial margin is often ~25–40% above notional/leverage. Stay under free.
 MAJORITY_MARGIN_BUFFER = 0.70
