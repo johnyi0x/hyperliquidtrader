@@ -43,6 +43,11 @@ MAJORITY_MAX_PAIR_SHARE = 0.70
 MAJORITY_MIN_COVERAGE = 0.70
 MAJORITY_STICKY = True
 MAJORITY_SNAP_SLEEP_S = 0.12
+# One name only: the most-held (pair, side). Off = top MAX_COINS_IN_BOOK split by votes.
+# Toggle live: PMF_MAJORITY_SINGLE_PAIR=0|1 (cloud default on).
+MAJORITY_SINGLE_PAIR = False
+# Gross margin when single-pair is on (falls back to OUR_GROSS_MARGIN_PCT if 0).
+MAJORITY_SINGLE_GROSS_PCT = 98.0
 # Fraction of *current* free margin used for the remaining book (HL IM > notional/lev).
 # HL initial margin is often ~25–40% above notional/leverage. Stay under free.
 MAJORITY_MARGIN_BUFFER = 0.70

@@ -79,4 +79,9 @@ def apply_profile(module_globals: dict[str, Any]) -> str:
     run_mode = env_mode
     if run_mode in ("crowd", "copy", "copy_reverse", "majority", "majority_hold", "meta"):
         module_globals["RUN_MODE"] = "majority" if run_mode in ("majority_hold", "meta") else run_mode
+    env_single = str(os.environ.get("PMF_MAJORITY_SINGLE_PAIR", "") or "").strip().lower()
+    if env_single in ("1", "true", "yes", "on"):
+        module_globals["MAJORITY_SINGLE_PAIR"] = True
+    elif env_single in ("0", "false", "no", "off"):
+        module_globals["MAJORITY_SINGLE_PAIR"] = False
     return name

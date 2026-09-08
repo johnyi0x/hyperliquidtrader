@@ -29,6 +29,7 @@ from .copy_score import (
 )
 from .majority import (
     compact_hold_board,
+    majority_gross_pct,
     pick_majority_targets,
     tally_holds,
 )
@@ -1277,6 +1278,24 @@ class ProfitMetaRunner:
         refresh_h = self._majority_refresh_h()
         last_meta = float(self.store.data.get("majority_meta_at") or 0)
         due = last_meta <= 0 or (now - last_meta) / 3600.0 >= refresh_h
+        managed = set(str(x) for x in (self.store.data.get("managed_coins") or []))
+        want_single = bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False))
+        was_single = bool(self.store.data.get("majority_single_pair"))
+        if want_single != was_single:
+            due = True
+            self.log.info(
+                "MAJORITY single-pair %s — run meta now (was %s)",
+                "on" if want_single else "off",
+                "on" if was_single else "off",
+            )
+        if want_single and len(managed) > 1:
+            last_try = float(self.store.data.get("majority_single_flatten_at") or 0)
+            if last_try <= 0 or (now - last_try) >= 180.0:
+                due = True
+                self.log.info(
+                    "MAJORITY single-pair — flatten extras now | have=%s",
+                    ",".join(sorted(managed)) or "-",
+                )
         if not due:
             if now - float(self.store.data.get("majority_idle_log_at") or 0) >= 300.0:
                 left_h = refresh_h - (now - last_meta) / 3600.0
@@ -1302,6 +1321,9 @@ class ProfitMetaRunner:
         if listed < 5:
             self.log.warning("MAJORITY basket empty — waiting for leaderboard refresh")
             return
+        if want_single and len(managed) > 1:
+            self.store.data["majority_single_flatten_at"] = now
+            self.store.save()
 
         sleep_s = float(getattr(self.cfg, "MAJORITY_SNAP_SLEEP_S", 0.12) or 0.0)
         self.log.info(
@@ -1372,6 +1394,14 @@ class ProfitMetaRunner:
             )
             or "-",
         )
+        if bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False)):
+            keep = [t.coin for t in targets]
+            extra = sorted(c for c in managed if c not in set(keep))
+            self.log.info(
+                "MAJORITY single-pair | keep=%s flatten=%s (no close/reopen on keep)",
+                ",".join(keep) or "-",
+                ",".join(extra) or "-",
+            )
         for r in annotated[:16]:
             if r.skip:
                 self.log.info(
@@ -1422,6 +1452,7 @@ class ProfitMetaRunner:
         held = [t for t in targets if t.coin in new_managed]
         held_keys = [f"{t.side}:{t.coin}" for t in held]
         self.store.data["majority_meta_at"] = now
+        self.store.data["majority_single_pair"] = bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False))
         self.store.data["majority_board_txt"] = ", ".join(held_keys) or "-"
         self.store.data["majority_stats"] = stats
         self.store.data["last_targets"] = [
@@ -1657,14 +1688,15 @@ class ProfitMetaRunner:
             elif self._is_majority_mode():
                 self.log.info(
                     "MAJORITY portfolio running | profile=%s paper=%s wallets=%s window=%s "
-                    "pairs<=%s gross=%.0f%% min_hold=%.0f%% min_agr=%.0f%% refresh=%.1fh "
+                    "pairs<=%s single=%s gross=%.0f%% min_hold=%.0f%% min_agr=%.0f%% refresh=%.1fh "
                     "filter=off sticky=%s scope=%s",
                     getattr(self.cfg, "PMF_PROFILE", "local"),
                     bool(self.cfg.PAPER_TRADING),
                     int(getattr(self.cfg, "BASKET_SIZE", 200) or 200),
                     str(getattr(self.cfg, "RANK_WINDOW", "week") or "week"),
                     int(getattr(self.cfg, "MAX_COINS_IN_BOOK", 4) or 4),
-                    float(getattr(self.cfg, "OUR_GROSS_MARGIN_PCT", 95) or 95),
+                    bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False)),
+                    majority_gross_pct(self.cfg),
                     float(getattr(self.cfg, "MAJORITY_MIN_HOLD_PCT", 0.05) or 0) * 100.0,
                     float(getattr(self.cfg, "MAJORITY_MIN_SIDE_AGREEMENT", 0.55) or 0) * 100.0,
                     self._majority_refresh_h(),

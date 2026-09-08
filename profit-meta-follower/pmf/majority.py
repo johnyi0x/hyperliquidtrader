@@ -192,6 +192,20 @@ def _eligible(row: HoldRow, cfg: Any, markets: dict[str, MarketCtx], *, exit_ban
     return ""
 
 
+def majority_max_pairs(cfg: Any) -> int:
+    if bool(getattr(cfg, "MAJORITY_SINGLE_PAIR", False)):
+        return 1
+    return max(1, int(getattr(cfg, "MAX_COINS_IN_BOOK", 4) or 4))
+
+
+def majority_gross_pct(cfg: Any) -> float:
+    if bool(getattr(cfg, "MAJORITY_SINGLE_PAIR", False)):
+        extra = float(getattr(cfg, "MAJORITY_SINGLE_GROSS_PCT", 0) or 0)
+        if extra > 0:
+            return extra
+    return float(getattr(cfg, "OUR_GROSS_MARGIN_PCT", 95.0) or 95.0)
+
+
 def pick_majority_targets(
     rows: list[HoldRow],
     cfg: Any,
@@ -199,13 +213,17 @@ def pick_majority_targets(
     managed: set[str] | None = None,
     markets: dict[str, MarketCtx] | None = None,
 ) -> tuple[list[TargetPos], list[HoldRow], dict[str, Any]]:
-    """Top MAX_COINS_IN_BOOK coins, margin ∝ wallet-count, sum ≈ OUR_GROSS_MARGIN_PCT."""
+    """Top MAX_COINS_IN_BOOK coins, margin ∝ wallet-count, sum ≈ OUR_GROSS_MARGIN_PCT.
+
+    MAJORITY_SINGLE_PAIR=True → only the #1 most-held eligible pair, full gross.
+    """
     markets = markets or {}
     managed = {str(c) for c in (managed or ())}
-    max_n = max(1, int(getattr(cfg, "MAX_COINS_IN_BOOK", 4) or 4))
-    gross = float(getattr(cfg, "OUR_GROSS_MARGIN_PCT", 95.0) or 95.0)
+    single = bool(getattr(cfg, "MAJORITY_SINGLE_PAIR", False))
+    max_n = majority_max_pairs(cfg)
+    gross = majority_gross_pct(cfg)
     max_share = float(getattr(cfg, "MAJORITY_MAX_PAIR_SHARE", 0.70) or 0.70)
-    sticky = bool(getattr(cfg, "MAJORITY_STICKY", True))
+    sticky = bool(getattr(cfg, "MAJORITY_STICKY", True)) and not single
 
     annotated: list[HoldRow] = []
     for row in rows:
@@ -292,6 +310,7 @@ def pick_majority_targets(
         "max_pairs": max_n,
         "eligible": len(fresh),
         "sticky": sticky,
+        "single": single,
     }
     return targets, annotated, meta
 

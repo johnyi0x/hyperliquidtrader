@@ -2089,6 +2089,8 @@ class MajorityHoldTests(unittest.TestCase):
                 "MAJORITY_MIN_SIDE_AGREEMENT": 0.55,
                 "MAJORITY_MAX_PAIR_SHARE": 1.0,
                 "MAJORITY_STICKY": False,
+                "MAJORITY_SINGLE_PAIR": False,
+                "MAJORITY_SINGLE_GROSS_PCT": 98.0,
                 "MAX_COINS_IN_BOOK": 4,
                 "OUR_GROSS_MARGIN_PCT": 95.0,
                 "OUR_MIN_LEVERAGE": 2,
@@ -2158,6 +2160,65 @@ class MajorityHoldTests(unittest.TestCase):
         self.assertEqual([t.coin for t in targets], ["AAA", "BBB"])
         ddd = next(r for r in annotated if r.coin == "DDD")
         self.assertEqual(ddd.skip, "hold_pct")
+
+    def test_single_pair_keeps_top_name_not_satellites(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.majority import pick_majority_targets, tally_holds
+        from pmf.rebalancer import plan_actions
+        from pmf.types import OurPos
+
+        cfg = self._cfg()
+        cfg.MAJORITY_SINGLE_PAIR = True
+        cfg.MAJORITY_SINGLE_GROSS_PCT = 98.0
+        cfg.MAJORITY_STICKY = True
+        snaps = []
+        n = 0
+        for coin, count in (("ZEC", 62), ("NEAR", 18), ("ETH", 16), ("ARB", 11)):
+            for _ in range(count):
+                snaps.append(_snap(f"0x{n:040x}", 8_000, {coin: 0.2}))
+                n += 1
+        for _ in range(200 - n):
+            snaps.append(_snap(f"0x{n:040x}", 8_000, {}))
+            n += 1
+        rows, _ = tally_holds(snaps, cfg, now=1_000.0)
+        targets, _, meta = pick_majority_targets(
+            rows,
+            cfg,
+            managed={"ZEC", "ETH", "NEAR", "ARB"},
+            markets={},
+        )
+        self.assertEqual([t.coin for t in targets], ["ZEC"])
+        self.assertAlmostEqual(targets[0].margin_pct, 98.0, places=2)
+        self.assertTrue(meta["single"])
+        self.assertEqual(meta["max_pairs"], 1)
+
+        plan_cfg = SimpleNamespace(
+            MANAGED_ONLY=True,
+            FLATTEN_WHEN_DROPPED=True,
+            REBALANCE_DRIFT_PCT=40.0,
+            MAX_ACTIONS_PER_CYCLE=12,
+        )
+        ours = [
+            OurPos("ZEC", "long", 0.10, 117.0, 1143.0, 9),
+            OurPos("ETH", "long", 0.0408, 101.0, 2499.0, 20),
+            OurPos("NEAR", "long", 11.6, 26.7, 2.27, 10),
+            OurPos("ARB", "long", 135.9, 22.8, 0.17, 8),
+        ]
+        acts = plan_actions(
+            ours,
+            targets,
+            26.45,
+            plan_cfg,
+            managed={"ZEC", "ETH", "NEAR", "ARB"},
+            flatten_foreign=True,
+            open_largest_first=True,
+        )
+        closed = {a.coin for a in acts if a.kind == "close"}
+        opened = {a.coin for a in acts if a.kind == "open"}
+        self.assertEqual(closed, {"ETH", "NEAR", "ARB"})
+        self.assertNotIn("ZEC", closed)
+        self.assertNotIn("ZEC", opened)
 
     def test_next_open_uses_current_free_not_stale_equity(self) -> None:
         from pmf.majority import next_open_margin_usd

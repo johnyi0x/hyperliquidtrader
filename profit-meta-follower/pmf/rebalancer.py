@@ -426,6 +426,37 @@ class Rebalancer:
                 return False
             return True
         add_sz = round_size(delta, self.client.sz_decimals)
+        if add_sz <= 0:
+            return True
+        if self.paper is None and self._is_majority():
+            avail = self._free_margin(equity)
+            buf = self._margin_buffer()
+            cap_n = max(0.0, avail * buf) * max(1, t.leverage)
+            add_n = add_sz * mark
+            if add_n > cap_n + 1e-9:
+                if cap_n < float(self.cfg.MIN_ORDER_NOTIONAL_USD) or mark <= 0:
+                    self.log.info(
+                        "MAJORITY resize %s — free $%.2f cannot fit add, keep current size",
+                        t.coin,
+                        avail,
+                    )
+                    try:
+                        self.client.set_leverage(
+                            t.leverage,
+                            is_cross=bool(self.cfg.USE_CROSS_MARGIN) and not self.client.only_isolated,
+                        )
+                    except Exception as exc:
+                        self.log.warning("Leverage set failed %s: %s — continue", t.coin, exc)
+                    return True
+                add_sz = floor_size(cap_n / mark, self.client.sz_decimals)
+                if add_sz <= 0:
+                    return True
+                self.log.info(
+                    "MAJORITY resize shrink %s add notional $%.2f (free $%.2f)",
+                    t.coin,
+                    add_sz * mark,
+                    avail,
+                )
         try:
             self.client.set_leverage(t.leverage, is_cross=bool(self.cfg.USE_CROSS_MARGIN) and not self.client.only_isolated)
             self.client.place_market_open(
@@ -554,20 +585,31 @@ class Rebalancer:
             except Exception as exc:
                 self.log.error("Action close %s crashed: %s", act.coin, exc)
                 failed_close.add(act.coin)
+        if majority and closes:
+            if self.paper is None:
+                time.sleep(1.5)
+            try:
+                ours, equity = self.current_book()
+                have = {p.coin: p for p in ours}
+            except Exception:
+                pass
         for act in resizes:
             try:
                 t = target_map.get(act.coin)
                 if t is None:
                     continue
-                ok = self._resize(t, have[act.coin], equity)
+                pos = have.get(act.coin)
+                if pos is None:
+                    continue
+                ok = self._resize(t, pos, equity)
                 if ok:
                     new_managed.add(act.coin)
                     did += 1
             except Exception as exc:
                 self.log.error("Action resize %s crashed: %s", act.coin, exc)
         if majority and (closes or resizes):
-            if self.paper is None:
-                time.sleep(1.5)
+            if self.paper is None and resizes:
+                time.sleep(1.2)
             try:
                 ours, equity = self.current_book()
             except Exception:
