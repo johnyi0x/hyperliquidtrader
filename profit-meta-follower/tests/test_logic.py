@@ -2159,6 +2159,125 @@ class MajorityHoldTests(unittest.TestCase):
         ddd = next(r for r in annotated if r.coin == "DDD")
         self.assertEqual(ddd.skip, "hold_pct")
 
+    def test_next_open_uses_current_free_not_stale_equity(self) -> None:
+        from pmf.majority import next_open_margin_usd
+
+        buf = 0.70
+        # Same leftover that skipped ZEC live: planned $10.14 vs free $8.20.
+        last = next_open_margin_usd(
+            available=8.20,
+            this_weight=50.7,
+            rest_weight=50.7,
+            planned_usd=10.14,
+            buffer=buf,
+        )
+        self.assertGreater(last, 5.0)
+        self.assertLessEqual(last, 8.20 * buf + 1e-9)
+
+        # Sequential opens with HL using 1.35x more IM than notional/lev.
+        avail = 20.15
+        weights = [50.7, 15.1, 15.1, 14.0]
+        equity = 20.15
+        opened: list[float] = []
+        for i, w in enumerate(weights):
+            rest = sum(weights[i:])
+            planned = (w / 100.0) * equity
+            dollar = next_open_margin_usd(
+                available=avail,
+                this_weight=w,
+                rest_weight=rest,
+                planned_usd=planned,
+                buffer=buf,
+            )
+            self.assertGreater(dollar, 0.5, msg=f"coin {i} got $0 leftover={avail:.2f}")
+            self.assertLessEqual(dollar * 1.35, avail + 1e-6, msg=f"coin {i} IM over free")
+            avail = max(0.0, avail - dollar * 1.35)
+            opened.append(dollar)
+        self.assertEqual(len(opened), 4)
+        self.assertGreaterEqual(opened[-1], 1.0)
+
+    def test_flatten_foreign_and_largest_open_first(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.rebalancer import plan_actions
+        from pmf.types import OurPos, TargetPos
+
+        cfg = SimpleNamespace(
+            MANAGED_ONLY=True,
+            FLATTEN_WHEN_DROPPED=True,
+            REBALANCE_DRIFT_PCT=40.0,
+            MAX_ACTIONS_PER_CYCLE=12,
+        )
+        ours = [
+            OurPos("xyz:DRAM", "long", 1, 20, 10, 20),
+            OurPos("xyz:RKLB", "short", 1, 20, 10, 10),
+        ]
+        targets = [
+            TargetPos("ARB", "long", 8, 15.1, 1.0),
+            TargetPos("BTC", "short", 20, 15.1, -1.0),
+            TargetPos("NEAR", "long", 10, 14.0, 1.0),
+            TargetPos("ZEC", "long", 10, 50.7, 1.0),
+        ]
+        acts = plan_actions(
+            ours,
+            targets,
+            20.15,
+            cfg,
+            managed=set(),
+            flatten_foreign=True,
+            open_largest_first=True,
+        )
+        closed = [a.coin for a in acts if a.kind == "close"]
+        opens = [a.coin for a in acts if a.kind == "open"]
+        self.assertEqual(set(closed), {"xyz:DRAM", "xyz:RKLB"})
+        self.assertEqual(opens, ["ZEC", "ARB", "BTC", "NEAR"])
+        self.assertTrue(acts.index(next(a for a in acts if a.kind == "close")) < acts.index(next(a for a in acts if a.kind == "open")))
+
+    def test_majority_run_opens_all_four_after_foreign_close(self) -> None:
+        import logging
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from pmf.rebalancer import PaperBook, Rebalancer
+        from pmf.types import OurPos, TargetPos
+
+        cfg = SimpleNamespace(
+            RUN_MODE="majority",
+            MANAGED_ONLY=True,
+            FLATTEN_WHEN_DROPPED=True,
+            REBALANCE_DRIFT_PCT=40.0,
+            MAX_ACTIONS_PER_CYCLE=12,
+            REBALANCE_COOLDOWN_S=0,
+            MIN_ORDER_NOTIONAL_USD=10.0,
+            OUR_GROSS_MARGIN_PCT=95.0,
+            MAX_MARGIN_PER_COIN_PCT=100.0,
+            MAJORITY_MARGIN_BUFFER=0.70,
+            USE_CROSS_MARGIN=True,
+            USE_MARKET_ORDERS=True,
+            MARKET_ORDER_SLIPPAGE=0.015,
+            MAX_SPREAD_PCT=0.0,
+        )
+        log = logging.getLogger("maj")
+        paper = PaperBook(20.15, 0.0, log)
+        paper.positions["xyz:DRAM"] = OurPos("xyz:DRAM", "long", 0.4, 4.0, 10.0, 20)
+        client = MagicMock()
+        client.sz_decimals = 4
+        client.only_isolated = False
+        client.get_mark_price.return_value = 10.0
+        client.l2_book.return_value = {"levels": [[{"px": 9.99}], [{"px": 10.01}]]}
+        reb = Rebalancer(client, None, cfg, log, paper=paper)
+        targets = [
+            TargetPos("ARB", "long", 8, 15.1, 1.0),
+            TargetPos("BTC", "short", 20, 15.1, -1.0),
+            TargetPos("NEAR", "long", 10, 14.0, 1.0),
+            TargetPos("ZEC", "long", 10, 50.7, 1.0),
+        ]
+        managed, ok = reb.run(targets, set(), 0.0, 10.0)
+        self.assertTrue(ok)
+        self.assertEqual(set(paper.positions), {"ARB", "BTC", "NEAR", "ZEC"})
+        self.assertEqual(managed, {"ARB", "BTC", "NEAR", "ZEC"})
+        self.assertNotIn("xyz:DRAM", paper.positions)
+
 
 if __name__ == "__main__":
     unittest.main()

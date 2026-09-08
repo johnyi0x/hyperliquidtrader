@@ -13,6 +13,7 @@ from src.pricing import floor_size, round_size
 
 from .snapshots import SnapshotClient, parse_positions, account_value_from_states
 from .types import OurPos, TargetPos
+from .majority import next_open_margin_usd
 
 
 @dataclass
@@ -97,14 +98,20 @@ def plan_actions(
     equity: float,
     cfg: Any,
     managed: set[str],
+    *,
+    flatten_foreign: bool = False,
+    open_largest_first: bool = False,
 ) -> list[Action]:
     have = {p.coin: p for p in ours}
     want = {t.coin: t for t in targets}
     drift = float(cfg.REBALANCE_DRIFT_PCT) / 100.0
     actions: list[Action] = []
+    margin_of = {t.coin: float(t.margin_pct) for t in targets}
 
     for coin, pos in have.items():
         if bool(cfg.MANAGED_ONLY) and coin not in managed and coin not in want:
+            if flatten_foreign:
+                actions.append(Action("close", coin, pos.side, pos.size, pos.leverage, "foreign"))
             continue
         t = want.get(coin)
         if t is None:
@@ -120,17 +127,24 @@ def plan_actions(
         if abs(pos.notional - tgt_n) / max(pos.notional, tgt_n) > drift:
             actions.append(Action("resize", coin, t.side, 0.0, t.leverage, "drift"))
 
+    opens: list[Action] = []
     for coin, t in want.items():
         pos = have.get(coin)
         if pos is None:
-            actions.append(Action("open", coin, t.side, 0.0, t.leverage, "new"))
+            opens.append(Action("open", coin, t.side, 0.0, t.leverage, "new"))
         elif pos.side != t.side:
-            actions.append(Action("open", coin, t.side, 0.0, t.leverage, "flip_open"))
+            opens.append(Action("open", coin, t.side, 0.0, t.leverage, "flip_open"))
+    if open_largest_first:
+        opens.sort(key=lambda a: (-margin_of.get(a.coin, 0.0), a.coin))
+    else:
+        opens.sort(key=lambda a: a.coin)
 
-    # Closes first, then resizes, then opens. Cap later.
+    # Closes first, then resizes, then opens.
     order = {"close": 0, "resize": 1, "open": 2}
-    actions.sort(key=lambda a: (order.get(a.kind, 9), a.coin))
-    return actions[: int(cfg.MAX_ACTIONS_PER_CYCLE)]
+    rest = [a for a in actions if a.kind != "open"]
+    rest.sort(key=lambda a: (order.get(a.kind, 9), a.coin))
+    out = rest + opens
+    return out[: int(cfg.MAX_ACTIONS_PER_CYCLE)]
 
 
 class Rebalancer:
@@ -148,6 +162,27 @@ class Rebalancer:
         self.log = logger
         self.paper = paper
         self._dust_skip_until: dict[str, float] = {}
+
+    def _is_majority(self) -> bool:
+        return str(getattr(self.cfg, "RUN_MODE", "") or "").lower() in (
+            "majority",
+            "majority_hold",
+            "meta",
+        )
+
+    def _margin_buffer(self) -> float:
+        return min(0.90, max(0.50, float(getattr(self.cfg, "MAJORITY_MARGIN_BUFFER", 0.70) or 0.70)))
+
+    def _free_margin(self, equity: float) -> float:
+        if self.paper is not None:
+            used = 0.0
+            for p in self.paper.positions.values():
+                used += abs(p.notional) / max(1, p.leverage)
+            return max(0.0, float(equity) - used)
+        try:
+            return max(0.0, float(self.client.get_available_margin(force=True)))
+        except Exception:
+            return max(0.0, float(equity) * 0.5)
 
     def _mark(self, coin: str) -> float:
         sym, dex = parse_coin_input(coin)
@@ -277,11 +312,13 @@ class Rebalancer:
             return False
         if sz <= 0 or notional <= 0:
             self.log.info("Skip open %s — size floors to 0 (dust notional)", t.coin)
-            self._dust_skip_until[t.coin] = now + 600.0
+            if not self._is_majority():
+                self._dust_skip_until[t.coin] = now + 600.0
             return False
         if notional < float(self.cfg.MIN_ORDER_NOTIONAL_USD):
             self.log.info("Skip open %s — notional $%.2f below min", t.coin, notional)
-            self._dust_skip_until[t.coin] = now + 300.0
+            if not self._is_majority():
+                self._dust_skip_until[t.coin] = now + 300.0
             return False
         mark = self.client.get_mark_price()
         spread = self._spread_pct()
@@ -304,14 +341,44 @@ class Rebalancer:
             self.log.warning("Leverage set failed %s: %s — continue", t.coin, exc)
         avail = self.client.get_available_margin(force=True)
         need = notional / max(1, t.leverage)
-        if avail < need * 0.9:
-            self.log.warning(
-                "Skip open %s — need margin $%.2f have $%.2f (HIP-3/manual pots can be empty)",
-                t.coin,
-                need,
-                avail,
-            )
-            return False
+        if not self._is_majority():
+            if avail < need * 0.9:
+                self.log.warning(
+                    "Skip open %s — need margin $%.2f have $%.2f (HIP-3/manual pots can be empty)",
+                    t.coin,
+                    need,
+                    avail,
+                )
+                return False
+        else:
+            buf = self._margin_buffer()
+            cap_m = max(0.0, avail * buf)
+            if need > cap_m + 1e-9:
+                cap_n = cap_m * max(1, t.leverage)
+                if cap_n < float(self.cfg.MIN_ORDER_NOTIONAL_USD) or mark <= 0:
+                    self.log.info(
+                        "MAJORITY %s — free $%.2f cannot fit min order, no send",
+                        t.coin,
+                        avail,
+                    )
+                    return False
+                sz = floor_size(cap_n / mark, self.client.sz_decimals)
+                notional = sz * mark
+                need = notional / max(1, t.leverage)
+                if sz <= 0 or need > avail + 1e-9:
+                    self.log.info(
+                        "MAJORITY %s — shrink still over free $%.2f, no send",
+                        t.coin,
+                        avail,
+                    )
+                    return False
+                self.log.info(
+                    "MAJORITY shrink %s notional $%.2f margin $%.2f (free $%.2f)",
+                    t.coin,
+                    notional,
+                    need,
+                    avail,
+                )
         try:
             if bool(self.cfg.USE_MARKET_ORDERS):
                 self.log.info("Market %s %s sz=%.6f notional=$%.2f lev=%sx", t.side, t.coin, sz, notional, t.leverage)
@@ -371,6 +438,62 @@ class Rebalancer:
             return False
         return True
 
+    def _open_majority_sequence(self, pending: list[TargetPos], equity: float) -> list[str]:
+        """Size each open from *current* free margin so later names still fit."""
+        buffer = self._margin_buffer()
+        filled: list[str] = []
+        min_n = float(self.cfg.MIN_ORDER_NOTIONAL_USD)
+        live = self.paper is None
+        for i, t in enumerate(pending):
+            rest = pending[i:]
+            rest_w = sum(max(0.0, x.margin_pct) for x in rest) or 1.0
+            try:
+                _, equity = self.current_book()
+            except Exception:
+                pass
+            if equity <= 0:
+                self.log.info("MAJORITY stop opens — equity $%.2f", equity)
+                break
+            avail = self._free_margin(equity)
+            planned = (t.margin_pct / 100.0) * equity
+            dollar = next_open_margin_usd(
+                available=avail,
+                this_weight=t.margin_pct,
+                rest_weight=rest_w,
+                planned_usd=planned,
+                buffer=buffer,
+            )
+            ntl = dollar * max(1, t.leverage)
+            if dollar < 0.5 or ntl < min_n:
+                self.log.info(
+                    "MAJORITY drop %s — leftover $%.2f too small for min notional (no order)",
+                    t.coin,
+                    dollar,
+                )
+                continue
+            fitted = TargetPos(
+                coin=t.coin,
+                side=t.side,
+                leverage=t.leverage,
+                margin_pct=(dollar / equity) * 100.0,
+                conviction=t.conviction,
+            )
+            self.log.info(
+                "MAJORITY size %s — plan $%.2f fit $%.2f from free $%.2f rest_w=%.1f",
+                t.coin,
+                planned,
+                dollar,
+                avail,
+                rest_w,
+            )
+            if self._open(fitted, equity):
+                filled.append(t.coin)
+                if live:
+                    time.sleep(1.2)
+            else:
+                self.log.info("MAJORITY %s not opened — continue remaining names", t.coin)
+        return filled
+
     def run(
         self,
         targets: list[TargetPos],
@@ -388,7 +511,16 @@ class Rebalancer:
             return managed, False
         targets = self._scale_copy_targets_for_batch_margin(targets, equity)
         have = {p.coin: p for p in ours}
-        actions = plan_actions(ours, targets, equity, self.cfg, managed)
+        majority = self._is_majority()
+        actions = plan_actions(
+            ours,
+            targets,
+            equity,
+            self.cfg,
+            managed,
+            flatten_foreign=majority,
+            open_largest_first=majority,
+        )
         if not actions:
             return managed, False
         cooldown = float(self.cfg.REBALANCE_COOLDOWN_S)
@@ -408,16 +540,53 @@ class Rebalancer:
         new_managed = set(managed)
         did = 0
         failed_close: set[str] = set()
-        for act in actions:
+        closes = [a for a in actions if a.kind == "close"]
+        resizes = [a for a in actions if a.kind == "resize"]
+        opens = [a for a in actions if a.kind == "open"]
+        for act in closes:
             try:
-                if act.kind == "close":
-                    ok = self._close(act.coin, act.size)
-                    if ok:
-                        new_managed.discard(act.coin)
-                        did += 1
-                    else:
-                        failed_close.add(act.coin)
-                elif act.kind == "open":
+                ok = self._close(act.coin, act.size)
+                if ok:
+                    new_managed.discard(act.coin)
+                    did += 1
+                else:
+                    failed_close.add(act.coin)
+            except Exception as exc:
+                self.log.error("Action close %s crashed: %s", act.coin, exc)
+                failed_close.add(act.coin)
+        for act in resizes:
+            try:
+                t = target_map.get(act.coin)
+                if t is None:
+                    continue
+                ok = self._resize(t, have[act.coin], equity)
+                if ok:
+                    new_managed.add(act.coin)
+                    did += 1
+            except Exception as exc:
+                self.log.error("Action resize %s crashed: %s", act.coin, exc)
+        if majority and (closes or resizes):
+            if self.paper is None:
+                time.sleep(1.5)
+            try:
+                ours, equity = self.current_book()
+            except Exception:
+                pass
+        if majority:
+            pending: list[TargetPos] = []
+            for act in opens:
+                if act.coin in failed_close:
+                    self.log.warning("Skip open %s — close did not finish", act.coin)
+                    continue
+                t = target_map.get(act.coin)
+                if t is not None:
+                    pending.append(t)
+            for coin in self._open_majority_sequence(pending, equity):
+                new_managed.add(coin)
+                did += 1
+        else:
+            for act in opens:
+                try:
                     if act.coin in failed_close:
                         self.log.warning("Skip open %s — close did not finish", act.coin)
                         continue
@@ -428,16 +597,8 @@ class Rebalancer:
                     if ok:
                         new_managed.add(act.coin)
                         did += 1
-                elif act.kind == "resize":
-                    t = target_map.get(act.coin)
-                    if t is None:
-                        continue
-                    ok = self._resize(t, have[act.coin], equity)
-                    if ok:
-                        new_managed.add(act.coin)
-                        did += 1
-            except Exception as exc:
-                self.log.error("Action %s %s crashed: %s", act.kind, act.coin, exc)
+                except Exception as exc:
+                    self.log.error("Action open %s crashed: %s", act.coin, exc)
         if did:
             self.log.info("Rebalance applied %s/%s", did, len(actions))
         # Only start the cooldown after a fill. Failed opens retry next tick.

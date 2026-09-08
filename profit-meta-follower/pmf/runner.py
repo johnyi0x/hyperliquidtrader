@@ -1419,8 +1419,10 @@ class ProfitMetaRunner:
             new_managed, attempted = managed, False
         else:
             new_managed, attempted = result
+        held = [t for t in targets if t.coin in new_managed]
+        held_keys = [f"{t.side}:{t.coin}" for t in held]
         self.store.data["majority_meta_at"] = now
-        self.store.data["majority_board_txt"] = ", ".join(trade_keys) or "-"
+        self.store.data["majority_board_txt"] = ", ".join(held_keys) or "-"
         self.store.data["majority_stats"] = stats
         self.store.data["last_targets"] = [
             {
@@ -1430,7 +1432,7 @@ class ProfitMetaRunner:
                 "margin_pct": t.margin_pct,
                 "conviction": t.conviction,
             }
-            for t in targets
+            for t in held
         ]
         if attempted or new_managed != managed:
             self.store.data["managed_coins"] = sorted(new_managed)
@@ -1440,12 +1442,21 @@ class ProfitMetaRunner:
                     ts=now,
                     kind="rebalance",
                     payload={
-                        "targets": trade_keys,
+                        "targets": held_keys,
+                        "planned": trade_keys,
                         "managed": sorted(new_managed),
                         "equity": self._last_equity,
                         "mode": "majority",
                     },
                 )
+        if len(held) < len(targets):
+            missed = [t.coin for t in targets if t.coin not in new_managed]
+            self.log.info(
+                "MAJORITY held %s/%s — not in book this cycle: %s",
+                len(held),
+                len(targets),
+                ", ".join(missed) or "-",
+            )
         self.store.save()
         self._save_paper()
         self.store.heartbeat(

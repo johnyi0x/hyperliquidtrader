@@ -43,6 +43,9 @@ MAJORITY_MAX_PAIR_SHARE = 0.70
 MAJORITY_MIN_COVERAGE = 0.70
 MAJORITY_STICKY = True
 MAJORITY_SNAP_SLEEP_S = 0.12
+# Fraction of *current* free margin used for the remaining book (HL IM > notional/lev).
+# HL initial margin is often ~25–40% above notional/leverage. Stay under free.
+MAJORITY_MARGIN_BUFFER = 0.70
 
 # --- Copy mode (RUN_MODE=copy|copy_reverse). Tune in config_profiles.py COPY_* block too. ---
 COPY_TOP_N = 5

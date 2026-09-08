@@ -16,6 +16,35 @@ from .consensus import _clamp_leverage, in_scope, market_blocks_entry
 from .types import MarketCtx, TargetPos, WalletSnapshot
 
 
+def next_open_margin_usd(
+    *,
+    available: float,
+    this_weight: float,
+    rest_weight: float,
+    planned_usd: float,
+    buffer: float = 0.70,
+) -> float:
+    """Dollar margin for the next open from *current* free collateral.
+
+    `rest_weight` is this coin plus every coin not opened yet. Last coin
+    gets buffer × all remaining free so it fills instead of skipping.
+    Earlier coins take their share of leftover, never the original equity %.
+    """
+    avail = max(0.0, float(available))
+    planned = max(0.0, float(planned_usd))
+    rest = max(1e-9, float(rest_weight))
+    this = max(0.0, float(this_weight))
+    buf = min(0.90, max(0.50, float(buffer)))
+    share = this / rest
+    fitted = avail * buf * share
+    if share >= 0.999:
+        return max(0.0, fitted)
+    if planned <= 0:
+        return max(0.0, fitted)
+    return max(0.0, min(planned, fitted))
+
+
+
 @dataclass
 class HoldRow:
     coin: str
