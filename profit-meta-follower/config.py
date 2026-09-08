@@ -24,11 +24,25 @@ MIN_ORDER_NOTIONAL_USD = 10.0
 # =============================================================================
 # RUN MODE — crowd (default) vs copy
 # =============================================================================
-# "crowd" = existing basket-consensus refine / dump / swing / mtf strategies.
+# "crowd"        = flow/EMA basket (legacy).
+# "majority"     = top-N 7d ROI wallets, hold what they hold most (pair+side).
 # "copy"         = pick top COPY_TOP_N wallets, mirror their books.
 # "copy_reverse" = same wallet pick, opposite side of each mirrored position.
-# Override at deploy: PMF_RUN_MODE=copy or PMF_RUN_MODE=copy_reverse
-RUN_MODE = "crowd"
+# Override at deploy: PMF_RUN_MODE=majority|crowd|copy|copy_reverse
+RUN_MODE = "majority"
+
+# Majority portfolio (RUN_MODE=majority). Top wallets by 7d ROI, no fill-tape
+# scalper/holder filter. Each wallet votes once per (coin, side) it holds.
+# Size of each pair = that pair's share of votes × OUR_GROSS_MARGIN_PCT.
+MAJORITY_REFRESH_HOURS = 2.5
+MAJORITY_MIN_HOLD_PCT = 0.05
+MAJORITY_EXIT_HOLD_PCT = 0.03
+MAJORITY_MIN_SIDE_AGREEMENT = 0.55
+MAJORITY_MIN_NOTIONAL_USD = 50.0
+MAJORITY_MAX_PAIR_SHARE = 0.70
+MAJORITY_MIN_COVERAGE = 0.70
+MAJORITY_STICKY = True
+MAJORITY_SNAP_SLEEP_S = 0.12
 
 # --- Copy mode (RUN_MODE=copy|copy_reverse). Tune in config_profiles.py COPY_* block too. ---
 COPY_TOP_N = 5
@@ -80,13 +94,13 @@ HL_API_TIMEOUT_S = 30.0
 # =============================================================================
 # Profile overrides in config_profiles.py: RESEARCH_GATHER_SIZE vs TRADE_BASKET_SIZE.
 # How many qualified wallets live cloud polls and backtest votes use.
-BASKET_SIZE = 50
+BASKET_SIZE = 200
 # Leaderboard shortlist before audit. With filters off, research gather expands to
 # RESEARCH_POOL_SIZE automatically (see qualify.shortlist).
-CANDIDATE_POOL = 50
-BASKET_REFRESH_HOURS = 12.0
+CANDIDATE_POOL = 200
+BASKET_REFRESH_HOURS = 2.5
 # Reuse a cached leaderboard dump this long (avoids re-downloading 15k+ rows).
-LEADERBOARD_CACHE_HOURS = 6.0
+LEADERBOARD_CACHE_HOURS = 2.0
 
 # Rank like the HL Leaderboard tab ROI column.
 # "day" = 24h ROI, "week" = 7d ROI. (month is ignored for ranking.)
@@ -174,7 +188,7 @@ MIN_SIDE_AGREEMENT = 0.10
 # Hold until the crowd falls to this fraction of the list (hysteresis vs enter).
 EXIT_SIDE_AGREEMENT = 0.05
 MIN_AVG_CONVICTION = 0.022  # applied to the SMOOTHED basket, not one noisy snapshot
-MAX_COINS_IN_BOOK = 3
+MAX_COINS_IN_BOOK = 4
 # If True, a held coin keeps its slot until a real exit; a 4th name cannot kick it.
 # Profiles turn this on for both local and cloud.
 STICKY_BOOK_SLOTS = False
@@ -231,9 +245,10 @@ LEVERAGE_MODE = "mean"
 COPY_MARGIN_CAP_PCT = 100.0
 # Total margin budget across ALL copied positions (percent of equity).
 # 90% = up to 3 coins × 30% margin each. Only used when SIZE_MODE = "fixed".
-OUR_GROSS_MARGIN_PCT = 90.0
-# Per-coin cap as percent of OUR_GROSS_MARGIN_PCT. 33.33% of 90% = 30% of equity per pair.
-MAX_MARGIN_PER_COIN_PCT = 33.33
+OUR_GROSS_MARGIN_PCT = 95.0
+# Per-coin cap as percent of OUR_GROSS_MARGIN_PCT. Majority mode uses 100 so
+# popularity weights are not flattened. Crowd copy used ~33.
+MAX_MARGIN_PER_COIN_PCT = 100.0
 # Leverage we use: clamp(wallet median or mean, these bounds, exchange max).
 OUR_MIN_LEVERAGE = 2
 OUR_MAX_LEVERAGE = 20
@@ -248,7 +263,7 @@ SINGLE_NAME_SIZE_MULT = 0.3333
 REBALANCE_DRIFT_PCT = 35.0
 # Blocks 10–20 min close/reopen loops; does not force multi-hour holds by itself.
 REBALANCE_COOLDOWN_S = 180.0
-MAX_ACTIONS_PER_CYCLE = 3
+MAX_ACTIONS_PER_CYCLE = 12
 # Flatten a managed coin if it leaves the consensus book.
 FLATTEN_WHEN_DROPPED = True
 # Only touch coins this bot opened (plus new targets). Never close unrelated positions.

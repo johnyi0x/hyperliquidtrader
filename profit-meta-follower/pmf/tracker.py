@@ -81,6 +81,25 @@ class BasketTracker:
             n += 1
         return n
 
+    def poll_all(self, now: float, *, sleep_s: float = 0.12) -> int:
+        """Snapshot every listed wallet once (meta refresh). Ignores due timers."""
+        if not self.addrs:
+            return 0
+        n = 0
+        pause = max(0.0, float(sleep_s))
+        for addr in self.addrs:
+            snap = self.snapper.snapshot(addr, now)
+            self.snapshots[addr] = snap
+            if snap.account_value > 0:
+                self.last_equity[addr] = snap.account_value
+            self._next_due[addr] = now + float(self.cfg.SNAPSHOT_INTERVAL_S)
+            n += 1
+            if snap.error:
+                self.log.warning("MAJORITY snap fail %s — %s", addr[:10], snap.error)
+            if pause > 0:
+                time.sleep(pause)
+        return n
+
     def churned_wallets(self, now: float) -> set[str]:
         """Wallets whose book flipped too often in the last hour (live scalpers).
 

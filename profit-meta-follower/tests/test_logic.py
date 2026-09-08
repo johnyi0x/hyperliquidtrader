@@ -2070,8 +2070,96 @@ class MarketResolverTests(unittest.TestCase):
                     self.assertEqual(resolve.call_args_list[-1].args[1], "SOL")
                     self.assertIsNone(resolve.call_args_list[-1].args[2])
                     self.assertEqual(client.coin, "SOL")
-                    self.assertIsNone(client.perp_dex)
+                    self.assertEqual(client.perp_dex, None)
+
+
+class MajorityHoldTests(unittest.TestCase):
+    def _cfg(self):
+        return type(
+            "MajCfg",
+            (),
+            {
+                "DEX_SCOPE": "include",
+                "ALLOW_COINS": (),
+                "DENY_COINS": (),
+                "STALE_SNAPSHOT_S": 1800.0,
+                "MAJORITY_MIN_NOTIONAL_USD": 50.0,
+                "MAJORITY_MIN_HOLD_PCT": 0.05,
+                "MAJORITY_EXIT_HOLD_PCT": 0.03,
+                "MAJORITY_MIN_SIDE_AGREEMENT": 0.55,
+                "MAJORITY_MAX_PAIR_SHARE": 1.0,
+                "MAJORITY_STICKY": False,
+                "MAX_COINS_IN_BOOK": 4,
+                "OUR_GROSS_MARGIN_PCT": 95.0,
+                "OUR_MIN_LEVERAGE": 2,
+                "OUR_MAX_LEVERAGE": 20,
+                "MIN_COIN_DAY_VOLUME": 0.0,
+                "MAX_HOSTILE_FUNDING": 0.0,
+                "MAX_BASIS_ABS": 1.0,
+            },
+        )()
+
+    def test_popularity_weights_and_week_list_size(self) -> None:
+        from pmf.majority import pick_majority_targets, tally_holds
+
+        cfg = self._cfg()
+        snaps = []
+        n = 0
+        for _ in range(30):
+            snaps.append(_snap(f"0x{n:040x}", 10_000, {"BTC": 0.3}))
+            n += 1
+        for _ in range(10):
+            snaps.append(_snap(f"0x{n:040x}", 10_000, {"ETH": 0.2}))
+            n += 1
+        for _ in range(60):
+            snaps.append(_snap(f"0x{n:040x}", 10_000, {}))
+            n += 1
+        rows, stats = tally_holds(snaps, cfg, now=1_000.0)
+        self.assertEqual(stats["ok"], 100)
+        btc = next(r for r in rows if r.coin == "BTC")
+        eth = next(r for r in rows if r.coin == "ETH")
+        self.assertEqual(btc.side, "long")
+        self.assertAlmostEqual(btc.hold_pct, 0.30, places=4)
+        self.assertAlmostEqual(eth.hold_pct, 0.10, places=4)
+        targets, _, meta = pick_majority_targets(rows, cfg, managed=set(), markets={})
+        by = {t.coin: t for t in targets}
+        self.assertAlmostEqual(by["BTC"].margin_pct, 95.0 * 0.75, places=2)
+        self.assertAlmostEqual(by["ETH"].margin_pct, 95.0 * 0.25, places=2)
+        self.assertAlmostEqual(sum(t.margin_pct for t in targets), 95.0, places=2)
+
+    def test_split_sides_keep_majority_only(self) -> None:
+        from pmf.majority import tally_holds
+
+        cfg = self._cfg()
+        snaps = [_snap(f"0x{i:040x}", 8_000, {"BTC": 0.4}) for i in range(40)]
+        snaps += [_snap(f"0x{i+40:040x}", 8_000, {"BTC": -0.4}) for i in range(15)]
+        snaps += [_snap(f"0x{i+55:040x}", 8_000, {}) for i in range(45)]
+        rows, stats = tally_holds(snaps, cfg, now=1_000.0)
+        self.assertEqual(stats["ok"], 100)
+        btc = next(r for r in rows if r.coin == "BTC")
+        self.assertEqual(btc.side, "long")
+        self.assertEqual(btc.long_n, 40)
+        self.assertEqual(btc.short_n, 15)
+        self.assertAlmostEqual(btc.agreement, 40 / 55, places=4)
+
+    def test_thin_hold_and_max_pairs(self) -> None:
+        from pmf.majority import pick_majority_targets, tally_holds
+
+        cfg = self._cfg()
+        cfg.MAX_COINS_IN_BOOK = 2
+        snaps = []
+        n = 0
+        for coin, count in (("AAA", 40), ("BBB", 25), ("CCC", 20), ("DDD", 3)):
+            for _ in range(count):
+                snaps.append(_snap(f"0x{n:040x}", 5_000, {coin: 0.2}))
+                n += 1
+        rows, _ = tally_holds(snaps, cfg, now=1_000.0)
+        targets, annotated, _ = pick_majority_targets(rows, cfg, managed=set(), markets={})
+        self.assertEqual([t.coin for t in targets], ["AAA", "BBB"])
+        ddd = next(r for r in annotated if r.coin == "DDD")
+        self.assertEqual(ddd.skip, "hold_pct")
 
 
 if __name__ == "__main__":
     unittest.main()
+

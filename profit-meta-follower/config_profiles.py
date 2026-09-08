@@ -16,8 +16,8 @@ from __future__ import annotations
 # =============================================================================
 # Wallets local/research gather into books.jsonl (full research pool).
 RESEARCH_GATHER_SIZE = 200
-# Wallets live cloud polls and backtest uses for votes / agreement %.
-TRADE_BASKET_SIZE = 50
+# Wallets live cloud polls (majority = top 200 by 7d ROI, no fill filter).
+TRADE_BASKET_SIZE = 200
 
 # Copy-mode knobs (RUN_MODE=copy | copy_reverse). Crowd mode ignores these.
 # Rank top 100 by 24h ROI; score stable profitable decent-scalpers (exclude holders / idle / HFT).
@@ -66,19 +66,39 @@ HL_API_TIMEOUT_S = 30.0
 # Cloud _TRADE last tuned: 2026-08-27 05:08 UTC strategy=cloud_all score=-16.036601627936605 ret=4.991863669691288%
 _TRADE: dict = {
     "BASKET_FILTER_MODE": 'off',
-    "MAX_BOOK_CHANGES_PER_HOUR": 6,
     "FLOW_EMA_ALPHA": 0.28,
     "OPEN_CONFIRM_S": 330.0,
     "EXIT_RAW_FLOW": -0.045,
     "EXIT_AGREEMENT_GIVEBACK": 0.34,
-    "REBALANCE_COOLDOWN_S": 300.0,
-    "STICKY_BOOK_SLOTS": True,
     "RANK_WINDOW": "week",
     "BASKET_SIZE": TRADE_BASKET_SIZE,
     "CANDIDATE_POOL": TRADE_BASKET_SIZE,
+    "BASKET_REFRESH_HOURS": 2.5,
+    "LEADERBOARD_CACHE_HOURS": 2.0,
     "RESEARCH_DATA_ENABLED": False,
     "RESEARCH_ONLY": False,
     "BACKTEST_LIVE_STRATEGY": 'cloud_all',
+    "MAX_COINS_IN_BOOK": 4,
+    "OUR_GROSS_MARGIN_PCT": 95.0,
+    "MAX_MARGIN_PER_COIN_PCT": 100.0,
+    "MAX_ACTIONS_PER_CYCLE": 12,
+    "MAX_BOOK_CHANGES_PER_HOUR": 0,
+    "STALE_SNAPSHOT_S": 1800.0,
+    "LOOP_SLEEP_S": 20.0,
+    "REBALANCE_COOLDOWN_S": 0.0,
+    "REBALANCE_DRIFT_PCT": 40.0,
+    "STICKY_BOOK_SLOTS": True,
+    "LIVE_CANDLE_SEED": False,
+    "RUN_MODE": "majority",
+    "MAJORITY_REFRESH_HOURS": 2.5,
+    "MAJORITY_MIN_HOLD_PCT": 0.05,
+    "MAJORITY_EXIT_HOLD_PCT": 0.03,
+    "MAJORITY_MIN_SIDE_AGREEMENT": 0.55,
+    "MAJORITY_MIN_NOTIONAL_USD": 50.0,
+    "MAJORITY_MAX_PAIR_SHARE": 0.70,
+    "MAJORITY_MIN_COVERAGE": 0.70,
+    "MAJORITY_STICKY": True,
+    "MAJORITY_SNAP_SLEEP_S": 0.12,
     "CONV_GIVEBACK": 0.38,
     "EXIT_AVG_CONVICTION": 0.024,
     "EXIT_FLOW": -0.013,
@@ -108,8 +128,6 @@ _TRADE: dict = {
     "DUMP_LOOKBACK_S": 1350.0,
     "DUMP_RANGE_PCT": -0.04,
     "DUMP_RET_PCT": -0.03,
-    # Copy mode — enable with PMF_RUN_MODE=copy on deploy (crowd unchanged).
-    "RUN_MODE": "crowd",
     "COPY_TOP_N": COPY_TOP_N,
     "COPY_RANK_WINDOW": COPY_RANK_WINDOW,
     "COPY_BOARD_SCAN": COPY_BOARD_SCAN,

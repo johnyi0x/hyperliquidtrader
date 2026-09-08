@@ -64,11 +64,19 @@ def apply_profile(module_globals: dict[str, Any]) -> str:
     if overrides is None:
         known = ", ".join(sorted(PROFILES))
         raise RuntimeError(f"Unknown PMF_PROFILE={name!r} — use one of: {known}")
-    overrides = _merge_tuned(dict(overrides), name)
+    overrides = dict(overrides)
+    env_mode = str(os.environ.get("PMF_RUN_MODE", "") or "").strip().lower()
+    profile_mode = str(overrides.get("RUN_MODE") or "").strip().lower()
+    majority = env_mode in ("majority", "majority_hold", "meta") or (
+        profile_mode in ("majority", "majority_hold", "meta")
+        and env_mode not in ("crowd", "copy", "copy_reverse")
+    )
+    if name == "cloud" and not majority:
+        overrides = _merge_tuned(overrides, name)
     for key, val in overrides.items():
         module_globals[key] = val
     module_globals["PMF_PROFILE"] = name
-    run_mode = str(os.environ.get("PMF_RUN_MODE", "") or "").strip().lower()
-    if run_mode in ("crowd", "copy", "copy_reverse"):
-        module_globals["RUN_MODE"] = run_mode
+    run_mode = env_mode
+    if run_mode in ("crowd", "copy", "copy_reverse", "majority", "majority_hold", "meta"):
+        module_globals["RUN_MODE"] = "majority" if run_mode in ("majority_hold", "meta") else run_mode
     return name
