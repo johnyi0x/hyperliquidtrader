@@ -1276,6 +1276,8 @@ class ProfitMetaRunner:
         return str(getattr(self.cfg, "MAJORITY_FORCE_RESIZE_ID", "") or "").strip()
 
     def _force_resize_pending(self) -> bool:
+        if not bool(getattr(self.cfg, "MAJORITY_RESIZE", False)):
+            return False
         if not bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False)):
             return False
         if not bool(getattr(self.cfg, "MAJORITY_FORCE_RESIZE_ONCE", False)):
@@ -1799,8 +1801,8 @@ class ProfitMetaRunner:
             elif self._is_majority_mode():
                 self.log.info(
                     "MAJORITY portfolio running | profile=%s paper=%s wallets=%s window=%s "
-                    "pairs<=%s single=%s gross=%.0f%% min_hold=%.0f%% min_agr=%.0f%% refresh=%.1fh "
-                    "filter=off sticky=%s scope=%s",
+                    "pairs<=%s single=%s gross=%.0f%% resize=%s lev_div=%s min_hold=%.0f%% "
+                    "min_agr=%.0f%% refresh=%.1fh filter=off sticky=%s scope=%s",
                     getattr(self.cfg, "PMF_PROFILE", "local"),
                     bool(self.cfg.PAPER_TRADING),
                     int(getattr(self.cfg, "BASKET_SIZE", 200) or 200),
@@ -1808,6 +1810,8 @@ class ProfitMetaRunner:
                     int(getattr(self.cfg, "MAX_COINS_IN_BOOK", 4) or 4),
                     bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False)),
                     majority_gross_pct(self.cfg),
+                    bool(getattr(self.cfg, "MAJORITY_RESIZE", False)),
+                    float(getattr(self.cfg, "MAJORITY_LEVERAGE_DIV", 1) or 1),
                     float(getattr(self.cfg, "MAJORITY_MIN_HOLD_PCT", 0.05) or 0) * 100.0,
                     float(getattr(self.cfg, "MAJORITY_MIN_SIDE_AGREEMENT", 0.55) or 0) * 100.0,
                     self._majority_refresh_h(),

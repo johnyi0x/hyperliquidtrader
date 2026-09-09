@@ -2091,6 +2091,8 @@ class MajorityHoldTests(unittest.TestCase):
                 "MAJORITY_STICKY": False,
                 "MAJORITY_SINGLE_PAIR": False,
                 "MAJORITY_SINGLE_GROSS_PCT": 95.0,
+                "MAJORITY_LEVERAGE_DIV": 1.0,
+                "MAJORITY_RESIZE": False,
                 "MAX_COINS_IN_BOOK": 4,
                 "OUR_GROSS_MARGIN_PCT": 95.0,
                 "OUR_MIN_LEVERAGE": 2,
@@ -2233,6 +2235,50 @@ class MajorityHoldTests(unittest.TestCase):
         self.assertTrue(any(a.kind == "resize" and a.coin == "ZEC" for a in acts_force))
         self.assertFalse(any(a.kind == "open" for a in acts_force))
         self.assertFalse(any(a.kind == "close" and a.coin == "ZEC" for a in acts_force))
+
+    def test_leverage_div_and_resize_off(self) -> None:
+        from types import SimpleNamespace
+
+        from pmf.majority import majority_leverage, pick_majority_targets, tally_holds
+        from pmf.rebalancer import plan_actions
+        from pmf.types import OurPos, TargetPos
+
+        cfg = self._cfg()
+        cfg.MAJORITY_LEVERAGE_DIV = 2.0
+        self.assertEqual(majority_leverage(cfg, 9.0), 4)
+        self.assertEqual(majority_leverage(cfg, 10.0), 5)
+        cfg.MAJORITY_LEVERAGE_DIV = 1.0
+        self.assertEqual(majority_leverage(cfg, 9.0), 9)
+
+        cfg.MAJORITY_SINGLE_PAIR = True
+        cfg.MAJORITY_LEVERAGE_DIV = 2.0
+        snaps = [_snap(f"0x{i:040x}", 8_000, {"ZEC": 0.3}, leverage=9) for i in range(40)]
+        snaps += [_snap(f"0x{i+40:040x}", 8_000, {}) for i in range(60)]
+        rows, _ = tally_holds(snaps, cfg, now=1_000.0)
+        targets, _, _ = pick_majority_targets(rows, cfg, managed=set(), markets={})
+        self.assertEqual(targets[0].coin, "ZEC")
+        self.assertEqual(targets[0].leverage, 4)
+
+        plan_cfg = SimpleNamespace(
+            RUN_MODE="majority",
+            MANAGED_ONLY=True,
+            FLATTEN_WHEN_DROPPED=True,
+            REBALANCE_DRIFT_PCT=40.0,
+            MAX_ACTIONS_PER_CYCLE=12,
+            MAJORITY_RESIZE=False,
+        )
+        ours = [OurPos("ZEC", "long", 0.05, 60.0, 1200.0, 4)]
+        tgt = [TargetPos("ZEC", "long", 4, 95.0, 1.0)]
+        acts = plan_actions(
+            ours,
+            tgt,
+            25.0,
+            plan_cfg,
+            managed={"ZEC"},
+            flatten_foreign=True,
+        )
+        self.assertFalse(any(a.kind == "resize" for a in acts))
+        self.assertFalse(any(a.kind == "close" for a in acts))
 
     def test_next_open_uses_current_free_not_stale_equity(self) -> None:
         from pmf.majority import next_open_margin_usd

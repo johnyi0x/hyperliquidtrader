@@ -48,6 +48,15 @@ MAJORITY_SNAP_SLEEP_S = 0.12
 MAJORITY_SINGLE_PAIR = False
 # Gross margin when single-pair is on (falls back to OUR_GROSS_MARGIN_PCT if 0).
 MAJORITY_SINGLE_GROSS_PCT = 95.0
+# Add/cut the live keep when equity/price moves (pyramid). Off = open once, hold size.
+# Toggle: PMF_MAJORITY_RESIZE=0|1
+MAJORITY_RESIZE = False
+# Wallet mean leverage ÷ this, then clamp. 1 = same as wallets. HL leverage is an int (9/2 → 4).
+# Toggle: PMF_MAJORITY_LEVERAGE_DIV=2
+MAJORITY_LEVERAGE_DIV = 2.0
+# One-shot add on the live keep (ignore 40% drift). Token in store so it runs once.
+MAJORITY_FORCE_RESIZE_ONCE = False
+MAJORITY_FORCE_RESIZE_ID = ""
 # One-shot add on the live keep (ignore 40% drift). Token in store so it runs once.
 MAJORITY_FORCE_RESIZE_ONCE = False
 MAJORITY_FORCE_RESIZE_ID = ""

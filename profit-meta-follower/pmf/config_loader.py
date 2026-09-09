@@ -84,4 +84,15 @@ def apply_profile(module_globals: dict[str, Any]) -> str:
         module_globals["MAJORITY_SINGLE_PAIR"] = True
     elif env_single in ("0", "false", "no", "off"):
         module_globals["MAJORITY_SINGLE_PAIR"] = False
+    env_resize = str(os.environ.get("PMF_MAJORITY_RESIZE", "") or "").strip().lower()
+    if env_resize in ("1", "true", "yes", "on"):
+        module_globals["MAJORITY_RESIZE"] = True
+    elif env_resize in ("0", "false", "no", "off"):
+        module_globals["MAJORITY_RESIZE"] = False
+    env_div = str(os.environ.get("PMF_MAJORITY_LEVERAGE_DIV", "") or "").strip()
+    if env_div:
+        try:
+            module_globals["MAJORITY_LEVERAGE_DIV"] = float(env_div)
+        except ValueError:
+            pass
     return name

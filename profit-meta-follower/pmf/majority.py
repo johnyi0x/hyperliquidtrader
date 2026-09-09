@@ -198,6 +198,17 @@ def majority_max_pairs(cfg: Any) -> int:
     return max(1, int(getattr(cfg, "MAX_COINS_IN_BOOK", 4) or 4))
 
 
+def majority_leverage(cfg: Any, raw: float) -> int:
+    """Wallet mean/median leverage, divided by MAJORITY_LEVERAGE_DIV, then clamped.
+
+    Hyperliquid only accepts integer leverage, so 9 / 2 → 4.
+    """
+    div = float(getattr(cfg, "MAJORITY_LEVERAGE_DIV", 1.0) or 1.0)
+    if div < 1.0:
+        div = 1.0
+    return _clamp_leverage(cfg, float(raw) / div)
+
+
 def majority_gross_pct(cfg: Any) -> float:
     if bool(getattr(cfg, "MAJORITY_SINGLE_PAIR", False)):
         extra = float(getattr(cfg, "MAJORITY_SINGLE_GROSS_PCT", 0) or 0)
@@ -278,7 +289,7 @@ def pick_majority_targets(
     targets: list[TargetPos] = []
     for row, w in zip(picked, weights):
         margin = gross * w
-        lev = _clamp_leverage(cfg, row.mean_leverage or float(row.median_leverage))
+        lev = majority_leverage(cfg, row.mean_leverage or float(row.median_leverage))
         if margin * lev < 0.5:
             continue
         targets.append(

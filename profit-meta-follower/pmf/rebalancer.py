@@ -124,6 +124,14 @@ def plan_actions(
         if t.side != pos.side:
             actions.append(Action("close", coin, pos.side, pos.size, pos.leverage, "flip_close"))
             continue
+        majority_hold = str(getattr(cfg, "RUN_MODE", "") or "").lower() in (
+            "majority",
+            "majority_hold",
+            "meta",
+        )
+        allow_resize = (not majority_hold) or bool(getattr(cfg, "MAJORITY_RESIZE", False)) or force_resize
+        if not allow_resize:
+            continue
         tgt_n = _target_notional(t, equity)
         if pos.notional <= 0 or tgt_n <= 0:
             continue
