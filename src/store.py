@@ -253,6 +253,7 @@ class SetupStore:
         pair_selection_mode: str | None = None,
         reverse_orders: bool | None = None,
         mover_tune: str | None = None,
+        merge: bool = False,
     ) -> None:
         self._last_attempt_ts = time.time()
         now = time.time()
@@ -266,6 +267,11 @@ class SetupStore:
         if not per_coin:
             self.log.warning("Empty tune results — keeping previous")
             return
+        if merge:
+            old = dict((self._state or {}).get("per_coin") or {})
+            if isinstance(old, dict) and old:
+                old.update(per_coin)
+                per_coin = old
         self._state = {
             "schema": 2,
             "updated_at": now,
@@ -281,7 +287,11 @@ class SetupStore:
         if mover_tune is not None:
             self._state["mover_tune"] = str(mover_tune)
         self._save()
-        self.log.info("Setups saved: %s", ", ".join(per_coin.keys()))
+        self.log.info(
+            "Setups saved%s: %s",
+            " (merge)" if merge else "",
+            ", ".join(per_coin.keys()),
+        )
 
 
 def signal_from_candles(setup: LiveSetup, candles: list[dict]) -> int:

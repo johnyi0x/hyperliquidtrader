@@ -105,11 +105,14 @@ from src.pair_universe import (
     MOVER_TUNE_LOCK,
     allowed_sides_for_movers,
     is_auto_pair_mode,
+    is_majority_mode,
     is_mover_mode,
+    is_side_locked_mode,
     is_volume_mode,
     mover_tune_side,
     resolve_pair_universe,
 )
+from src.majority_universe import majority_resolve_kwargs
 from src.paper_broker import PaperHyperliquidClient
 from src.position_guard import (
     cleanup_closed_coin,
@@ -367,8 +370,8 @@ def main() -> None:
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
     if pair_mode != "manual" and not is_auto_pair_mode(pair_mode):
         raise ValueError(
-            "PAIR_SELECTION_MODE must be 'manual', 'top_volume', or 'top_movers' "
-            f"(got {pair_mode!r})"
+            "PAIR_SELECTION_MODE must be 'manual', 'top_volume', 'top_movers', "
+            f"or 'majority' (got {pair_mode!r})"
         )
     if pair_mode == "manual":
         pairs = tuple(cfg.PAIRS) if not isinstance(cfg.PAIRS, str) else (cfg.PAIRS,)
@@ -384,6 +387,15 @@ def main() -> None:
         )
         if is_mover_mode(pair_mode) and mover_n < 1:
             raise ValueError("TOP_MOVER_COUNT must be >= 1 for top_movers mode")
+        if is_majority_mode(pair_mode):
+            if int(getattr(cfg, "MAJORITY_MAX_PAIRS", 0) or 0) < 1:
+                raise ValueError("MAJORITY_MAX_PAIRS must be >= 1 for majority mode")
+            if float(getattr(cfg, "MAJORITY_LIST_REFRESH_HOURS", 0) or 0) <= 0:
+                raise ValueError("MAJORITY_LIST_REFRESH_HOURS must be > 0")
+            if int(getattr(cfg, "MAJORITY_BASKET_SIZE", 0) or 0) < 8:
+                raise ValueError("MAJORITY_BASKET_SIZE must be >= 8")
+            if float(getattr(cfg, "MAJORITY_SNAP_SLEEP_S", 0) or 0) < 0:
+                raise ValueError("MAJORITY_SNAP_SLEEP_S must be >= 0")
         if int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0) < 0:
             raise ValueError("MIN_MAX_LEVERAGE must be >= 0")
         if int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) < 0:
@@ -414,11 +426,18 @@ def main() -> None:
     if cfg.TARGET_TRADES_PER_DAY <= 0:
         raise ValueError("TARGET_TRADES_PER_DAY must be > 0")
     # Reverse only when REVERSE_STRATEGY is on — never implied by top_movers.
-    flip_live = bool(cfg.reverse_orders_enabled())
+    # Majority always matches the wallet side (do not fade the crowd).
+    flip_live = bool(cfg.reverse_orders_enabled()) and not is_majority_mode(pair_mode)
 
     logger = setup_logger("hl-multi-bot", LOG_DIR)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     housekeep_data_dir(DATA_DIR, logger=logger)
+
+    def pair_universe_kwargs(*, force: bool = False) -> dict:
+        extra: dict = {}
+        if is_majority_mode(pair_mode):
+            extra.update(majority_resolve_kwargs(cfg, data_dir=DATA_DIR, force=force))
+        return extra
 
     def apply_hft_watch(entries):
         """HFT-only: keep markets whose exchange maxLev is ≤ HFT_MAX_MAX_LEVERAGE."""
@@ -491,6 +510,7 @@ def main() -> None:
         min_day_notional=float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0),
         xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
         logger=logger,
+        **pair_universe_kwargs(),
     )
     pair_inputs = [c for c, _ in universe.pairs]
     markets = resolve_watchlist(bootstrap, pair_inputs, None)
@@ -534,6 +554,7 @@ def main() -> None:
     leverage_by_coin = build_leverage_map(watch)
     universe_built_at = time.time()
     mover_buckets: dict[str, str] = dict(universe.buckets)
+    majority_fail_until = 0.0
 
     paper_on = bool(cfg.PAPER_TRADING)
     executor = OrderExecutor(
@@ -554,7 +575,7 @@ def main() -> None:
     )
 
     def refresh_universe_if_needed(*, force: bool = False) -> None:
-        """Re-rank volume/mover leaders before each tune in auto pair modes."""
+        """Re-rank volume/mover/majority leaders in auto pair modes."""
         nonlocal watch, cleanup_coins, tune_leverage, leverage_by_coin
         nonlocal universe_built_at, mover_buckets
         if not is_auto_pair_mode(pair_mode):
@@ -562,7 +583,22 @@ def main() -> None:
         # Startup already ranked — skip duplicate refresh on first tune.
         if not force and time.time() - universe_built_at < 90.0:
             return
-        if is_mover_mode(pair_mode):
+        if is_majority_mode(pair_mode):
+            maj_h = float(getattr(cfg, "MAJORITY_LIST_REFRESH_HOURS", 2.5) or 2.5)
+            if not force and time.time() - universe_built_at < maj_h * 3600.0:
+                return
+            logger.info(
+                "Refreshing majority universe (max_pairs=%s basket=%s sleep=%.2fs "
+                "refresh=%.1fh xyz_mode=%s min_maxLev≥%s minVol≥$%s)",
+                int(getattr(cfg, "MAJORITY_MAX_PAIRS", 2) or 2),
+                int(getattr(cfg, "MAJORITY_BASKET_SIZE", 120) or 120),
+                float(getattr(cfg, "MAJORITY_SNAP_SLEEP_S", 0.22) or 0.22),
+                maj_h,
+                cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
+                int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
+                int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
+            )
+        elif is_mover_mode(pair_mode):
             logger.info(
                 "Refreshing top-mover universe (n=%s xyz_mode=%s min_maxLev≥%s max_maxLev≤%s minVol≥$%s)",
                 mov_n,
@@ -580,27 +616,36 @@ def main() -> None:
                 universe_max_lev or "off",
                 int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
             )
-        fresh = resolve_pair_universe(
-            client.info,
-            mode=pair_mode,
-            manual_pairs=tuple(cfg.PAIRS)
-            if not isinstance(cfg.PAIRS, str)
-            else (cfg.PAIRS,),
-            top_volume_count=vol_n,
-            top_mover_count=mov_n,
-            include_xyz=bool(getattr(cfg, "INCLUDE_XYZ_PAIRS", False)),
-            use_max_leverage=bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
-            default_leverage=int(cfg.LEVERAGE),
-            leverage_overrides=getattr(cfg, "PAIR_LEVERAGE", None),
-            requested_leverage_for=cfg.requested_leverage_for,
-            min_max_leverage=int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
-            max_max_leverage=universe_max_lev,
-            min_day_notional=float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0),
-            xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
-            logger=logger,
-        )
-        watch = init_pairs(client, fresh.pairs, logger, arm_leverage=not hft_on)
-        filtered = apply_hft_watch(watch)
+        old_names = [e.api_coin for e in watch]
+        try:
+            fresh = resolve_pair_universe(
+                client.info,
+                mode=pair_mode,
+                manual_pairs=tuple(cfg.PAIRS)
+                if not isinstance(cfg.PAIRS, str)
+                else (cfg.PAIRS,),
+                top_volume_count=vol_n,
+                top_mover_count=mov_n,
+                include_xyz=bool(getattr(cfg, "INCLUDE_XYZ_PAIRS", False)),
+                use_max_leverage=bool(getattr(cfg, "USE_MAX_LEVERAGE", True)),
+                default_leverage=int(cfg.LEVERAGE),
+                leverage_overrides=getattr(cfg, "PAIR_LEVERAGE", None),
+                requested_leverage_for=cfg.requested_leverage_for,
+                min_max_leverage=int(getattr(cfg, "MIN_MAX_LEVERAGE", 0) or 0),
+                max_max_leverage=universe_max_lev,
+                min_day_notional=float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0),
+                xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
+                logger=logger,
+                **pair_universe_kwargs(force=force and is_majority_mode(pair_mode)),
+            )
+        except Exception as exc:
+            logger.exception("Universe refresh failed — keeping previous watch: %s", exc)
+            return
+        if not fresh.pairs:
+            logger.warning("Universe refresh returned 0 pairs — keeping previous watch")
+            return
+        new_watch = init_pairs(client, fresh.pairs, logger, arm_leverage=not hft_on)
+        filtered = apply_hft_watch(new_watch)
         if hft_on and not filtered:
             logger.warning(
                 "HFT refresh produced 0 names with maxLev≤%sx — keeping previous watch",
@@ -613,26 +658,53 @@ def main() -> None:
         leverage_by_coin = build_leverage_map(watch)
         mover_buckets = dict(fresh.buckets)
         universe_built_at = time.time()
+        new_names = [e.api_coin for e in watch]
+        if old_names != new_names:
+            dropped = [c for c in old_names if c not in set(new_names)]
+            added = [c for c in new_names if c not in set(old_names)]
+            logger.info(
+                "Pair list change | was=%s now=%s dropped=%s added=%s",
+                ",".join(old_names) or "-",
+                ",".join(new_names) or "-",
+                ",".join(dropped) or "-",
+                ",".join(added) or "-",
+            )
 
-    def run_tune() -> None:
+    def run_tune(
+        *,
+        coins: list[str] | None = None,
+        merge: bool = False,
+        skip_refresh: bool = False,
+    ) -> None:
         nonlocal watch, cleanup_coins, tune_leverage, leverage_by_coin
-        refresh_universe_if_needed()
-        reverse_live = bool(cfg.reverse_orders_enabled())
+        if not skip_refresh:
+            refresh_universe_if_needed()
+        reverse_live = flip_live
         side_map = (
             allowed_sides_for_movers(mover_buckets)
-            if is_mover_mode(pair_mode)
+            if is_side_locked_mode(pair_mode)
             else None
         )
-        if side_map:
+        if side_map and is_majority_mode(pair_mode):
+            logger.info(
+                "MAJORITY: tune WITH wallet side (long=LONG, short=SHORT). "
+                "Live reverse=%s → orders match list",
+                reverse_live,
+            )
+        elif side_map:
             logger.info(
                 "Movers: tune WITH 24h move (gainers LONG, losers SHORT). "
                 "Live reverse=%s → orders %s",
                 reverse_live,
                 "flipped" if reverse_live else "match backtest",
             )
+        tune_coins = coins or [e.api_coin for e in watch]
+        if not tune_coins:
+            logger.warning("Tune skipped — empty watch")
+            return
         results = run_full_tune(
             client.info,
-            [e.api_coin for e in watch],
+            tune_coins,
             list(cfg.INTERVALS),
             leverage=tune_leverage,
             leverage_by_coin=leverage_by_coin,
@@ -659,6 +731,8 @@ def main() -> None:
         )
         if results:
             max_live = int(getattr(cfg, "MAX_LIVE_PAIRS", 5) or 5)
+            if is_majority_mode(pair_mode):
+                max_live = max(max_live, int(getattr(cfg, "MAJORITY_MAX_PAIRS", 2) or 2))
             results = select_top_live_pairs(
                 results,
                 max_live,
@@ -670,10 +744,13 @@ def main() -> None:
                 leverage=tune_leverage,
                 pair_selection_mode=pair_mode,
                 reverse_orders=reverse_live,
-                mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
+                mover_tune=MOVER_TUNE_LOCK if is_side_locked_mode(pair_mode) else None,
+                merge=merge,
             )
             # Auto pair modes: live-scan only kept winners (full set rebuilt on retune).
-            if is_auto_pair_mode(pair_mode):
+            # Majority watch is the wallet list itself — do not drop a name that
+            # failed this tune (it stays on the list; no-setup until next tune).
+            if is_auto_pair_mode(pair_mode) and not is_majority_mode(pair_mode):
                 winners = set(results.keys())
                 kept = [e for e in watch if e.api_coin in winners]
                 if kept:
@@ -699,8 +776,8 @@ def main() -> None:
         # Empty setups: never hammer retune — honor cooldown after a failed attempt.
         mismatch = store.config_mismatch(
             pair_mode,
-            cfg.reverse_orders_enabled(),
-            mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
+            flip_live,
+            mover_tune=MOVER_TUNE_LOCK if is_side_locked_mode(pair_mode) else None,
         )
         if mismatch:
             cooled = (
@@ -920,6 +997,32 @@ def main() -> None:
             int(getattr(cfg, "MAX_MAX_LEVERAGE", 0) or 0) or "off",
             int(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0) or "off",
         )
+    if is_majority_mode(pair_mode):
+        longs = [c for c, b in mover_buckets.items() if b == "gainer"]
+        shorts = [c for c, b in mover_buckets.items() if b == "loser"]
+        logger.info(
+            "MAJORITY settings: max_pairs=%s basket=%s snap_sleep=%.2fs "
+            "list_refresh=%.1fh window=%s min_hold=%.0f%% min_agr=%.0f%% "
+            "xyz_mode=%s | tune with-trend live reverse=%s",
+            int(getattr(cfg, "MAJORITY_MAX_PAIRS", 2) or 2),
+            int(getattr(cfg, "MAJORITY_BASKET_SIZE", 120) or 120),
+            float(getattr(cfg, "MAJORITY_SNAP_SLEEP_S", 0.22) or 0.22),
+            float(getattr(cfg, "MAJORITY_LIST_REFRESH_HOURS", 2.5) or 2.5),
+            str(getattr(cfg, "MAJORITY_RANK_WINDOW", "week") or "week"),
+            float(getattr(cfg, "MAJORITY_MIN_HOLD_PCT", 0.05) or 0.05) * 100.0,
+            float(getattr(cfg, "MAJORITY_MIN_SIDE_AGREEMENT", 0.55) or 0.55) * 100.0,
+            cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else getattr(cfg, "INCLUDE_XYZ_PAIRS", False),
+            flip_live,
+        )
+        if longs:
+            logger.info("MAJORITY longs: %s", ",".join(longs))
+        if shorts:
+            logger.info("MAJORITY shorts: %s", ",".join(shorts))
+        logger.info(
+            "Strategy: MTF on majority names only (EMA-race/dev/HFT off). "
+            "Off-list or side-flip closes now. MAX_POSITION_HOURS=%.1f still applies.",
+            float(cfg.MAX_POSITION_HOURS),
+        )
     if is_mover_mode(pair_mode):
         gainer_side = mover_tune_side("gainer")
         loser_side = mover_tune_side("loser")
@@ -978,8 +1081,8 @@ def main() -> None:
     pos_ok, open_positions = client.fetch_open_positions(force=True)
     mismatch0 = store.config_mismatch(
         pair_mode,
-        cfg.reverse_orders_enabled(),
-        mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
+        flip_live,
+        mover_tune=MOVER_TUNE_LOCK if is_side_locked_mode(pair_mode) else None,
     )
     if not ema_dev_on and not hft_on and not race_on and mismatch0 and pos_ok and open_positions:
         logger.warning(
@@ -1088,10 +1191,77 @@ def main() -> None:
         )
         drop_local(entry.api_coin)
 
+    def majority_wanted_side(coin: str, entry=None) -> str | None:
+        if not is_majority_mode(pair_mode):
+            return None
+        names = [str(coin)]
+        if entry is not None:
+            names.extend(entry.position_coin_names())
+            names.append(entry.api_coin)
+        for name in names:
+            b = str(mover_buckets.get(name) or "").strip().lower()
+            if b == "gainer":
+                return "long"
+            if b == "loser":
+                return "short"
+        return None
+
+    def flatten_majority_off_list(positions) -> int:
+        """Close names that left the majority list or flipped side. Return closes."""
+        if not is_majority_mode(pair_mode):
+            return 0
+        closed = 0
+        for coin, pos in list(positions):
+            entry = find_watch_entry(watch, coin)
+            pos_side = str(getattr(pos, "side", "") or "").lower()
+            want = majority_wanted_side(coin, entry)
+            if entry is None:
+                why = "off list"
+            elif want and pos_side and pos_side != want:
+                why = f"side flip (have {pos_side}, list {want})"
+            else:
+                continue
+            logger.info("MAJORITY close %s %s — %s", coin, pos_side or "?", why)
+            if entry is not None:
+                activate_pair(client, entry)
+            else:
+                client.configure_coin(str(coin))
+            executor.emergency_flatten("majority_off_list")
+            if entry is not None:
+                finish_close(entry)
+            else:
+                wait_until_flat(
+                    client,
+                    trade_store,
+                    logger,
+                    coin=client.coin,
+                    coin_names=frozenset({client.coin, str(coin)}),
+                )
+                drop_local(client.coin)
+                drop_local(str(coin))
+            closed += 1
+        return closed
+
     def manage_one(coin: str, position) -> bool:
         """Manage one open coin. Return True if it was closed this pass."""
         entry = find_watch_entry(watch, coin)
         if entry is None:
+            if is_majority_mode(pair_mode):
+                logger.info("MAJORITY close %s — off list", coin)
+                client.configure_coin(str(coin))
+                executor.emergency_flatten("majority_off_list")
+                wait_until_flat(
+                    client,
+                    trade_store,
+                    logger,
+                    coin=client.coin,
+                    coin_names=frozenset(
+                        {client.coin, str(coin), client.market.symbol}
+                    ),
+                )
+                drop_local(client.coin)
+                drop_local(str(coin))
+                return True
             logger.warning(
                 "Position on %s outside watch — managing max-hold only",
                 coin,
@@ -1132,6 +1302,18 @@ def main() -> None:
                 return True
             return False
         activate_pair(client, entry)
+        side = str(getattr(position, "side", "") or "")
+        want = majority_wanted_side(entry.api_coin, entry)
+        if is_majority_mode(pair_mode) and want and side and side.lower() != want:
+            logger.info(
+                "MAJORITY close %s %s — side flip (list %s)",
+                entry.api_coin,
+                side,
+                want,
+            )
+            executor.emergency_flatten("majority_side_flip")
+            finish_close(entry)
+            return True
         setup = resolve_setup_for_position(entry.api_coin, store, open_setup_mem)
         if setup is None:
             logger.warning(
@@ -3513,6 +3695,49 @@ def main() -> None:
                     break
                 continue
 
+            if is_majority_mode(pair_mode) and not (hft_on or race_on or ema_dev_on):
+                maj_h = float(getattr(cfg, "MAJORITY_LIST_REFRESH_HOURS", 2.5) or 2.5)
+                due = time.time() - universe_built_at >= maj_h * 3600.0
+                if due and time.time() >= majority_fail_until:
+                    built = universe_built_at
+                    refresh_universe_if_needed(force=True)
+                    if universe_built_at == built:
+                        majority_fail_until = time.time() + 300.0
+                        logger.warning(
+                            "MAJORITY refresh did not apply — retry in 300s"
+                        )
+                    else:
+                        majority_fail_until = 0.0
+                closed_n = flatten_majority_off_list(open_positions)
+                if closed_n:
+                    pos_ok, open_positions = client.fetch_open_positions(force=True)
+                    if not pos_ok:
+                        continue
+                missing = []
+                for e in watch:
+                    setups = store.setups_for(e.api_coin)
+                    if not setups:
+                        missing.append(e.api_coin)
+                        continue
+                    want = majority_wanted_side(e.api_coin, e)
+                    if not want:
+                        continue
+                    want_sig = 1 if want == "long" else -1
+                    if all(int(s.side) != want_sig for s in setups):
+                        missing.append(e.api_coin)
+                if missing:
+                    cooled = (
+                        store._last_attempt_ts <= 0
+                        or time.time() - store._last_attempt_ts
+                        >= store._retry_cooldown_s
+                    )
+                    if cooled:
+                        logger.info(
+                            "MAJORITY setups stale vs list %s — tuning (merge)",
+                            ",".join(missing),
+                        )
+                        run_tune(coins=missing, merge=True, skip_refresh=True)
+
             closed_any = False
             if hft_on:
                 closed_any = manage_hft_positions(open_positions)
@@ -3644,7 +3869,16 @@ def main() -> None:
                     parts.append(f"{entry.api_coin} no-setup")
                     continue
                 hits: list[tuple] = []
+                want = majority_wanted_side(entry.api_coin, entry)
                 for setup in setups:
+                    if want:
+                        want_sig = 1 if want == "long" else -1
+                        if int(setup.side) != want_sig:
+                            parts.append(
+                                f"{entry.api_coin} skip setup-side "
+                                f"{'LONG' if setup.side > 0 else 'SHORT'}≠{want.upper()}"
+                            )
+                            continue
                     need = max(80, int(setup.aux) + 50, 120)
                     if setup.is_mtf:
                         vote_ivs = list(setup.mtf_intervals) or list(cfg.INTERVALS)
@@ -3668,6 +3902,15 @@ def main() -> None:
                         tag = f"MTF@{setup.interval}:{setup.name}"
                         if sig != 0:
                             order = -sig if rev else sig
+                            if want:
+                                if (want == "long" and order < 0) or (
+                                    want == "short" and order > 0
+                                ):
+                                    parts.append(
+                                        f"{entry.api_coin} [{tag}] skip list-side {want} "
+                                        f"({snap})"
+                                    )
+                                    continue
                             hits.append((entry, sig, setup, bar_t, multi))
                             parts.append(
                                 f"{entry.api_coin} [{tag}] YES "
@@ -3688,6 +3931,14 @@ def main() -> None:
                         tag = f"{setup.interval}:{setup.name}"
                         if sig != 0:
                             order = -sig if rev else sig
+                            if want:
+                                if (want == "long" and order < 0) or (
+                                    want == "short" and order > 0
+                                ):
+                                    parts.append(
+                                        f"{entry.api_coin} [{tag}] skip list-side {want}"
+                                    )
+                                    continue
                             hits.append((entry, sig, setup, bar_t, None))
                             parts.append(
                                 f"{entry.api_coin} [{tag}] YES "

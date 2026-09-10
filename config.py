@@ -12,6 +12,10 @@ from __future__ import annotations
 # One live path at a time. First True wins: HFT > EMA_RACE > EMA_DEV > MTF.
 # This file only -- not profit-meta-follower/config.py.
 # False = MTF (tune / backtest) when the three flags below are all False.
+#
+# Majority pair+side list: MTF is the fit. It tunes WITH the wallet side
+# (long=gainer, short=loser) and only enters when multi-TF agrees. EMA-race
+# / EMA-dev pick their own side from EMA stretch and can fight the crowd.
 USE_EMA_DEV_STRATEGY = False
 
 # EMA race (relative stretch vs the 24h gainer/loser basket).
@@ -19,7 +23,7 @@ USE_EMA_DEV_STRATEGY = False
 # Watches every selected pair's distance from EMA, picks the standout,
 # 1:1 market TP/SL. Size is EMA_RACE_MARGIN_PCT of equity (not ~90%).
 # Learns pick weights from every close.
-USE_EMA_RACE_STRATEGY = True
+USE_EMA_RACE_STRATEGY = False
 EMA_RACE_INTERVAL = "1m"
 EMA_RACE_PERIOD = 100
 EMA_RACE_MIN_DEV_PCT = 0.25
@@ -197,7 +201,12 @@ def ema_dev_strategy_enabled() -> bool:
 #                 REVERSE_STRATEGY off → live matches that (long pumps / short dumps).
 #                 REVERSE_STRATEGY on  → live flips (short pumps / long dumps).
 #                 Backtest itself is never reversed.
-PAIR_SELECTION_MODE = "top_movers"
+# "majority"    = meta-follower wallet vote: top wallets by 7d ROI, snapshot
+#                 what they hold, take majority (pair, side). Tune WITH that
+#                 side (long→gainer / short→loser). Live does NOT reverse.
+#                 Off-list / side-flip closes immediately. Old 24h movers stay
+#                 available — set this back to "top_movers" to use them.
+PAIR_SELECTION_MODE = "majority"
 
 # --- top_volume mode only ---
 # How many highest-volume perps to backtest each tune (before MAX_LIVE_PAIRS cut).
@@ -206,6 +215,23 @@ TOP_VOLUME_COUNT = 27
 # Look-set size. Half are 24h gainers, half are 24h losers (odd extra → gainers).
 # Example 14 → 7 gainers + 7 losers, then MAX_LIVE_PAIRS keeps the best of those.
 TOP_MOVER_COUNT = 14
+# --- majority mode only (ignored unless PAIR_SELECTION_MODE=majority) ---
+# How many names from the wallet board to trade/backtest (rank 1, 2, …).
+# Example 2 → ZEC long + NEAR long when those are #1/#2.
+MAJORITY_MAX_PAIRS = 2
+# Rebuild the list this often. Positions not on the new list (or wrong side)
+# are closed immediately. Do not snap every poll — 200 wallets 429'd live.
+MAJORITY_LIST_REFRESH_HOURS = 2.5
+# Wallets to snapshot (top by MAJORITY_RANK_WINDOW ROI). 120 ≈ one ALL_DEXES
+# call each + sleep; 200 previously hit Hyperliquid 429s on Railway.
+MAJORITY_BASKET_SIZE = 120
+MAJORITY_SNAP_SLEEP_S = 0.22
+MAJORITY_RANK_WINDOW = "week"
+MAJORITY_MIN_HOLD_PCT = 0.05
+MAJORITY_MIN_SIDE_AGREEMENT = 0.55
+MAJORITY_MIN_WALLET_NOTIONAL_USD = 50.0
+# Leaderboard is the public stats CDN (not /info). Safe to cache longer.
+MAJORITY_LEADERBOARD_CACHE_HOURS = 6.0
 # Skip markets whose 24h notional volume (dayNtlVlm) is below this USD amount.
 # 0 = off. Movers especially need this — tiny HIP-3 books can print huge 24h %.
 # 1_000_000 ≈ $1M/day. Raise if you still see thin names; lower to include more xyz.
@@ -314,8 +340,8 @@ MIN_TRADES_ABS = 5
 # If more than this many pairs produce a winner, keep only the top-N by rank_score
 # for live scanning (saves Hyperliquid IP weight). ≤N winners → keep all.
 # IMPORTANT: 1 starves live to a single coin (often silent for days).
-# Example ratios: manual 14→5, top_volume 50→15, top_movers 14→9 (half/half).
-MAX_LIVE_PAIRS = 9
+# Majority: keep this >= MAJORITY_MAX_PAIRS (watch is already that list).
+MAX_LIVE_PAIRS = 2
 
 # Tuner-only: which margin % to simulate when ranking setups. Live sizing ignores
 # this — see TOTAL_BALANCE_PCT / BALANCE_SPLIT_POSITIONS below.
@@ -362,7 +388,7 @@ DCA_MAX_ADDS = 1
 # False = real Hyperliquid orders
 # Paper uses MARKET orders only (same path as live EMA with EMA_DEV_LIMIT_ORDERS=False).
 # Do not turn limit/maker on in paper — those fills would not match live.
-PAPER_TRADING = True
+PAPER_TRADING = False
 PAPER_START_BALANCE = 1000.0
 USE_MARKET_ORDERS = True
 MARKET_ORDER_SLIPPAGE = 0.05
@@ -379,9 +405,9 @@ ALLOW_CONCURRENT_POSITIONS = True
 # Example $1000 equity: budget $950 (capped 95% in live sizing), 5 pairs.
 # Each pair gets 19% of equity total; with DCA_MAX_ADDS=1 that is two equal
 # ~9.5% fills (entry + one add). A 6th coin is blocked.
-TOTAL_BALANCE_PCT = 55.0
-BALANCE_SPLIT_POSITIONS = 5
-MAX_CONCURRENT_POSITIONS = 5
+TOTAL_BALANCE_PCT = 70.0
+BALANCE_SPLIT_POSITIONS = 2
+MAX_CONCURRENT_POSITIONS = 2
 # IP-weight headroom (Hyperliquid 1200/min). 50 is for a dedicated Railway IP.
 # Raise to 250 if a browser or extra bots share the same IP.
 IP_WEIGHT_RESERVE = 50
@@ -390,8 +416,10 @@ IP_WEIGHT_RESERVE = 50
 # EMA-dev: off = mean-revert; on = momentum (long above / short below).
 # Both use fixed TP/SL = ±D% from the fill (D locked at entry). Same flag.
 # Backtest/tune is NEVER reversed.
-REVERSE_STRATEGY = True
-FLIP_EXECUTION = True # legacy alias; either True enables reverse
+# Majority mode ignores this (live must match the wallet side). Turn back on
+# if you switch PAIR_SELECTION_MODE to top_movers and want fade/flip.
+REVERSE_STRATEGY = False
+FLIP_EXECUTION = False # legacy alias; either True enables reverse
 
 
 def reverse_orders_enabled() -> bool:

@@ -17,11 +17,14 @@ from src.market_resolver import parse_coin_input
 from src.pair_universe import (
     MOVER_TUNE_LOCK,
     allowed_sides_for_movers,
+    is_majority_mode,
     is_mover_mode,
+    is_side_locked_mode,
     is_volume_mode,
     mover_tune_side,
     resolve_pair_universe,
 )
+from src.majority_universe import majority_resolve_kwargs
 from src.store import SetupStore
 from src.tuner import run_full_tune, select_top_live_pairs
 
@@ -64,10 +67,12 @@ def main() -> None:
         raise ValueError(f"Unknown INTERVALS {bad}")
 
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
-    if pair_mode != "manual" and not (is_volume_mode(pair_mode) or is_mover_mode(pair_mode)):
+    if pair_mode != "manual" and not (
+        is_volume_mode(pair_mode) or is_mover_mode(pair_mode) or is_majority_mode(pair_mode)
+    ):
         raise ValueError(
-            "PAIR_SELECTION_MODE must be 'manual', 'top_volume', or 'top_movers' "
-            f"(got {pair_mode!r})"
+            "PAIR_SELECTION_MODE must be 'manual', 'top_volume', 'top_movers', "
+            f"or 'majority' (got {pair_mode!r})"
         )
 
     logger = setup_logger("hl-multi-backtest", PROJECT / "logs")
@@ -103,6 +108,11 @@ def main() -> None:
         min_day_notional=float(getattr(cfg, "MIN_DAY_NOTIONAL_USD", 0) or 0),
         xyz_mode=cfg.xyz_pair_mode() if hasattr(cfg, "xyz_pair_mode") else None,
         logger=logger,
+        **(
+            majority_resolve_kwargs(cfg, data_dir=data_dir, force=False)
+            if is_majority_mode(pair_mode)
+            else {}
+        ),
     )
     coins = []
     leverage_by_coin: dict[str, int] = {}
@@ -140,9 +150,23 @@ def main() -> None:
     mover_buckets = dict(universe.buckets)
     side_map = (
         allowed_sides_for_movers(mover_buckets)
-        if is_mover_mode(pair_mode)
+        if is_side_locked_mode(pair_mode)
         else None
     )
+    if is_majority_mode(pair_mode):
+        longs = [c for c, b in mover_buckets.items() if b == "gainer"]
+        shorts = [c for c, b in mover_buckets.items() if b == "loser"]
+        logger.info(
+            "MAJORITY: max_pairs=%s basket=%s window=%s min_hold=%.0f%% min_agr=%.0f%% "
+            "| tune WITH wallet side longs=%s shorts=%s (no live reverse in backtest)",
+            int(getattr(cfg, "MAJORITY_MAX_PAIRS", 2) or 2),
+            int(getattr(cfg, "MAJORITY_BASKET_SIZE", 120) or 120),
+            str(getattr(cfg, "MAJORITY_RANK_WINDOW", "week") or "week"),
+            float(getattr(cfg, "MAJORITY_MIN_HOLD_PCT", 0.05) or 0.05) * 100.0,
+            float(getattr(cfg, "MAJORITY_MIN_SIDE_AGREEMENT", 0.55) or 0.55) * 100.0,
+            ",".join(longs) or "-",
+            ",".join(shorts) or "-",
+        )
     if is_mover_mode(pair_mode):
         gainer_side = mover_tune_side("gainer")
         loser_side = mover_tune_side("loser")
@@ -206,10 +230,13 @@ def main() -> None:
             results,
             leverage=cfg.LEVERAGE,
             pair_selection_mode=pair_mode,
-            reverse_orders=bool(cfg.reverse_orders_enabled())
-            if hasattr(cfg, "reverse_orders_enabled")
-            else False,
-            mover_tune=MOVER_TUNE_LOCK if is_mover_mode(pair_mode) else None,
+            reverse_orders=(
+                bool(cfg.reverse_orders_enabled())
+                if hasattr(cfg, "reverse_orders_enabled")
+                else False
+            )
+            and not is_majority_mode(pair_mode),
+            mover_tune=MOVER_TUNE_LOCK if is_side_locked_mode(pair_mode) else None,
         )
         logger.info("Done: %s", store.describe())
     else:

@@ -1,7 +1,8 @@
 """
-Discover Hyperliquid perp pairs by 24h notional volume or 24h % movers.
+Discover Hyperliquid perp pairs by 24h notional volume, 24h % movers,
+or top-wallet majority holds.
 
-Used by PAIR_SELECTION_MODE = "top_volume" / "top_movers".
+Used by PAIR_SELECTION_MODE = "top_volume" / "top_movers" / "majority".
 Manual PAIRS mode does not use this.
 """
 
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable
 
 from .market_resolver import (
@@ -30,6 +32,15 @@ MOVER_MODES = frozenset(
         "gainer_losers",
     }
 )
+MAJORITY_MODES = frozenset(
+    {
+        "majority",
+        "wallet_majority",
+        "meta_majority",
+        "meta_follower",
+        "wallet_holds",
+    }
+)
 
 
 def is_volume_mode(mode: str | None) -> bool:
@@ -40,12 +51,21 @@ def is_mover_mode(mode: str | None) -> bool:
     return str(mode or "").strip().lower() in MOVER_MODES
 
 
+def is_majority_mode(mode: str | None) -> bool:
+    return str(mode or "").strip().lower() in MAJORITY_MODES
+
+
+def is_side_locked_mode(mode: str | None) -> bool:
+    """Tune/live lock pair side from the universe (movers or majority)."""
+    return is_mover_mode(mode) or is_majority_mode(mode)
+
+
 def is_auto_pair_mode(mode: str | None) -> bool:
-    return is_volume_mode(mode) or is_mover_mode(mode)
+    return is_volume_mode(mode) or is_mover_mode(mode) or is_majority_mode(mode)
 
 
 def valid_pair_modes() -> tuple[str, ...]:
-    return ("manual", *sorted(VOLUME_MODES | MOVER_MODES))
+    return ("manual", *sorted(VOLUME_MODES | MOVER_MODES | MAJORITY_MODES))
 
 
 @dataclass(frozen=True)
@@ -590,6 +610,17 @@ def resolve_pair_universe(
     top_mover_count: int | None = None,
     min_day_notional: float = 0.0,
     logger: logging.Logger | None = None,
+    data_dir: Path | str | None = None,
+    majority_force: bool = False,
+    majority_max_pairs: int | None = None,
+    majority_basket_size: int | None = None,
+    majority_snap_sleep_s: float | None = None,
+    majority_refresh_hours: float | None = None,
+    majority_rank_window: str | None = None,
+    majority_min_hold_pct: float | None = None,
+    majority_min_agreement: float | None = None,
+    majority_min_wallet_notional: float | None = None,
+    majority_leaderboard_cache_hours: float | None = None,
 ) -> PairUniverse:
     """
     Returns PairUniverse for tune + watch.
@@ -598,6 +629,7 @@ def resolve_pair_universe(
       - "manual": use manual_pairs + PAIR_LEVERAGE / LEVERAGE
       - "top_volume": discover by dayNtlVlm
       - "top_movers": half 24h gainers + half 24h losers
+      - "majority": top-wallet majority holds (pair + side)
     """
     log = logger or logging.getLogger("hl-multi")
     mode_s = (mode or "manual").strip().lower()
@@ -650,6 +682,54 @@ def resolve_pair_universe(
                 "MAX_MAX_LEVERAGE / MIN_DAY_NOTIONAL_USD"
             )
         pairs = _assign_discovered_leverage(
+            discovered,
+            use_max_leverage=use_max_leverage,
+            leverage_overrides=overrides,
+            requested_leverage_for=requested_leverage_for,
+        )
+        return PairUniverse(pairs=pairs, buckets=buckets)
+
+    if is_majority_mode(mode_s):
+        from .majority_universe import assign_majority_leverage, discover_majority_pairs
+
+        discovered, buckets = discover_majority_pairs(
+            info,
+            data_dir=Path(data_dir or "data"),
+            max_pairs=int(majority_max_pairs or 2),
+            basket_size=int(majority_basket_size or 120),
+            snap_sleep_s=float(
+                majority_snap_sleep_s if majority_snap_sleep_s is not None else 0.22
+            ),
+            refresh_hours=float(majority_refresh_hours or 2.5),
+            rank_window=str(majority_rank_window or "week"),
+            xyz_mode=scope,
+            include_xyz=bool(include_xyz),
+            use_max_leverage=use_max_leverage,
+            leverage_overrides=overrides,
+            requested_leverage_for=requested_leverage_for,
+            min_max_leverage=int(min_max_leverage or 0),
+            max_max_leverage=int(max_max_leverage or 0),
+            min_day_notional=float(min_day_notional or 0.0),
+            min_hold_pct=float(
+                majority_min_hold_pct if majority_min_hold_pct is not None else 0.05
+            ),
+            min_agreement=float(
+                majority_min_agreement if majority_min_agreement is not None else 0.55
+            ),
+            min_wallet_notional=float(
+                majority_min_wallet_notional
+                if majority_min_wallet_notional is not None
+                else 50.0
+            ),
+            leaderboard_cache_hours=float(
+                majority_leaderboard_cache_hours
+                if majority_leaderboard_cache_hours is not None
+                else 6.0
+            ),
+            force=bool(majority_force),
+            logger=log,
+        )
+        pairs = assign_majority_leverage(
             discovered,
             use_max_leverage=use_max_leverage,
             leverage_overrides=overrides,
