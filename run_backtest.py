@@ -58,8 +58,10 @@ def main() -> None:
             "Run python bot_live.py instead."
         )
         return
-    if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
-        raise ValueError("Enable at least one exit layer in config.py")
+    trend_on = bool(getattr(cfg, "trend_follow_enabled", lambda: False)())
+    if not trend_on:
+        if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
+            raise ValueError("Enable at least one exit layer in config.py")
     from src.candles import INTERVAL_MS
 
     bad = [i for i in cfg.INTERVALS if i not in INTERVAL_MS]
@@ -191,6 +193,52 @@ def main() -> None:
         )
     if getattr(cfg, "PAIR_LEVERAGE", None):
         logger.info("Per-pair leverage overrides: %s", cfg.PAIR_LEVERAGE)
+    if trend_on:
+        from src.trend_follow import TrendStore, tune_coin as trend_tune_coin
+
+        logger.info(
+            "TREND tune — list side locked, exec=%s htf=%s no TP, exit=EMA/ATR trail",
+            getattr(cfg, "TREND_INTERVAL", "15m"),
+            getattr(cfg, "TREND_HTF_INTERVAL", "1h"),
+        )
+        tstore = TrendStore(data_dir / "trend_follow.json")
+        results: dict = {}
+        for coin in coins:
+            side = 1
+            if side_map:
+                if coin in side_map:
+                    side = int(side_map[coin])
+                else:
+                    short = coin.split(":")[-1]
+                    hit = next(
+                        (
+                            int(sig)
+                            for key, sig in side_map.items()
+                            if str(key) == coin or str(key).split(":")[-1] == short
+                        ),
+                        None,
+                    )
+                    if hit is not None:
+                        side = hit
+                    elif str(mover_buckets.get(coin) or "").strip().lower() == "loser":
+                        side = -1
+            row = trend_tune_coin(
+                info,
+                coin,
+                side=int(side),
+                data_dir=data_dir,
+                requested_candles=int(getattr(cfg, "REQUESTED_CANDLES", 3000) or 3000),
+                logger=logger,
+                cfg=cfg,
+            )
+            if row:
+                results[coin] = row
+        if results:
+            tstore.save_tune(results, merge=False)
+            logger.info("TREND done: %s coins → data/trend_follow.json", ",".join(results))
+        else:
+            logger.warning("TREND tune found no usable params")
+        return
     results = run_full_tune(
         info,
         coins,

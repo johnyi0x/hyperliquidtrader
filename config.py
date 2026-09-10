@@ -9,20 +9,14 @@ from __future__ import annotations
 # =============================================================================
 # WHICH STRATEGY  (set this first)
 # =============================================================================
-# One live path at a time. First True wins: HFT > EMA_RACE > EMA_DEV > MTF.
+# One live path at a time. First True wins: HFT > EMA_RACE > EMA_DEV > TREND > MTF.
 # This file only -- not profit-meta-follower/config.py.
-# False = MTF (tune / backtest) when the three flags below are all False.
 #
-# Majority pair+side list: MTF is the fit. It tunes WITH the wallet side
-# (long=gainer, short=loser) and only enters when multi-TF agrees. EMA-race
-# / EMA-dev pick their own side from EMA stretch and can fight the crowd.
+# Majority / 24h list picks pair+side. TREND rides that side (15m EMA + ATR trail)
+# so pumps are held and dumps exit — not 1m 1% scalps, not bag-hold.
 USE_EMA_DEV_STRATEGY = False
 
 # EMA race (relative stretch vs the 24h gainer/loser basket).
-# True  = live/paper uses race instead of EMA-dev / MTF (HFT still wins if on).
-# Watches every selected pair's distance from EMA, picks the standout,
-# 1:1 market TP/SL. Size is EMA_RACE_MARGIN_PCT of equity (not ~90%).
-# Learns pick weights from every close.
 USE_EMA_RACE_STRATEGY = False
 EMA_RACE_INTERVAL = "1m"
 EMA_RACE_PERIOD = 100
@@ -190,6 +184,37 @@ def ema_dev_strategy_enabled() -> bool:
     except NameError:
         return False
 
+
+# =============================================================================
+# TREND FOLLOW  (list side + ride pumps / cut dumps)
+# =============================================================================
+# True = live/paper uses this instead of MTF. Pair list still majority / movers.
+# 15m EMA is the trend line. No 1% TP. Exit = tighter of EMA break and ATR trail
+# from the high (long) / low (short) since entry. 1h EMA blocks entries against
+# the higher-timeframe. Tuner picks ema period / trail / chase cap per coin.
+USE_TREND_FOLLOW = True
+TREND_INTERVAL = "15m"
+TREND_HTF_INTERVAL = "1h"
+TREND_EMA_PERIOD = 50
+TREND_ATR_PERIOD = 14
+TREND_ATR_K = 3.0
+# Skip a NEW entry if price is already this far past the EMA (wait for pullback).
+TREND_CHASE_PCT = 8.0
+TREND_ENTRY_BUF_ATR = 0.35
+TREND_COOLDOWN_BARS = 3
+TREND_MIN_ATR_PCT = 0.20
+TREND_SL_RATCHET_PCT = 0.15  # only re-place exchange SL if trail moved this %
+
+
+def trend_follow_enabled() -> bool:
+    """True when live/paper should ride list-side trends instead of MTF."""
+    if hft_pingpong_enabled() or ema_race_strategy_enabled() or ema_dev_strategy_enabled():
+        return False
+    try:
+        return bool(USE_TREND_FOLLOW)
+    except NameError:
+        return False
+
 # =============================================================================
 # PAIR SELECTION
 # =============================================================================
@@ -202,10 +227,9 @@ def ema_dev_strategy_enabled() -> bool:
 #                 REVERSE_STRATEGY on  → live flips (short pumps / long dumps).
 #                 Backtest itself is never reversed.
 # "majority"    = meta-follower wallet vote: top wallets by 7d ROI, snapshot
-#                 what they hold, take majority (pair, side). Tune WITH that
-#                 side (long→gainer / short→loser). Live does NOT reverse.
-#                 Off-list / side-flip closes immediately. Old 24h movers stay
-#                 available — set this back to "top_movers" to use them.
+#                 what they hold, take majority (pair, side). Includes HIP-3
+#                 (xyz:) even if XYZ_PAIR_MODE is native. Off-list / side-flip
+#                 closes immediately. Set this back to "top_movers" for 24h.
 PAIR_SELECTION_MODE = "majority"
 
 # --- top_volume mode only ---
@@ -243,7 +267,7 @@ MIN_MAX_LEVERAGE = 3
 # Skip markets whose exchange max leverage is ABOVE this (exclude ultra-high lev).
 # Ping-pong's ≤20x cut is HFT_MAX_MAX_LEVERAGE, not this.
 MAX_MAX_LEVERAGE = 0
-# Which books to scan (volume or 24h movers). Same filter in EMA-dev and MTF.
+# Which books to scan (volume or 24h movers only — majority always includes HIP-3).
 #   "native"   = Hyperliquid main perps only (BTC, ETH, …). No HIP-3.
 #                Drops xyz: / para: / 10x: / other builder-dex prefixes.
 #   "include"  = native + HIP-3 (xyz:..., para:..., 10x:...)

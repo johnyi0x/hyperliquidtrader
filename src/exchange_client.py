@@ -1410,6 +1410,42 @@ class HyperliquidClient:
                 return False, err
         return True, None
 
+    def attach_stop_at_price(
+        self,
+        position: Position,
+        sl_px: float,
+        *,
+        max_attempts: int = 3,
+    ) -> bool:
+        """Place / ratchet a reduce-only market SL at an absolute trigger price."""
+        import time as time_mod
+
+        sl_px = float(sl_px)
+        if sl_px <= 0:
+            return False
+        for _attempt in range(1, max_attempts + 1):
+            live = self.get_position(force=True)
+            if live is None or live.size < 1e-12:
+                return False
+            if self._sl_matches(live, sl_px):
+                return True
+            self.cancel_sl_triggers_for_coin()
+            ok, err = self._place_sl_trigger_raw(live.side, live.size, sl_px)
+            if not ok:
+                self.logger.warning("SL-at-price place failed: %s", err)
+                time_mod.sleep(0.6)
+                continue
+            time_mod.sleep(0.45)
+            if self.has_exchange_sl():
+                self.logger.info(
+                    "Exchange SL at price %s sz=%s sl=%.6g",
+                    live.side,
+                    live.size,
+                    sl_px,
+                )
+                return True
+        return self.has_exchange_sl()
+
     def attach_stop_loss_only(
         self,
         position: Position,

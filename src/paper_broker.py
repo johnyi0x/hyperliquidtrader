@@ -502,6 +502,28 @@ class PaperHyperliquidClient(HyperliquidClient):
         self._settle()
         return True
 
+    def attach_stop_at_price(
+        self,
+        position,
+        sl_px: float,
+        *,
+        max_attempts: int = 3,
+    ) -> bool:
+        pos = self.positions.get(self.coin)
+        if not pos:
+            return False
+        pos["tp_px"] = None
+        pos["sl_px"] = float(sl_px)
+        self._save_account()
+        self.logger.info(
+            "PAPER SL-at-price %s %s sl=%.8f",
+            pos["coin"],
+            pos["side"],
+            sl_px,
+        )
+        self._settle()
+        return self.coin in self.positions or True
+
     def protect_ema_maker(
         self,
         take_profit_pct: float,

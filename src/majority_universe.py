@@ -22,6 +22,7 @@ from .pair_universe import (
     _assign_discovered_leverage,
     _collect_perp_pairs,
     _dedupe_by_api_coin,
+    _normalize_xyz_mode,
 )
 
 _PMF_ROOT = Path(__file__).resolve().parents[1] / "profit-meta-follower"
@@ -209,8 +210,16 @@ def discover_majority_pairs(
     max_n = max(1, int(max_pairs or 1))
     cache_h = max(0.05, float(refresh_hours or 2.5))
     cache_file = _cache_path(Path(data_dir))
+    want_xyz = _normalize_xyz_mode(xyz_mode, include_xyz)
     if not force:
         cached = _load_cache(cache_file, cache_h)
+        if cached is not None and str(cached.get("xyz_mode") or "") != want_xyz:
+            log.info(
+                "MAJORITY cache ignore — scope %s vs want %s (HIP-3 eligible)",
+                cached.get("xyz_mode") or "?",
+                want_xyz,
+            )
+            cached = None
         if cached is not None:
             discovered: list[VolumePair] = []
             buckets: dict[str, str] = {}
@@ -359,42 +368,45 @@ def discover_majority_pairs(
                 )
             )
             continue
-        if min_lev > 0 and int(market.max_leverage) < min_lev:
-            extra_skip_logs.append(
-                "MAJORITY skip %s %s — min_lev %sx<%sx hold=%.1f%%"
-                % (
-                    market.api_coin,
-                    row.side,
-                    market.max_leverage,
-                    min_lev,
-                    float(row.hold_pct) * 100.0,
+        # HIP-3 (xyz: stocks, etc.) stay eligible even when movers/volume
+        # scans use XYZ_PAIR_MODE=native plus min lev / min volume cuts.
+        if not market.perp_dex:
+            if min_lev > 0 and int(market.max_leverage) < min_lev:
+                extra_skip_logs.append(
+                    "MAJORITY skip %s %s — min_lev %sx<%sx hold=%.1f%%"
+                    % (
+                        market.api_coin,
+                        row.side,
+                        market.max_leverage,
+                        min_lev,
+                        float(row.hold_pct) * 100.0,
+                    )
                 )
-            )
-            continue
-        if max_lev_cap > 0 and int(market.max_leverage) > max_lev_cap:
-            extra_skip_logs.append(
-                "MAJORITY skip %s %s — max_lev %sx>%sx hold=%.1f%%"
-                % (
-                    market.api_coin,
-                    row.side,
-                    market.max_leverage,
-                    max_lev_cap,
-                    float(row.hold_pct) * 100.0,
+                continue
+            if max_lev_cap > 0 and int(market.max_leverage) > max_lev_cap:
+                extra_skip_logs.append(
+                    "MAJORITY skip %s %s — max_lev %sx>%sx hold=%.1f%%"
+                    % (
+                        market.api_coin,
+                        row.side,
+                        market.max_leverage,
+                        max_lev_cap,
+                        float(row.hold_pct) * 100.0,
+                    )
                 )
-            )
-            continue
-        if min_vol > 0 and float(market.day_ntl_vlm) < min_vol:
-            extra_skip_logs.append(
-                "MAJORITY skip %s %s — min_vol $%.0f<$%.0f hold=%.1f%%"
-                % (
-                    market.api_coin,
-                    row.side,
-                    market.day_ntl_vlm,
-                    min_vol,
-                    float(row.hold_pct) * 100.0,
+                continue
+            if min_vol > 0 and float(market.day_ntl_vlm) < min_vol:
+                extra_skip_logs.append(
+                    "MAJORITY skip %s %s — min_vol $%.0f<$%.0f hold=%.1f%%"
+                    % (
+                        market.api_coin,
+                        row.side,
+                        market.day_ntl_vlm,
+                        min_vol,
+                        float(row.hold_pct) * 100.0,
+                    )
                 )
-            )
-            continue
+                continue
         if len(selected) >= max_n:
             overflow.append(row)
             continue
@@ -469,6 +481,7 @@ def discover_majority_pairs(
         {
             "fetched_at": time.time(),
             "max_pairs": max_n,
+            "xyz_mode": want_xyz,
             "pairs": [_pair_payload(p, r.side) for p, r in selected],
             "stats": stats,
             "board": [asdict(r) if hasattr(r, "__dataclass_fields__") else {} for r in annotated[:20]],
@@ -513,4 +526,7 @@ def majority_resolve_kwargs(cfg: Any, *, data_dir: Path, force: bool = False) ->
         "majority_leaderboard_cache_hours": float(
             getattr(cfg, "MAJORITY_LEADERBOARD_CACHE_HOURS", 6.0) or 6.0
         ),
+        # Wallet list may rank HIP-3 (xyz:) names. Do not inherit XYZ_PAIR_MODE=native.
+        "majority_xyz_mode": "include",
+        "majority_min_day_notional": 0.0,
     }

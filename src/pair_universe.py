@@ -621,6 +621,8 @@ def resolve_pair_universe(
     majority_min_agreement: float | None = None,
     majority_min_wallet_notional: float | None = None,
     majority_leaderboard_cache_hours: float | None = None,
+    majority_xyz_mode: str | None = None,
+    majority_min_day_notional: float | None = None,
 ) -> PairUniverse:
     """
     Returns PairUniverse for tune + watch.
@@ -702,14 +704,18 @@ def resolve_pair_universe(
             ),
             refresh_hours=float(majority_refresh_hours or 2.5),
             rank_window=str(majority_rank_window or "week"),
-            xyz_mode=scope,
-            include_xyz=bool(include_xyz),
+            xyz_mode=str(majority_xyz_mode or "include"),
+            include_xyz=True,
             use_max_leverage=use_max_leverage,
             leverage_overrides=overrides,
             requested_leverage_for=requested_leverage_for,
             min_max_leverage=int(min_max_leverage or 0),
             max_max_leverage=int(max_max_leverage or 0),
-            min_day_notional=float(min_day_notional or 0.0),
+            min_day_notional=float(
+                majority_min_day_notional
+                if majority_min_day_notional is not None
+                else 0.0
+            ),
             min_hold_pct=float(
                 majority_min_hold_pct if majority_min_hold_pct is not None else 0.05
             ),
