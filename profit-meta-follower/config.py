@@ -41,8 +41,12 @@ MAJORITY_MIN_SIDE_AGREEMENT = 0.55
 MAJORITY_MIN_NOTIONAL_USD = 50.0
 MAJORITY_MAX_PAIR_SHARE = 0.70
 MAJORITY_MIN_COVERAGE = 0.70
-MAJORITY_STICKY = True
+MAJORITY_STICKY = False
 MAJORITY_SNAP_SLEEP_S = 0.12
+# Enter only when rank improves into the top MAJORITY_ENTER_TOP. Exit only on rank drop.
+MAJORITY_RANK_ENTRY = True
+MAJORITY_ENTER_TOP = 5
+MAJORITY_RANK_WATCH = 16
 # One name only: the most-held (pair, side). Off = top MAX_COINS_IN_BOOK split by votes.
 # Toggle live: PMF_MAJORITY_SINGLE_PAIR=0|1 (cloud default on).
 MAJORITY_SINGLE_PAIR = False
@@ -53,7 +57,7 @@ MAJORITY_SINGLE_GROSS_PCT = 90.0
 MAJORITY_RESIZE = False
 # Wallet mean leverage ÷ this, then clamp. 1 = same as wallets. HL leverage is an int (9/2 → 4).
 # Toggle: PMF_MAJORITY_LEVERAGE_DIV=2
-MAJORITY_LEVERAGE_DIV = 1.5
+MAJORITY_LEVERAGE_DIV = 1.0
 # One-shot add on the live keep (ignore 40% drift). Token in store so it runs once.
 MAJORITY_FORCE_RESIZE_ONCE = False
 MAJORITY_FORCE_RESIZE_ID = ""
@@ -210,7 +214,7 @@ MIN_SIDE_AGREEMENT = 0.10
 # Hold until the crowd falls to this fraction of the list (hysteresis vs enter).
 EXIT_SIDE_AGREEMENT = 0.05
 MIN_AVG_CONVICTION = 0.022  # applied to the SMOOTHED basket, not one noisy snapshot
-MAX_COINS_IN_BOOK = 4
+MAX_COINS_IN_BOOK = 5
 # If True, a held coin keeps its slot until a real exit; a 4th name cannot kick it.
 # Profiles turn this on for both local and cloud.
 STICKY_BOOK_SLOTS = False

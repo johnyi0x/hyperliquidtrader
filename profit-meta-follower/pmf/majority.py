@@ -217,23 +217,183 @@ def majority_gross_pct(cfg: Any) -> float:
     return float(getattr(cfg, "OUR_GROSS_MARGIN_PCT", 95.0) or 95.0)
 
 
+def hold_key(coin: str, side: str) -> str:
+    return f"{str(coin)}|{str(side or '').strip().lower()}"
+
+
+def board_ranks(rows: list[HoldRow]) -> dict[str, int]:
+    return {hold_key(r.coin, r.side): i for i, r in enumerate(rows, start=1)}
+
+
+def majority_enter_top(cfg: Any) -> int:
+    return max(1, int(getattr(cfg, "MAJORITY_ENTER_TOP", 5) or 5))
+
+
+def majority_rank_watch(cfg: Any) -> int:
+    top = majority_enter_top(cfg)
+    watch = int(getattr(cfg, "MAJORITY_RANK_WATCH", 0) or 0)
+    return max(top + 1, watch if watch > 0 else 16)
+
+
+def _targets_from_picked(picked: list[HoldRow], cfg: Any) -> list[TargetPos]:
+    gross = majority_gross_pct(cfg)
+    max_share = float(getattr(cfg, "MAJORITY_MAX_PAIR_SHARE", 0.70) or 0.70)
+    votes = [max(1, r.wallets) for r in picked]
+    total = float(sum(votes)) or 1.0
+    raw_w = [v / total for v in votes]
+    if max_share > 0 and raw_w:
+        capped = [min(w, max_share) for w in raw_w]
+        s = sum(capped) or 1.0
+        weights = [w / s for w in capped]
+    else:
+        weights = raw_w
+    targets: list[TargetPos] = []
+    for row, w in zip(picked, weights):
+        margin = gross * w
+        lev = majority_leverage(cfg, row.mean_leverage or float(row.median_leverage))
+        if margin * lev < 0.5:
+            continue
+        targets.append(
+            TargetPos(
+                coin=row.coin,
+                side=row.side,
+                leverage=lev,
+                margin_pct=margin,
+                conviction=row.avg_conviction if row.side == "long" else -row.avg_conviction,
+            )
+        )
+    return targets
+
+
+def plan_rank_targets(
+    annotated: list[HoldRow],
+    cfg: Any,
+    *,
+    prev_ranks: dict[str, int],
+    held: dict[str, str],
+) -> tuple[list[TargetPos], dict[str, Any]]:
+    """Enter only on rank-up into the top N; exit only on rank-down.
+
+    First snapshot with empty prev_ranks seeds ranks and opens nothing.
+    """
+    enter_top = majority_enter_top(cfg)
+    watch_n = majority_rank_watch(cfg)
+    current = board_ranks(annotated)
+    by_key = {hold_key(r.coin, r.side): r for r in annotated}
+    events: list[str] = []
+    if not prev_ranks:
+        persist = {k: v for k, v in current.items() if v <= watch_n}
+        return [], {
+            "seed": True,
+            "ranks": current,
+            "persist_ranks": persist,
+            "enter_top": enter_top,
+            "watch": watch_n,
+            "events": ["seed ranks — no entries until a name moves up"],
+            "picked": [],
+        }
+
+    keep_rows: list[HoldRow] = []
+    for coin, side in (held or {}).items():
+        k = hold_key(coin, side)
+        row = by_key.get(k)
+        cur = current.get(k)
+        prev = int(prev_ranks[k]) if k in prev_ranks else None
+        if row is None or cur is None:
+            events.append(f"rank-drop EXIT {coin} {side} #{prev or '?'}→off")
+            continue
+        if prev is not None and cur > prev:
+            events.append(f"rank-drop EXIT {coin} {side} #{prev}→#{cur}")
+            continue
+        keep_rows.append(row)
+        if prev is None:
+            events.append(f"hold {coin} {side} #{cur}")
+        elif cur < prev:
+            events.append(f"hold {coin} {side} #{prev}→#{cur} (up)")
+        else:
+            events.append(f"hold {coin} {side} #{cur}")
+
+    keep_keys = {hold_key(r.coin, r.side) for r in keep_rows}
+    enters: list[HoldRow] = []
+    for row in annotated:
+        if row.skip:
+            continue
+        k = hold_key(row.coin, row.side)
+        rank = current.get(k)
+        if rank is None or rank > enter_top:
+            continue
+        if k in keep_keys:
+            continue
+        old = int(prev_ranks[k]) if k in prev_ranks else watch_n + 1
+        if rank < old:
+            enters.append(row)
+            old_txt = f"#{old}" if k in prev_ranks else "unranked"
+            events.append(
+                f"rank-up ENTER {row.coin} {row.side} {old_txt}→#{rank}"
+            )
+
+    slots = max(0, enter_top - len(keep_rows))
+    enters.sort(key=lambda r: current.get(hold_key(r.coin, r.side), 10**9))
+    skipped_cap = enters[slots:]
+    enters = enters[:slots]
+    for row in skipped_cap:
+        events.append(
+            f"rank-up skip {row.coin} {row.side} — already {enter_top} names"
+        )
+
+    picked = keep_rows + enters
+    targets = _targets_from_picked(picked, cfg)
+    persist = {k: v for k, v in current.items() if v <= watch_n}
+    for row in keep_rows:
+        persist[hold_key(row.coin, row.side)] = current[hold_key(row.coin, row.side)]
+    return targets, {
+        "seed": False,
+        "ranks": current,
+        "persist_ranks": persist,
+        "enter_top": enter_top,
+        "watch": watch_n,
+        "events": events,
+        "picked": [
+            {
+                "coin": t.coin,
+                "side": t.side,
+                "wallets": next((r.wallets for r in picked if r.coin == t.coin), 0),
+                "hold_pct": round(
+                    next((r.hold_pct for r in picked if r.coin == t.coin), 0.0) * 100.0,
+                    2,
+                ),
+                "margin_pct": round(t.margin_pct, 3),
+                "lev": t.leverage,
+            }
+            for t in targets
+        ],
+        "gross": majority_gross_pct(cfg),
+        "max_pairs": enter_top,
+        "eligible": sum(1 for r in annotated if not r.skip),
+        "sticky": False,
+        "single": False,
+        "rank_entry": True,
+    }
+
+
 def pick_majority_targets(
     rows: list[HoldRow],
     cfg: Any,
     *,
     managed: set[str] | None = None,
     markets: dict[str, MarketCtx] | None = None,
+    prev_ranks: dict[str, int] | None = None,
+    held: dict[str, str] | None = None,
 ) -> tuple[list[TargetPos], list[HoldRow], dict[str, Any]]:
     """Top MAX_COINS_IN_BOOK coins, margin ∝ wallet-count, sum ≈ OUR_GROSS_MARGIN_PCT.
 
     MAJORITY_SINGLE_PAIR=True → only the #1 most-held eligible pair, full gross.
+    MAJORITY_RANK_ENTRY=True + prev_ranks dict → enter on rank-up, exit on rank-down.
     """
     markets = markets or {}
     managed = {str(c) for c in (managed or ())}
     single = bool(getattr(cfg, "MAJORITY_SINGLE_PAIR", False))
     max_n = majority_max_pairs(cfg)
-    gross = majority_gross_pct(cfg)
-    max_share = float(getattr(cfg, "MAJORITY_MAX_PAIR_SHARE", 0.70) or 0.70)
     sticky = bool(getattr(cfg, "MAJORITY_STICKY", True)) and not single
 
     annotated: list[HoldRow] = []
@@ -256,6 +416,14 @@ def pick_majority_targets(
             )
         )
 
+    rank_on = bool(getattr(cfg, "MAJORITY_RANK_ENTRY", False)) and not single
+    if rank_on and prev_ranks is not None:
+        targets, rank_meta = plan_rank_targets(
+            annotated, cfg, prev_ranks=prev_ranks, held=held or {}
+        )
+        rank_meta["ranks"] = board_ranks(annotated)
+        return targets, annotated, rank_meta
+
     fresh = [r for r in annotated if not r.skip]
     picked: list[HoldRow] = []
     if sticky and managed:
@@ -276,32 +444,7 @@ def pick_majority_targets(
             continue
         picked.append(row)
 
-    votes = [max(1, r.wallets) for r in picked]
-    total = float(sum(votes)) or 1.0
-    raw_w = [v / total for v in votes]
-    if max_share > 0 and raw_w:
-        capped = [min(w, max_share) for w in raw_w]
-        s = sum(capped) or 1.0
-        weights = [w / s for w in capped]
-    else:
-        weights = raw_w
-
-    targets: list[TargetPos] = []
-    for row, w in zip(picked, weights):
-        margin = gross * w
-        lev = majority_leverage(cfg, row.mean_leverage or float(row.median_leverage))
-        if margin * lev < 0.5:
-            continue
-        targets.append(
-            TargetPos(
-                coin=row.coin,
-                side=row.side,
-                leverage=lev,
-                margin_pct=margin,
-                conviction=row.avg_conviction if row.side == "long" else -row.avg_conviction,
-            )
-        )
-
+    targets = _targets_from_picked(picked, cfg)
     meta = {
         "picked": [
             {
@@ -317,22 +460,24 @@ def pick_majority_targets(
             }
             for t in targets
         ],
-        "gross": gross,
+        "gross": majority_gross_pct(cfg),
         "max_pairs": max_n,
         "eligible": len(fresh),
         "sticky": sticky,
         "single": single,
+        "ranks": board_ranks(annotated),
     }
     return targets, annotated, meta
 
 
-def compact_hold_board(rows: list[HoldRow], *, n: int = 12) -> str:
+def compact_hold_board(rows: list[HoldRow], *, n: int = 16) -> str:
     parts = []
-    for r in rows[: max(1, n)]:
+    for i, r in enumerate(rows[: max(1, n)], start=1):
         tag = r.skip or "ok"
         parts.append(
-            "%s %s %s/%s (%.1f%%) agr=%.0f%% lev=%s %s"
+            "#%s %s %s %s/%s (%.1f%%) agr=%.0f%% lev=%s %s"
             % (
+                i,
                 r.coin,
                 r.side,
                 r.wallets,

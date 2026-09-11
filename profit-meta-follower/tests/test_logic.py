@@ -2280,6 +2280,89 @@ class MajorityHoldTests(unittest.TestCase):
         self.assertFalse(any(a.kind == "resize" for a in acts))
         self.assertFalse(any(a.kind == "close" for a in acts))
 
+    def test_rank_up_enter_and_rank_drop_exit(self) -> None:
+        from pmf.majority import compact_hold_board, pick_majority_targets, tally_holds
+
+        cfg = self._cfg()
+        cfg.MAJORITY_RANK_ENTRY = True
+        cfg.MAJORITY_ENTER_TOP = 5
+        cfg.MAJORITY_RANK_WATCH = 16
+        cfg.MAJORITY_STICKY = False
+        snaps = []
+        n = 0
+        for coin, count in (
+            ("AAA", 50),
+            ("BBB", 40),
+            ("CCC", 30),
+            ("DDD", 20),
+            ("EEE", 10),
+            ("FFF", 8),
+        ):
+            for _ in range(count):
+                snaps.append(_snap(f"0x{n:040x}", 5_000, {coin: 0.2}))
+                n += 1
+        for _ in range(20):
+            snaps.append(_snap(f"0x{n:040x}", 5_000, {}))
+            n += 1
+        rows, _ = tally_holds(snaps, cfg, now=1_000.0)
+        t0, annotated, meta0 = pick_majority_targets(
+            rows, cfg, managed=set(), markets={}, prev_ranks={}, held={}
+        )
+        self.assertTrue(meta0.get("seed"))
+        self.assertEqual(t0, [])
+        self.assertIn("#1", compact_hold_board(annotated, n=8))
+        prev = dict(meta0["persist_ranks"])
+        # EEE was 5th; bump it ahead of DDD so it becomes 4th.
+        snaps2 = []
+        n = 0
+        for coin, count in (
+            ("AAA", 50),
+            ("BBB", 40),
+            ("CCC", 30),
+            ("EEE", 22),
+            ("DDD", 20),
+            ("FFF", 8),
+        ):
+            for _ in range(count):
+                snaps2.append(_snap(f"0x{n:040x}", 5_000, {coin: 0.2}))
+                n += 1
+        for _ in range(20):
+            snaps2.append(_snap(f"0x{n:040x}", 5_000, {}))
+            n += 1
+        rows2, _ = tally_holds(snaps2, cfg, now=2_000.0)
+        t1, _, meta1 = pick_majority_targets(
+            rows2, cfg, managed=set(), markets={}, prev_ranks=prev, held={}
+        )
+        self.assertFalse(meta1.get("seed"))
+        coins = [t.coin for t in t1]
+        self.assertIn("EEE", coins)
+        self.assertTrue(any("rank-up ENTER EEE" in e for e in meta1["events"]))
+        held = {t.coin: t.side for t in t1}
+        prev2 = dict(meta1["persist_ranks"])
+        # EEE drops 4th → 5th → exit even though still in top 5.
+        snaps3 = []
+        n = 0
+        for coin, count in (
+            ("AAA", 50),
+            ("BBB", 40),
+            ("CCC", 30),
+            ("DDD", 21),
+            ("EEE", 10),
+            ("FFF", 8),
+        ):
+            for _ in range(count):
+                snaps3.append(_snap(f"0x{n:040x}", 5_000, {coin: 0.2}))
+                n += 1
+        for _ in range(20):
+            snaps3.append(_snap(f"0x{n:040x}", 5_000, {}))
+            n += 1
+        rows3, _ = tally_holds(snaps3, cfg, now=3_000.0)
+        t2, _, meta2 = pick_majority_targets(
+            rows3, cfg, managed=set(held), markets={}, prev_ranks=prev2, held=held
+        )
+        self.assertNotIn("EEE", [t.coin for t in t2])
+        self.assertTrue(any("rank-drop EXIT EEE" in e for e in meta2["events"]))
+
     def test_next_open_uses_current_free_not_stale_equity(self) -> None:
         from pmf.majority import next_open_margin_usd
 

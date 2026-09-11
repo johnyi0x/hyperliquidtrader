@@ -1470,15 +1470,35 @@ class ProfitMetaRunner:
             self.log.warning("MAJORITY market cache: %s", exc)
 
         managed = set(str(x) for x in (self.store.data.get("managed_coins") or []))
+        prev_ranks_raw = self.store.data.get("majority_ranks") or {}
+        prev_ranks: dict[str, int] = {}
+        if isinstance(prev_ranks_raw, dict):
+            for k, v in prev_ranks_raw.items():
+                try:
+                    prev_ranks[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    continue
+        held: dict[str, str] = {}
+        for row in self.store.data.get("last_targets") or []:
+            if not isinstance(row, dict):
+                continue
+            coin = str(row.get("coin") or "")
+            if coin:
+                held[coin] = str(row.get("side") or "long")
         targets, annotated, meta = pick_majority_targets(
             rows,
             self.cfg,
             managed=managed,
             markets=self.markets.ctxs,
+            prev_ranks=prev_ranks,
+            held=held,
         )
-        board_txt = compact_hold_board(annotated, n=12)
+        watch_n = int(meta.get("watch") or meta.get("enter_top") or 16)
+        board_txt = compact_hold_board(annotated, n=max(16, watch_n))
         skip_n = sum(1 for r in annotated if r.skip)
         self.log.info("MAJORITY board | %s", board_txt)
+        for ev in meta.get("events") or []:
+            self.log.info("MAJORITY %s", ev)
         self.log.info(
             "MAJORITY pick %s/%s eligible=%s skipped=%s gross=%.0f%% | %s",
             len(targets),
@@ -1507,7 +1527,7 @@ class ProfitMetaRunner:
                 ",".join(keep) or "-",
                 ",".join(extra) or "-",
             )
-        for r in annotated[:16]:
+        for r in annotated[: max(16, watch_n)]:
             if r.skip:
                 self.log.info(
                     "MAJORITY skip %s %s — %s hold=%.1f%% agr=%.0f%% L=%s S=%s",
@@ -1526,6 +1546,8 @@ class ProfitMetaRunner:
             pass
 
         trade_keys = [f"{t.side}:{t.coin}" for t in targets]
+        persist_ranks = meta.get("persist_ranks") or meta.get("ranks") or {}
+        self.store.data["majority_ranks"] = persist_ranks
         self.telemetry.record_tick(
             ts=now,
             voters=n_ok,
@@ -1543,9 +1565,27 @@ class ProfitMetaRunner:
                 "coverage": round(cov, 4),
                 "board": [r.as_dict() for r in annotated[:20]],
                 "picked": meta.get("picked"),
+                "events": meta.get("events"),
                 "equity": self._last_equity,
             },
         )
+
+        if meta.get("seed"):
+            self.store.data["majority_meta_at"] = now
+            self.store.data["majority_board_txt"] = board_txt
+            self.store.data["majority_stats"] = stats
+            self.store.save()
+            self.store.heartbeat(
+                {
+                    "mode": "majority",
+                    "seed": True,
+                    "ok": n_ok,
+                    "listed": listed,
+                    "ranks": len(persist_ranks),
+                    "equity": self._last_equity,
+                }
+            )
+            return
 
         last_reb = float(self.store.data.get("last_rebalance_at") or 0)
         result = self.rebalancer.run(
@@ -1560,8 +1600,8 @@ class ProfitMetaRunner:
             new_managed, attempted = managed, False
         else:
             new_managed, attempted = result
-        held = [t for t in targets if t.coin in new_managed]
-        held_keys = [f"{t.side}:{t.coin}" for t in held]
+        held_tgts = [t for t in targets if t.coin in new_managed]
+        held_keys = [f"{t.side}:{t.coin}" for t in held_tgts]
         self.store.data["majority_meta_at"] = now
         self.store.data["majority_single_pair"] = bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False))
         if self._force_resize_pending() and any(t.coin in new_managed for t in targets):
@@ -1576,7 +1616,7 @@ class ProfitMetaRunner:
                 "margin_pct": t.margin_pct,
                 "conviction": t.conviction,
             }
-            for t in held
+            for t in held_tgts
         ]
         if attempted or new_managed != managed:
             self.store.data["managed_coins"] = sorted(new_managed)
@@ -1593,11 +1633,11 @@ class ProfitMetaRunner:
                         "mode": "majority",
                     },
                 )
-        if len(held) < len(targets):
+        if len(held_tgts) < len(targets):
             missed = [t.coin for t in targets if t.coin not in new_managed]
             self.log.info(
                 "MAJORITY held %s/%s — not in book this cycle: %s",
-                len(held),
+                len(held_tgts),
                 len(targets),
                 ", ".join(missed) or "-",
             )

@@ -186,36 +186,6 @@ def ema_dev_strategy_enabled() -> bool:
 
 
 # =============================================================================
-# TREND FOLLOW  (list side + ride pumps / cut dumps)
-# =============================================================================
-# True = live/paper uses this instead of MTF. Pair list still majority / movers.
-# 15m EMA is the trend line. No 1% TP. Exit = tighter of EMA break and ATR trail
-# from the high (long) / low (short) since entry. 1h EMA blocks entries against
-# the higher-timeframe. Tuner picks ema period / trail / chase cap per coin.
-USE_TREND_FOLLOW = True
-TREND_INTERVAL = "15m"
-TREND_HTF_INTERVAL = "1h"
-TREND_EMA_PERIOD = 50
-TREND_ATR_PERIOD = 14
-TREND_ATR_K = 3.0
-# Skip a NEW entry if price is already this far past the EMA (wait for pullback).
-TREND_CHASE_PCT = 8.0
-TREND_ENTRY_BUF_ATR = 0.35
-TREND_COOLDOWN_BARS = 3
-TREND_MIN_ATR_PCT = 0.20
-TREND_SL_RATCHET_PCT = 0.15  # only re-place exchange SL if trail moved this %
-
-
-def trend_follow_enabled() -> bool:
-    """True when live/paper should ride list-side trends instead of MTF."""
-    if hft_pingpong_enabled() or ema_race_strategy_enabled() or ema_dev_strategy_enabled():
-        return False
-    try:
-        return bool(USE_TREND_FOLLOW)
-    except NameError:
-        return False
-
-# =============================================================================
 # PAIR SELECTION
 # =============================================================================
 # "manual"      = use PAIRS (+ PAIR_LEVERAGE) exactly as listed.

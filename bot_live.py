@@ -113,17 +113,6 @@ from src.pair_universe import (
     resolve_pair_universe,
 )
 from src.majority_universe import majority_resolve_kwargs
-from src.trend_follow import (
-    TrendStore,
-    TrendTrade,
-    bars_need as trend_bars_need,
-    entry_reason as trend_entry_reason,
-    exit_reason as trend_exit_reason,
-    last_state as trend_last_state,
-    live_stop_px,
-    params_from_dict as trend_params_from_dict,
-    tune_coin as trend_tune_coin,
-)
 from src.paper_broker import PaperHyperliquidClient
 from src.position_guard import (
     cleanup_closed_coin,
@@ -345,17 +334,12 @@ def main() -> None:
     hft_on = bool(getattr(cfg, "hft_pingpong_enabled", lambda: False)())
     race_on = bool(getattr(cfg, "ema_race_strategy_enabled", lambda: False)())
     ema_dev_on = bool(cfg.ema_dev_strategy_enabled())
-    trend_on = bool(getattr(cfg, "trend_follow_enabled", lambda: False)())
     if hft_on:
         race_on = False
         ema_dev_on = False
-        trend_on = False
     if race_on:
         ema_dev_on = False
-        trend_on = False
-    if ema_dev_on:
-        trend_on = False
-    if not ema_dev_on and not hft_on and not race_on and not trend_on:
+    if not ema_dev_on and not hft_on and not race_on:
         if not cfg.USE_TP_SL and not cfg.USE_EXIT_SIGNAL and not cfg.USE_MAX_HOLD:
             raise ValueError("Enable at least one of USE_TP_SL, USE_EXIT_SIGNAL, USE_MAX_HOLD")
     elif ema_dev_on:
@@ -383,19 +367,6 @@ def main() -> None:
         risk = float(getattr(cfg, "EMA_RACE_EQUITY_RISK_PCT", 0) or 0)
         if risk <= 0 or risk > 40:
             raise ValueError("EMA_RACE_EQUITY_RISK_PCT must be in (0, 40]")
-    if trend_on:
-        tr_iv = str(getattr(cfg, "TREND_INTERVAL", "15m") or "15m")
-        if tr_iv not in INTERVAL_MS:
-            raise ValueError(
-                f"Unknown TREND_INTERVAL {tr_iv!r}; known={list(INTERVAL_MS)}"
-            )
-        htf_iv = str(getattr(cfg, "TREND_HTF_INTERVAL", "1h") or "1h")
-        if htf_iv not in INTERVAL_MS:
-            raise ValueError(
-                f"Unknown TREND_HTF_INTERVAL {htf_iv!r}; known={list(INTERVAL_MS)}"
-            )
-        if int(getattr(cfg, "TREND_EMA_PERIOD", 0) or 0) < 5:
-            raise ValueError("TREND_EMA_PERIOD must be >= 5")
     pair_mode = str(getattr(cfg, "PAIR_SELECTION_MODE", "manual") or "manual").strip().lower()
     if pair_mode != "manual" and not is_auto_pair_mode(pair_mode):
         raise ValueError(
@@ -502,7 +473,6 @@ def main() -> None:
     race_store = RaceStore(DATA_DIR / "ema_race_state.json")
     race_learn = RaceLearner(DATA_DIR / "ema_race_learn.json")
     race_journal = RaceJournal(DATA_DIR / "ema_race_trades.jsonl", logger)
-    trend_store = TrendStore(DATA_DIR / "trend_follow.json")
     hft_store = HftStore(DATA_DIR / "hft_pingpong_state.json")
     store = SetupStore(DATA_DIR, logger, refresh_hours=cfg.BACKTEST_REFRESH_HOURS)
 
@@ -592,7 +562,7 @@ def main() -> None:
         wait_seconds=30,
         max_attempts=5,
         logger=logger,
-        use_market_orders=True if (paper_on or race_on or trend_on) else cfg.USE_MARKET_ORDERS,
+        use_market_orders=True if (paper_on or race_on) else cfg.USE_MARKET_ORDERS,
         market_slippage=cfg.MARKET_ORDER_SLIPPAGE,
         mid_limit_then_market=ema_dev_on
         and (not paper_on)
@@ -846,81 +816,6 @@ def main() -> None:
         if force or store.refresh_due():
             run_tune()
 
-    def trend_refresh_due() -> bool:
-        hours = float(getattr(cfg, "BACKTEST_REFRESH_HOURS", 0) or 0)
-        if hours <= 0:
-            return False
-        return time.time() - float(trend_store.updated_at or 0) >= hours * 3600.0
-
-    def list_side_sig(entry) -> int | None:
-        """List-locked side: majority/movers bucket, else tuned/manual long."""
-        if entry is None:
-            return None
-        names = [entry.api_coin]
-        names.extend(entry.position_coin_names())
-        raw = None
-        for name in names:
-            b = str(mover_buckets.get(name) or "").strip().lower()
-            if b == "gainer":
-                raw = 1
-                break
-            if b == "loser":
-                raw = -1
-                break
-        if raw is None:
-            if is_side_locked_mode(pair_mode):
-                stored = trend_store.side_for(entry.api_coin)
-                if stored is None:
-                    return None
-                raw = 1 if int(stored) > 0 else -1
-            else:
-                stored = trend_store.side_for(entry.api_coin)
-                raw = 1 if stored is None or int(stored) > 0 else -1
-        return -raw if flip_live else raw
-
-    def run_trend_tune(
-        *,
-        coins: list[str] | None = None,
-        merge: bool = True,
-    ) -> None:
-        targets = list(coins) if coins else [e.api_coin for e in watch]
-        if not targets:
-            return
-        logger.info("TREND tune %s", ",".join(targets))
-        results: dict = {}
-        for coin in targets:
-            entry = find_watch_entry(watch, coin)
-            side = list_side_sig(entry) if entry is not None else 1
-            if side is None:
-                logger.info("TREND skip tune %s — no list side", coin)
-                continue
-            row = trend_tune_coin(
-                client.info,
-                coin,
-                side=int(side),
-                data_dir=DATA_DIR,
-                requested_candles=int(getattr(cfg, "REQUESTED_CANDLES", 3000) or 3000),
-                logger=logger,
-                cfg=cfg,
-            )
-            if row:
-                results[coin] = row
-        if results:
-            trend_store.save_tune(results, merge=merge)
-            logger.info("TREND params saved for %s", ",".join(results))
-        else:
-            logger.warning("TREND tune produced nothing")
-
-    def maybe_trend_tune(*, force: bool = False) -> None:
-        missing = [
-            e.api_coin for e in watch if e.api_coin not in trend_store.params_by_coin
-        ]
-        if force or trend_refresh_due() or not trend_store.params_by_coin:
-            run_trend_tune(merge=True)
-            return
-        if missing:
-            run_trend_tune(coins=missing, merge=True)
-
     mode = "PAPER" if cfg.PAPER_TRADING else "LIVE"
     strat_mode = getattr(cfg, "STRATEGY_MODE", "mtf")
     logger.info(
@@ -944,18 +839,6 @@ def main() -> None:
         int(getattr(cfg, "DCA_MAX_ADDS", 1) or 0),
         flip_live,
     )
-    if trend_on:
-        logger.info(
-            "TREND follow ON — list side only, no TP, no 2h max-hold | "
-            "exec=%s filter=%s ema=%s atr_k=%s chase=%.0f%% cooldown=%sb | "
-            "exit=tighter of EMA-break and ATR trail from extreme since entry",
-            getattr(cfg, "TREND_INTERVAL", "15m"),
-            getattr(cfg, "TREND_HTF_INTERVAL", "1h"),
-            getattr(cfg, "TREND_EMA_PERIOD", 50),
-            getattr(cfg, "TREND_ATR_K", 3.0),
-            getattr(cfg, "TREND_CHASE_PCT", 8.0),
-            getattr(cfg, "TREND_COOLDOWN_BARS", 3),
-        )
     concurrent = bool(getattr(cfg, "ALLOW_CONCURRENT_POSITIONS", True))
     max_concurrent = int(getattr(cfg, "MAX_CONCURRENT_POSITIONS", 0) or 0)
     if ema_dev_on or hft_on or race_on:
@@ -1205,7 +1088,6 @@ def main() -> None:
         not ema_dev_on
         and not hft_on
         and not race_on
-        and not trend_on
         and mismatch0
         and pos_ok
         and open_positions
@@ -1221,11 +1103,6 @@ def main() -> None:
             logger.info("Flat — EMA-race will scan 24h movers vs EMA (no tune)")
         elif ema_dev_on:
             logger.info("Flat — EMA-dev will scan the pair list (no tune)")
-        elif trend_on:
-            logger.info(
-                "Flat — TREND will tune list-side params then enter on pullbacks"
-            )
-            maybe_trend_tune(force=not trend_store.params_by_coin)
         else:
             logger.info("Flat — auto-tune if no params or refresh due")
             maybe_tune(force=not store.setups())
@@ -1252,12 +1129,6 @@ def main() -> None:
     def wake_seconds() -> float:
         if hft_on:
             return max(2.0, float(getattr(cfg, "HFT_POLL_SECONDS", 3.0) or 3.0))
-        if trend_on:
-            iv = str(getattr(cfg, "TREND_INTERVAL", "15m") or "15m")
-            wait = seconds_until_next_candle(iv)
-            if trade_store.trades or trend_store.trades:
-                wait = min(wait, max(1.0, float(cfg.POSITION_POLL_SECONDS)))
-            return wait
         if ema_dev_on or race_on:
             iv = (
                 str(getattr(cfg, "EMA_RACE_INTERVAL", "1m") or "1m")
@@ -1358,10 +1229,6 @@ def main() -> None:
             else:
                 continue
             logger.info("MAJORITY close %s %s — %s", coin, pos_side or "?", why)
-            if trend_on:
-                trend_store.close_trade(
-                    entry.api_coin if entry is not None else str(coin), 0
-                )
             if entry is not None:
                 activate_pair(client, entry)
             else:
@@ -1381,396 +1248,6 @@ def main() -> None:
                 drop_local(str(coin))
             closed += 1
         return closed
-
-    last_trend_scan_log = 0.0
-
-    def _trend_params_for(entry: PairSetup, trade: TrendTrade | None = None):
-        base = trend_store.params_for(entry.api_coin, cfg)
-        if trade is not None and trade.params:
-            return trend_params_from_dict(trade.params, base)
-        return base
-
-    def _trend_candles(entry: PairSetup, params):
-        need = trend_bars_need(params)
-        exec_c = client.get_closed_candles_for(
-            entry.api_coin, params.interval, min_bars=need
-        )
-        htf_need = max(80, int(params.ema_period) + 10)
-        htf_c = client.get_closed_candles_for(
-            entry.api_coin, params.htf_interval, min_bars=htf_need
-        )
-        return exec_c, htf_c
-
-    def flatten_trend(entry: PairSetup, reason: str, bar_t: int = 0) -> bool:
-        logger.info("TREND close %s — %s", entry.api_coin, reason)
-        activate_pair_for_trade(client, entry)
-        executor.emergency_flatten(reason)
-        finish_close(entry)
-        trend_store.close_trade(entry.api_coin, int(bar_t or 0))
-        return True
-
-    def hydrate_trend(entry: PairSetup, position) -> TrendTrade:
-        existing = trend_store.trades.get(entry.api_coin)
-        if existing is not None:
-            return existing
-        params = trend_store.params_for(entry.api_coin, cfg)
-        fill = float(getattr(position, "entry_price", 0) or 0) or client.get_mark_price()
-        mark = client.get_mark_price()
-        side_s = str(getattr(position, "side", "") or "long")
-        extreme = fill
-        sl_px = 0.0
-        bar_t = 0
-        try:
-            exec_c, htf_c = _trend_candles(entry, params)
-            st = trend_last_state(exec_c, htf_c, params)
-        except Exception:
-            st = None
-        if st:
-            bar_t = int(st["bar_t"])
-            if side_s == "long":
-                extreme = max(fill, float(st["high"]), mark if mark > 0 else fill)
-            else:
-                lows = [x for x in (fill, float(st["low"]), mark) if x > 0]
-                extreme = min(lows) if lows else fill
-            sl_px = live_stop_px(
-                1 if side_s == "long" else -1,
-                float(st["ema"]),
-                float(st["atr"]),
-                extreme,
-                params.atr_k,
-            )
-        trade = TrendTrade(
-            coin=entry.api_coin,
-            side=side_s,
-            entry_px=fill,
-            extreme=extreme,
-            sl_px=sl_px,
-            opened_bar_t=bar_t,
-            opened_at=time.time(),
-            params=params.as_dict(),
-        )
-        trend_store.open_trade(trade)
-        logger.info(
-            "TREND adopt %s %s entry=%.6g extreme=%.6g sl=%.6g",
-            entry.api_coin,
-            side_s,
-            fill,
-            extreme,
-            sl_px,
-        )
-        return trade
-
-    def _trend_sl_improved(side: int, old_sl: float, new_sl: float) -> bool:
-        if new_sl <= 0:
-            return False
-        if old_sl <= 0:
-            return True
-        ratchet = float(getattr(cfg, "TREND_SL_RATCHET_PCT", 0.15) or 0.15)
-        if side > 0:
-            return new_sl > old_sl and (new_sl - old_sl) / old_sl * 100.0 >= ratchet
-        return new_sl < old_sl and (old_sl - new_sl) / old_sl * 100.0 >= ratchet
-
-    def _trend_place_sl(entry: PairSetup, sl_px: float) -> bool:
-        if sl_px <= 0:
-            return False
-        pos = client.get_position(force=True)
-        if pos is None:
-            return False
-        rounded = round_price(sl_px, entry.market.sz_decimals)
-        if rounded <= 0:
-            return False
-        return bool(client.attach_stop_at_price(pos, rounded))
-
-    def manage_trend_one(entry: PairSetup, position) -> bool:
-        activate_pair(client, entry)
-        trade = hydrate_trend(entry, position)
-        params = _trend_params_for(entry, trade)
-        side = 1 if str(trade.side).lower() == "long" else -1
-        mark = client.get_mark_price()
-        bar_t = int(trade.opened_bar_t or 0)
-        st = None
-        try:
-            exec_c, htf_c = _trend_candles(entry, params)
-            st = trend_last_state(exec_c, htf_c, params)
-        except Exception as exc:
-            logger.warning("TREND candles %s: %s", entry.api_coin, exc)
-        if st:
-            bar_t = int(st["bar_t"])
-            if side > 0:
-                extreme = max(
-                    float(trade.extreme or 0),
-                    float(st["high"]),
-                    mark if mark > 0 else 0.0,
-                )
-            else:
-                cands = [
-                    x
-                    for x in (
-                        float(trade.extreme or 0),
-                        float(st["low"]),
-                        mark,
-                    )
-                    if x > 0
-                ]
-                extreme = min(cands) if cands else float(st["low"])
-            sl_now = live_stop_px(
-                side, float(st["ema"]), float(st["atr"]), extreme, params.atr_k
-            )
-            if (
-                (side > 0 and extreme > float(trade.extreme or 0) + 1e-12)
-                or (
-                    side < 0
-                    and (
-                        float(trade.extreme or 0) <= 0
-                        or extreme < float(trade.extreme) - 1e-12
-                    )
-                )
-            ):
-                trend_store.mark_extreme(entry.api_coin, extreme, sl_now)
-                trade = trend_store.trades.get(entry.api_coin) or trade
-            why = trend_exit_reason(
-                side=side,
-                close=float(st["close"]),
-                ema_v=float(st["ema"]),
-                atr_v=float(st["atr"]),
-                extreme=extreme,
-                k=params.atr_k,
-            )
-            if why:
-                return flatten_trend(
-                    entry,
-                    f"{why} close={st['close']:.6g} ema={st['ema']:.6g} sl={sl_now:.6g}",
-                    bar_t,
-                )
-        else:
-            extreme = float(trade.extreme or 0)
-            sl_now = float(trade.sl_px or 0)
-        if mark > 0 and sl_now > 0:
-            through = (side > 0 and mark <= sl_now) or (side < 0 and mark >= sl_now)
-            if through:
-                return flatten_trend(
-                    entry,
-                    f"intra_bar_stop mark={mark:.6g} sl={sl_now:.6g}",
-                    bar_t,
-                )
-        if sl_now > 0:
-            have_sl = False
-            try:
-                have_sl = bool(client.has_exchange_sl())
-            except Exception:
-                have_sl = False
-            if (not have_sl) or _trend_sl_improved(side, float(trade.sl_px or 0), sl_now):
-                if _trend_place_sl(entry, sl_now):
-                    trend_store.mark_extreme(entry.api_coin, extreme, sl_now)
-                elif not have_sl:
-                    return flatten_trend(entry, "unprotected_sl", bar_t)
-        elif not st:
-            logger.warning("TREND %s no stop this pass — waiting on candles", entry.api_coin)
-        if bar_t > 0:
-            last_manage_bar[entry.api_coin] = bar_t
-        return False
-
-    def manage_trend_positions(open_positions: list) -> bool:
-        closed = False
-        seen: set[str] = set()
-        for coin, position in list(open_positions):
-            entry = find_watch_entry(watch, coin)
-            key = entry.api_coin if entry else str(coin)
-            if key in seen:
-                continue
-            seen.add(key)
-            if entry is None:
-                logger.info("TREND close %s — off list", coin)
-                client.configure_coin(str(coin))
-                executor.emergency_flatten("trend_off_list")
-                wait_until_flat(
-                    client,
-                    trade_store,
-                    logger,
-                    coin=client.coin,
-                    coin_names=frozenset({client.coin, str(coin)}),
-                )
-                drop_local(client.coin)
-                drop_local(str(coin))
-                trend_store.close_trade(str(coin), 0)
-                closed = True
-                continue
-            if manage_trend_one(entry, position):
-                closed = True
-        return closed
-
-    def try_open_trend() -> bool:
-        nonlocal last_trend_scan_log
-        pos_ok, live_pos = client.fetch_open_positions(force=True)
-        if not pos_ok:
-            return False
-        occupied = occupied_api(live_pos)
-        if max_concurrent > 0 and len(occupied) >= max_concurrent:
-            return False
-        opened = False
-        parts: list[str] = []
-        now_s = time.time()
-        for entry in watch:
-            if entry.api_coin in occupied or occupied.intersection(
-                entry.position_coin_names()
-            ):
-                parts.append(f"{entry.api_coin} in-pos")
-                continue
-            if max_concurrent > 0 and len(occupied) >= max_concurrent:
-                break
-            side = list_side_sig(entry)
-            if side is None:
-                parts.append(f"{entry.api_coin} no-side")
-                continue
-            params = trend_store.params_for(entry.api_coin, cfg)
-            try:
-                exec_c, htf_c = _trend_candles(entry, params)
-            except Exception as exc:
-                parts.append(f"{entry.api_coin} candles:{exc}")
-                continue
-            st = trend_last_state(exec_c, htf_c, params)
-            if st is None:
-                parts.append(f"{entry.api_coin} warming")
-                continue
-            bar_t = int(st["bar_t"])
-            last_x = int(trend_store.last_exit_bar.get(entry.api_coin) or 0)
-            step = INTERVAL_MS.get(params.interval, 900_000)
-            if (
-                last_x > 0
-                and int(params.cooldown_bars) > 0
-                and bar_t <= last_x + int(params.cooldown_bars) * int(step)
-            ):
-                parts.append(f"{entry.api_coin} cooldown")
-                continue
-            key = (entry.api_coin, bar_t, int(side))
-            if last_entry_key.get(entry.api_coin) == key:
-                parts.append(f"{entry.api_coin} same-bar")
-                continue
-            why = trend_entry_reason(
-                side=int(side),
-                close=float(st["close"]),
-                ema_v=float(st["ema"]),
-                atr_v=float(st["atr"]),
-                htf_ema=float(st["htf_ema"]),
-                chase_pct=params.chase_pct,
-                entry_buf_atr=params.entry_buf_atr,
-                min_atr_pct=params.min_atr_pct,
-            )
-            if why:
-                parts.append(
-                    f"{entry.api_coin} skip {why} "
-                    f"{'LONG' if side > 0 else 'SHORT'} "
-                    f"ext={st['ext_pct']:.1f}%"
-                )
-                continue
-            last_entry_key[entry.api_coin] = key
-            total_bal, bal, slices, legs = live_margin_pcts()
-            activate_pair_for_trade(client, entry)
-            try:
-                client.set_leverage(entry.leverage, is_cross=entry.use_cross_margin)
-            except Exception as exc:
-                logger.warning("TREND leverage %s: %s", entry.api_coin, exc)
-            est = client.estimate_order_size(
-                bal,
-                entry.leverage,
-                sz_decimals=entry.market.sz_decimals,
-                min_notional_usd=cfg.MIN_ORDER_NOTIONAL_USD,
-                margin_from="equity",
-            )
-            if not est.ok:
-                parts.append(f"{entry.api_coin} size:{est.reason}")
-                continue
-            try:
-                equity = client.get_account_value(force=True)
-            except Exception:
-                equity = 0.0
-            if equity > 0 and est.available_margin < equity * cfg.MIN_FREE_MARGIN_FRAC:
-                parts.append(f"{entry.api_coin} low-margin")
-                continue
-            sl_px = live_stop_px(
-                int(side),
-                float(st["ema"]),
-                float(st["atr"]),
-                float(st["high"]) if side > 0 else float(st["low"]),
-                params.atr_k,
-            )
-            logger.info(
-                "TREND entry %s %s size=%s notional=$%.2f margin=%.2f%% of equity "
-                "(1/%s of %.0f%%) ema=%.6g atr=%.6g sl=%.6g ext=%.1f%% [%s]",
-                entry.api_coin,
-                "LONG" if side > 0 else "SHORT",
-                est.size,
-                est.notional_usd,
-                bal,
-                slices,
-                total_bal,
-                st["ema"],
-                st["atr"],
-                sl_px,
-                st["ext_pct"],
-                mode,
-            )
-            try:
-                client.cancel_all_orders_for_coin()
-                ok = executor.execute_open(is_buy=side > 0, target_sz=est.size)
-            except RuntimeError as exc:
-                if "insufficient margin" in str(exc).lower():
-                    logger.warning("TREND insufficient margin %s", entry.api_coin)
-                    continue
-                raise
-            if not ok:
-                cleanup_closed_coin(client, trade_store, entry.api_coin)
-                continue
-            pos = client.get_position(force=True)
-            if pos is None:
-                cleanup_closed_coin(client, trade_store, entry.api_coin)
-                continue
-            fill = pos.entry_price or client.get_mark_price()
-            extreme = float(st["high"]) if side > 0 else float(st["low"])
-            if side > 0:
-                extreme = max(extreme, fill)
-            else:
-                extreme = min(extreme, fill) if extreme > 0 else fill
-            sl_px = live_stop_px(
-                int(side), float(st["ema"]), float(st["atr"]), extreme, params.atr_k
-            )
-            if not _trend_place_sl(entry, sl_px):
-                executor.emergency_flatten("unprotected")
-                cleanup_closed_coin(client, trade_store, entry.api_coin)
-                trend_store.close_trade(entry.api_coin, bar_t)
-                logger.warning("TREND %s flattened — could not attach SL", entry.api_coin)
-                continue
-            trade_store.open_trade(
-                client.coin,
-                pos.side,
-                fill,
-                pos.size,
-                0.01,
-                0.01,
-                equity_at_entry=client.get_account_value(force=True),
-            )
-            trend_store.open_trade(
-                TrendTrade(
-                    coin=entry.api_coin,
-                    side=pos.side,
-                    entry_px=fill,
-                    extreme=extreme,
-                    sl_px=sl_px,
-                    opened_bar_t=bar_t,
-                    opened_at=time.time(),
-                    params=params.as_dict(),
-                )
-            )
-            last_manage_bar[entry.api_coin] = bar_t
-            occupied.add(entry.api_coin)
-            opened = True
-            parts.append(
-                f"{entry.api_coin} YES {'LONG' if side > 0 else 'SHORT'} ext={st['ext_pct']:.1f}%"
-            )
-        if now_s - last_trend_scan_log >= 60.0 or opened:
-            last_trend_scan_log = now_s
-            logger.info("TREND scan | %s", " || ".join(parts) if parts else "idle")
-        return opened
 
     def manage_one(coin: str, position) -> bool:
         """Manage one open coin. Return True if it was closed this pass."""
@@ -4243,43 +3720,30 @@ def main() -> None:
                     pos_ok, open_positions = client.fetch_open_positions(force=True)
                     if not pos_ok:
                         continue
-                if trend_on:
-                    missing_t = [
-                        e.api_coin
-                        for e in watch
-                        if e.api_coin not in trend_store.params_by_coin
-                    ]
-                    if missing_t:
+                missing = []
+                for e in watch:
+                    setups = store.setups_for(e.api_coin)
+                    if not setups:
+                        missing.append(e.api_coin)
+                        continue
+                    want = majority_wanted_side(e.api_coin, e)
+                    if not want:
+                        continue
+                    want_sig = 1 if want == "long" else -1
+                    if all(int(s.side) != want_sig for s in setups):
+                        missing.append(e.api_coin)
+                if missing:
+                    cooled = (
+                        store._last_attempt_ts <= 0
+                        or time.time() - store._last_attempt_ts
+                        >= store._retry_cooldown_s
+                    )
+                    if cooled:
                         logger.info(
-                            "MAJORITY TREND params missing vs list %s — tuning",
-                            ",".join(missing_t),
+                            "MAJORITY setups stale vs list %s — tuning (merge)",
+                            ",".join(missing),
                         )
-                        run_trend_tune(coins=missing_t, merge=True)
-                else:
-                    missing = []
-                    for e in watch:
-                        setups = store.setups_for(e.api_coin)
-                        if not setups:
-                            missing.append(e.api_coin)
-                            continue
-                        want = majority_wanted_side(e.api_coin, e)
-                        if not want:
-                            continue
-                        want_sig = 1 if want == "long" else -1
-                        if all(int(s.side) != want_sig for s in setups):
-                            missing.append(e.api_coin)
-                    if missing:
-                        cooled = (
-                            store._last_attempt_ts <= 0
-                            or time.time() - store._last_attempt_ts
-                            >= store._retry_cooldown_s
-                        )
-                        if cooled:
-                            logger.info(
-                                "MAJORITY setups stale vs list %s — tuning (merge)",
-                                ",".join(missing),
-                            )
-                            run_tune(coins=missing, merge=True, skip_refresh=True)
+                        run_tune(coins=missing, merge=True, skip_refresh=True)
 
             closed_any = False
             if hft_on:
@@ -4288,8 +3752,6 @@ def main() -> None:
                 closed_any = manage_race_positions(open_positions)
             elif ema_dev_on:
                 closed_any = manage_ema_positions(open_positions)
-            elif trend_on:
-                closed_any = manage_trend_positions(open_positions)
             else:
                 seen_manage: set[str] = set()
                 for coin, position in list(open_positions):
@@ -4361,18 +3823,6 @@ def main() -> None:
                         coin=tracked_r.coin, bar_t=int(tracked_r.opened_bar_t or 0)
                     )
                     drop_local(tracked_r.coin)
-            if trend_on:
-                for coin in list(trend_store.trades):
-                    if coin not in occupied:
-                        logger.info(
-                            "TREND %s closed on exchange — clearing local state",
-                            coin,
-                        )
-                        t = trend_store.trades.get(coin)
-                        bar_t = int(t.opened_bar_t or 0) if t is not None else 0
-                        trend_store.close_trade(coin, bar_t)
-                        drop_local(coin)
-
             if not occupied:
                 just_closed = bool(was_in_position)
                 if was_in_position or trade_store.trades:
@@ -4387,7 +3837,7 @@ def main() -> None:
                     maybe_refresh_ema_universe(after_close=just_closed)
                 elif race_on:
                     maybe_refresh_race_universe(after_close=just_closed)
-                elif not trend_on:
+                else:
                     maybe_tune(force=not store.setups())
             else:
                 was_in_position = True
@@ -4400,11 +3850,6 @@ def main() -> None:
                 if not occupied:
                     try_open_race()
                 continue
-            if trend_on:
-                maybe_trend_tune()
-                try_open_trend()
-                continue
-
             can_scan = concurrent or not occupied
             if can_scan and max_concurrent > 0 and len(occupied) >= max_concurrent:
                 logger.info(
