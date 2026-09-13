@@ -9,13 +9,13 @@ import logging
 import statistics
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 
-from .store import connect, upsert_rows
+from .store import connect, local_max_cycle, upsert_rows
 from .timeutil import floor_hour, to_iso
 
 log = logging.getLogger("bagrank.hlcycle")
@@ -415,9 +415,23 @@ def fetch_ctx_map(info: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
-def gather_cycle(info: Any, *, basket: int = BASKET_SIZE) -> dict[str, Any]:
+def closed_cycle_ts(now: datetime | None = None) -> str:
+    """UTC hour that just ended. Matches collector hours already in Neon."""
+    cur = floor_hour(now or datetime.now(timezone.utc))
+    return to_iso(cur - timedelta(hours=1))
+
+
+def should_append_hour(last_cycle: str, closed: str) -> bool:
+    if not closed:
+        return False
+    if not last_cycle:
+        return True
+    return closed > last_cycle
+
+
+def gather_cycle(info: Any, *, basket: int = BASKET_SIZE, cycle_ts: str | None = None) -> dict[str, Any]:
     started = time.time()
-    cycle_ts = to_iso(floor_hour(datetime.now(timezone.utc)))
+    cycle_ts = cycle_ts or closed_cycle_ts()
     rows = fetch_leaderboard()
     addrs = shortlist_top_roi(rows, limit=basket)
     if not addrs:
@@ -563,16 +577,24 @@ class LiveBoard:
         self.refresh_s = float(refresh_s)
         self.keep_hours = max(1, int(keep_hours))
         self.last_at = 0.0
+        self.last_hour = ""
+        try:
+            conn = connect(self.sqlite_path)
+            try:
+                self.last_hour = local_max_cycle(conn, "hyperliquid") or ""
+            finally:
+                conn.close()
+        except Exception:
+            self.last_hour = ""
 
     def maybe_refresh(self) -> bool:
-        now = time.time()
-        hour_key = to_iso(floor_hour(datetime.now(timezone.utc)))
-        if getattr(self, "last_hour", "") == hour_key and self.last_at > 0:
+        closed = closed_cycle_ts()
+        if not should_append_hour(self.last_hour, closed):
             return False
-        payload = gather_cycle(self.info)
+        payload = gather_cycle(self.info, cycle_ts=closed)
         persist_cycle(self.sqlite_path, payload, keep_hours=self.keep_hours)
-        self.last_at = now
-        self.last_hour = str(payload.get("cycle_ts") or hour_key)
+        self.last_at = time.time()
+        self.last_hour = str(payload.get("cycle_ts") or closed)
         log.info(
             "HL board hour %s | coins=%s coverage=%.0f%% snapped=%s/%s in %.1fs",
             payload["cycle_ts"],

@@ -525,6 +525,44 @@ class UniverseAndDsnTests(unittest.TestCase):
         )
         self.assertGreaterEqual(float(hold8), float(hold0))
 
+    def test_live_min_hold_does_not_open_second_slot(self) -> None:
+        import time as time_mod
+
+        from bagrank.live import PaperBook, _apply_paper
+
+        book = PaperBook(1000.0)
+        book.positions["BCH"] = {"side": "long", "size": 1.0, "entry": 100.0}
+        state = {"opened": {"BCH": time_mod.time()}}
+        desired = [
+            {
+                "coin": "GOOGL",
+                "side": "short",
+                "size": 1.0,
+                "px": 10.0,
+                "notional": 100.0,
+            }
+        ]
+        _apply_paper(
+            book,
+            desired,
+            state,
+            min_hold_h=6,
+            marks={"BCH": 100.0, "GOOGL": 10.0},
+            slots=1,
+        )
+        self.assertIn("BCH", book.positions)
+        self.assertNotIn("GOOGL", book.positions)
+
+    def test_closed_hour_does_not_replace_neon_hour(self) -> None:
+        from datetime import datetime, timezone
+
+        from bagrank.hlcycle import closed_cycle_ts, should_append_hour
+
+        now = datetime(2026, 9, 13, 3, 2, 0, tzinfo=timezone.utc)
+        self.assertEqual(closed_cycle_ts(now), "2026-09-13T02:00:00Z")
+        self.assertFalse(should_append_hour("2026-09-13T02:00:00Z", "2026-09-13T02:00:00Z"))
+        self.assertTrue(should_append_hour("2026-09-13T02:00:00Z", "2026-09-13T03:00:00Z"))
+
     def test_score_wallet_flow_picks_rising_wallets(self) -> None:
         import numpy as np
         from bagrank.kernels import MODE_TOP, N_FEAT, build_score_targets

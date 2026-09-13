@@ -16,7 +16,7 @@ from .engine import lagged_holdings
 from .hlcycle import LiveBoard
 from .kernels import NAME_TO_ID
 from .panel import panel_from_sqlite
-from .prices import fill_panel_from_collector, overlay_hl_market
+from .prices import fill_panel_from_collector
 from .specio import default_live_csv, load_strategy, require_strategy_row, spec_from_row
 from .store import connect
 from .timeutil import to_iso
@@ -173,7 +173,30 @@ def _mids(client) -> dict[str, float]:
     return out
 
 
-def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], min_hold_h: int) -> None:
+def _pos_side(pos: Any) -> str:
+    if isinstance(pos, dict):
+        return str(pos.get("side") or "")
+    return str(getattr(pos, "side", "") or "")
+
+
+def _occupied_slots(
+    have: dict[str, Any],
+    want: dict[str, dict[str, Any]],
+    state: dict[str, Any],
+    min_hold_h: int,
+    now: float,
+) -> list[str]:
+    """Coins that still fill a slot (wanted, or locked by min-hold). Same as backtest."""
+    held: list[str] = []
+    for coin, pos in have.items():
+        side = _pos_side(pos)
+        keep = coin in want and want[coin]["side"] == side
+        if keep or not _can_exit(state, coin, min_hold_h, now):
+            held.append(coin)
+    return held
+
+
+def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], min_hold_h: int, slots: int = 1) -> None:
     from src.market_resolver import resolve_market
     from src.pricing import round_size
 
@@ -208,9 +231,13 @@ def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], mi
 
     ok, positions = client.fetch_open_positions(force=True)
     have = {coin: pos for coin, pos in (positions if ok else [])}
+    occupied = _occupied_slots(have, want, state, min_hold_h, now)
+    free = max(0, max(int(slots or 1), 1) - len(occupied))
     mids = _mids(client)
     for coin, d in want.items():
-        if coin in have and have[coin].side == d["side"]:
+        if coin in have and _pos_side(have[coin]) == d["side"]:
+            continue
+        if free <= 0:
             continue
         px = mids.get(coin) or float(d.get("px") or 0)
         if px <= 0:
@@ -230,6 +257,7 @@ def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], mi
                 pass
             client.place_market_open(d["side"] == "long", size)
             state.setdefault("opened", {})[coin] = now
+            free -= 1
             log.info("LIVE open %s %s sz=%s", coin, d["side"], size)
         except Exception as exc:
             log.warning("Open %s failed: %s", coin, exc)
@@ -241,6 +269,7 @@ def _apply_paper(
     state: dict[str, Any],
     min_hold_h: int,
     marks: dict[str, float],
+    slots: int = 1,
 ) -> None:
     now = time.time()
     want = {str(d["coin"]): d for d in desired}
@@ -254,8 +283,12 @@ def _apply_paper(
             continue
         book.close(coin, marks.get(coin) or float(pos.get("entry") or 0))
         (state.setdefault("opened", {})).pop(coin, None)
+    occupied = _occupied_slots(book.positions, want, state, min_hold_h, now)
+    free = max(0, max(int(slots or 1), 1) - len(occupied))
     for coin, d in want.items():
         if coin in book.positions and book.positions[coin]["side"] == d["side"]:
+            continue
+        if free <= 0:
             continue
         px = marks.get(coin) or float(d.get("px") or 0)
         if px <= 0:
@@ -265,6 +298,7 @@ def _apply_paper(
             size = float(d["notional"]) / px
         book.open(coin, d["side"], size, px)
         state.setdefault("opened", {})[coin] = now
+        free -= 1
 
 
 def run_live(
@@ -318,12 +352,6 @@ def run_live(
     )
     logged_wait = False
     while not _STOP:
-        panel = load_panel(sqlite_path) if sqlite_path.exists() else None
-        if panel is not None and info is not None:
-            try:
-                overlay_hl_market(panel, info)
-            except Exception as exc:
-                log.warning("HL overlay failed: %s", exc)
         have = 0 if panel is None else panel.n_times
         if have >= keep_hours:
             holds = lagged_holdings(panel, spec)
@@ -368,11 +396,24 @@ def run_live(
             if mode == "dry":
                 pass
             elif mode == "paper" and book is not None:
-                _apply_paper(book, sized, state, int(spec.get("min_hold_h") or 0), marks)
+                _apply_paper(
+                    book,
+                    sized,
+                    state,
+                    int(spec.get("min_hold_h") or 0),
+                    marks,
+                    slots=int(spec.get("slots") or 1),
+                )
                 if changed:
                     log.info("PAPER equity $%.2f positions %s", book.equity(marks), list(book.positions))
             elif mode == "live" and client is not None:
-                _apply_live(client, sized, state, int(spec.get("min_hold_h") or 0))
+                _apply_live(
+                    client,
+                    sized,
+                    state,
+                    int(spec.get("min_hold_h") or 0),
+                    slots=int(spec.get("slots") or 1),
+                )
             state["last_bar"] = bar_ts
             state["last_signal"] = sig_ts
             _save_state(state_path, state)
