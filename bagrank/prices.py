@@ -192,3 +192,82 @@ def fill_panel_from_hl_cache(conn: Any, panel: Any, *, bar_seconds: int = HOUR_S
                 panel.marks[i, j] = px
                 n += 1
     return n
+
+
+def _fctx(ctx: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        v = _fany(ctx.get(key))
+        if v != 0.0:
+            return v
+    return 0.0
+
+
+def overlay_hl_market(panel: Any, info: Any) -> int:
+    """Overwrite the latest bar's mark/funding/OI/premium/volume from Hyperliquid."""
+    if panel is None or panel.n_times < 1 or panel.n_coins < 1:
+        return 0
+    try:
+        raw = info.meta_and_asset_ctxs()
+    except Exception:
+        try:
+            raw = info.post("/info", {"type": "metaAndAssetCtxs"})
+        except Exception as exc:
+            log.warning("HL metaAndAssetCtxs failed: %s", exc)
+            return 0
+    meta: dict[str, Any] = {}
+    ctxs: list[Any] = []
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        meta = raw[0] if isinstance(raw[0], dict) else {}
+        ctxs = raw[1] if isinstance(raw[1], list) else []
+    universe = meta.get("universe") or []
+    by_coin: dict[str, dict[str, Any]] = {}
+    for i, asset in enumerate(universe):
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "").strip()
+        if not name:
+            continue
+        ctx = ctxs[i] if i < len(ctxs) and isinstance(ctxs[i], dict) else {}
+        by_coin[name] = ctx
+        if ":" in name:
+            by_coin[name.split(":")[-1]] = ctx
+    try:
+        mids_raw = info.all_mids()
+    except Exception:
+        mids_raw = {}
+    mids: dict[str, float] = {}
+    if isinstance(mids_raw, dict):
+        for coin, px in mids_raw.items():
+            try:
+                v = float(px)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                mids[str(coin)] = v
+    t = panel.n_times - 1
+    filled = 0
+    for j, coin in enumerate(panel.coins):
+        ctx = by_coin.get(coin) or by_coin.get(str(coin).split(":")[-1]) or {}
+        px = mids.get(coin) or mids.get(str(coin).split(":")[-1]) or 0.0
+        if px <= 0:
+            px = _fctx(ctx, "markPx", "midPx", "oraclePx")
+        if px > 0:
+            panel.marks[t, j] = px
+            filled += 1
+        fund = _fctx(ctx, "funding")
+        if fund != 0.0 or "funding" in ctx:
+            panel.funding[t, j] = float(ctx.get("funding") or 0)
+        oi = _fctx(ctx, "openInterest")
+        if oi > 0:
+            panel.oi[t, j] = oi
+        prem = _fctx(ctx, "premium")
+        if prem != 0.0 or "premium" in ctx:
+            panel.premium[t, j] = float(ctx.get("premium") or 0)
+        vol = _fctx(ctx, "dayNtlVlm")
+        if vol > 0:
+            panel.volume[t, j] = vol
+        prev = _fctx(ctx, "prevDayPx")
+        if prev > 0:
+            panel.prev_day[t, j] = prev
+    log.info("HL live overlay | last-bar marks=%s coins=%s", filled, panel.n_coins)
+    return filled

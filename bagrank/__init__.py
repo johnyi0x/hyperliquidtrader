@@ -1,5 +1,5 @@
-"""Local bag-rank store: read-only Neon backup + rank-strategy backtests.
+"""Bag-rank backtests (local sqlite from Neon) and live trading (Hyperliquid API).
 
-Collector / website are the data source (meta_index + coin_prices).
-This package never writes to Neon.
+Neon is for `backup_bagrank.py` / `run_rank_backtest.py` only.
+`run_rank.py` rebuilds the hourly majority board from Hyperliquid, same as the collector.
 """

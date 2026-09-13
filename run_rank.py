@@ -1,5 +1,8 @@
 """Live rank trader. Reads rank_live.csv (header + one copied backtest row).
 
+Rebuilds the hourly bag-rank board from Hyperliquid (leaderboard + wallet
+snapshots), same tally as the collector. Neon is not used.
+
 Local paper:  python run_rank.py
 Local live:   python run_rank.py --live
 Railway:      python run_rank.py

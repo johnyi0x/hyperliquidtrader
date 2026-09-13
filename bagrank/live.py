@@ -10,12 +10,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .backup import sync_neon
-from .dsn import default_sqlite_path, load_env, resolve_database_url
+from .dsn import default_live_sqlite_path, load_env
 from .engine import lagged_holdings
-from .panel import panel_from_sqlite
-from .prices import fill_panel_from_collector
+from .hlcycle import LiveBoard
 from .kernels import NAME_TO_ID
+from .panel import panel_from_sqlite
+from .prices import fill_panel_from_collector, overlay_hl_market
 from .specio import default_live_csv, load_strategy, require_strategy_row, spec_from_row
 from .store import connect
 from .timeutil import to_iso
@@ -42,15 +42,16 @@ def load_panel(sqlite_path: Path, venue: str = "hyperliquid"):
         conn.close()
 
 
-def maybe_sync_backup(sqlite_path: Path) -> None:
-    url, src = resolve_database_url()
-    if not url:
-        return
-    try:
-        log.info("Refreshing local backup via %s", src)
-        sync_neon(sqlite_path, venue="hyperliquid")
-    except Exception as exc:
-        log.warning("Backup refresh failed (using existing sqlite): %s", exc)
+def _min_hours(spec: dict[str, Any]) -> int:
+    lag = max(0, int(spec.get("exec_lag") or 1))
+    return max(2, lag + 1)
+
+
+def _lookback_hours(spec: dict[str, Any]) -> int:
+    look = max(1, int(spec.get("lookback") or 1))
+    lag = max(0, int(spec.get("exec_lag") or 1))
+    step = max(1, int(spec.get("step_h") or 1))
+    return look * step + lag + 1
 
 
 def _weight_targets(
@@ -146,6 +147,13 @@ def _can_exit(state: dict[str, Any], coin: str, min_hold_h: int, now: float) -> 
     if not opened:
         return True
     return (now - float(opened)) >= min_hold_h * 3600.0
+
+
+def _info_only():
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+
+    return Info(constants.MAINNET_API_URL, skip_ws=True)
 
 
 def _make_client():
@@ -273,7 +281,7 @@ def run_live(
     sqlite_path: Path,
     mode: str,
     poll_s: float = 30.0,
-    sync: bool = True,
+    refresh_board: bool = True,
     state_path: Path | None = None,
 ) -> int:
     signal.signal(signal.SIGINT, _request_stop)
@@ -288,14 +296,15 @@ def run_live(
         client = _make_client()
     else:
         book = PaperBook(float(spec.get("equity") or 1000.0))
-    if sync:
-        url, _src = resolve_database_url()
-        if not sqlite_path.exists() and not url:
-            raise SystemExit(
-                "No collector backup. Set NEON_BAGRANK (Railway) or run: python backup_bagrank.py"
-            )
+    info = client.info if client is not None else None
+    if info is None:
+        try:
+            info = _info_only()
+        except Exception as exc:
+            log.warning("HL info client failed; public HTTP will still gather the board: %s", exc)
+    board = LiveBoard(sqlite_path, info) if refresh_board else None
     log.info(
-        "Trading %s | engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s",
+        "Trading %s | board from Hyperliquid API (not Neon) | engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s",
         mode,
         spec.get("engine"),
         spec.get("family"),
@@ -303,15 +312,49 @@ def run_live(
         spec.get("min_hold_h"),
         spec.get("slots"),
         spec.get("exec_lag"),
+        spec.get("lookback"),
     )
+    missing_board_at = 0.0
+    warn_lookback_at = 0.0
+    need = _min_hours(spec)
+    want = _lookback_hours(spec)
     while not _STOP:
-        if sync:
-            maybe_sync_backup(sqlite_path)
-        panel = load_panel(sqlite_path)
-        if panel.n_times < 4:
-            log.warning("Need more collector hours (have %s)", panel.n_times)
+        if board is not None:
+            try:
+                board.maybe_refresh()
+            except Exception as exc:
+                log.warning("HL board gather failed: %s", exc)
+        panel = load_panel(sqlite_path) if sqlite_path.exists() else None
+        if panel is not None and info is not None:
+            try:
+                overlay_hl_market(panel, info)
+            except Exception as exc:
+                log.warning("HL overlay failed: %s", exc)
+        have = 0 if panel is None else panel.n_times
+        if have < need:
+            now = time.time()
+            if now - missing_board_at > 60:
+                log.warning(
+                    "Gathered %s/%s UTC hours from Hyperliquid. "
+                    "Need at least %s hours for exec_lag=%s (past hours cannot be rebuilt from the live API).",
+                    have,
+                    want,
+                    need,
+                    spec.get("exec_lag"),
+                )
+                missing_board_at = now
             time.sleep(poll_s)
             continue
+        if have < want:
+            now = time.time()
+            if now - warn_lookback_at > 300:
+                log.warning(
+                    "Only %s hours so far; lookback=%s wants %s. Trading anyway; signals match the backtest more closely after more hours.",
+                    have,
+                    spec.get("lookback"),
+                    want,
+                )
+                warn_lookback_at = now
         holds = lagged_holdings(panel, spec)
         equity = float(spec.get("equity") or 1000.0)
         marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
@@ -378,12 +421,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Defaults to rank_live.csv in the repo root",
     )
     p.add_argument("--row", type=int, default=2, help="Excel row including header (2 = the pasted strategy)")
-    p.add_argument("--db", type=Path, default=default_sqlite_path())
+    p.add_argument("--db", type=Path, default=default_live_sqlite_path())
     p.add_argument("--paper", action="store_true", help="Simulated fills (default when not on Railway)")
     p.add_argument("--live", action="store_true", help="Send real Hyperliquid orders")
     p.add_argument("--dry-run", action="store_true", help="Print targets only")
     p.add_argument("--poll", type=float, default=30.0)
-    p.add_argument("--no-sync", action="store_true", help="Do not refresh sqlite from Neon")
+    p.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Do not snapshot Hyperliquid wallets; reuse hours already in local sqlite",
+    )
+    p.add_argument(
+        "--no-sync",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     csv_path = args.csv or default_live_csv()
@@ -415,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
         sqlite_path=args.db,
         mode=mode,
         poll_s=args.poll,
-        sync=not args.no_sync,
+        refresh_board=not (args.no_refresh or args.no_sync),
     )
 
 

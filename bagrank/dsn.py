@@ -137,3 +137,11 @@ def default_sqlite_path() -> Path:
         p = Path(override)
         return p if p.is_absolute() else REPO / p
     return REPO / "data" / "bagrank" / "bagrank.sqlite"
+
+
+def default_live_sqlite_path() -> Path:
+    override = (os.environ.get("BAGRANK_LIVE_SQLITE") or "").strip()
+    if override:
+        p = Path(override)
+        return p if p.is_absolute() else REPO / p
+    return REPO / "data" / "bagrank" / "live.sqlite"

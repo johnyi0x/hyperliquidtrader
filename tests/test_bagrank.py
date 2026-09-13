@@ -384,6 +384,52 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn("ep-from-bagrank", shown)
         self.assertNotIn("secret", shown)
 
+    def test_railway_does_not_use_database_url(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        from bagrank.dsn import resolve_database_url
+
+        env = {
+            "RAILWAY_ENVIRONMENT": "production",
+            "DATABASE_URL": "postgresql://u:secret@ep-rail.c-5.us-east-2.aws.neon.tech/neondb",
+        }
+        with patch("bagrank.dsn.load_env"), patch.dict(os.environ, env, clear=True):
+            url, src = resolve_database_url()
+        self.assertEqual(src, "")
+        self.assertEqual(url, "")
+
+    def test_hl_overlay_writes_last_bar_mark(self) -> None:
+        from bagrank.prices import overlay_hl_market
+
+        hours = ["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"]
+        rows = [_meta(cycle, "AAA", 1, 50) for cycle in hours]
+        panel = panel_from_meta_rows(rows)
+        panel.marks[:] = 10.0
+
+        class _Info:
+            def meta_and_asset_ctxs(self):
+                return (
+                    {"universe": [{"name": "AAA"}]},
+                    [
+                        {
+                            "markPx": "77.5",
+                            "funding": "0.0001",
+                            "openInterest": "9",
+                            "premium": "0.01",
+                            "dayNtlVlm": "100",
+                            "prevDayPx": "70",
+                        }
+                    ],
+                )
+
+            def all_mids(self):
+                return {"AAA": "88.25"}
+
+        n = overlay_hl_market(panel, _Info())
+        self.assertGreaterEqual(n, 1)
+        self.assertAlmostEqual(float(panel.marks[-1, 0]), 88.25)
+
     def test_enter_top_zero_allows_names_outside_top_five(self) -> None:
         hours = ["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"]
         rows = []
@@ -788,6 +834,112 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertEqual(float(row["gross_pct"]), 40.0)
         self.assertEqual(int(row["size_mode"]), 1)
         self.assertIn("fitness", row)
+
+    def test_hl_tally_ranks_by_wallets_then_hold_pct(self) -> None:
+        from bagrank.hlcycle import tally_holds
+
+        snaps = [
+            {
+                "ok": True,
+                "positions": [
+                    {"coin": "BBB", "side": "long", "notional": 100, "leverage": 3, "conviction": 0.1},
+                    {"coin": "AAA", "side": "long", "notional": 100, "leverage": 5, "conviction": 0.2},
+                ],
+            },
+            {
+                "ok": True,
+                "positions": [
+                    {"coin": "AAA", "side": "long", "notional": 80, "leverage": 4, "conviction": 0.15},
+                ],
+            },
+            {
+                "ok": True,
+                "positions": [
+                    {"coin": "AAA", "side": "short", "notional": 90, "leverage": 2, "conviction": -0.1},
+                    {"coin": "CCC", "side": "short", "notional": 200, "leverage": 8, "conviction": -0.4},
+                ],
+            },
+            {"ok": False, "positions": []},
+        ]
+        rows, stats = tally_holds(snaps)
+        self.assertEqual(stats["ok"], 3)
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(rows[0]["coin"], "AAA")
+        self.assertEqual(rows[0]["side"], "long")
+        self.assertEqual(rows[0]["wallets"], 2)
+        self.assertEqual(rows[0]["rank"], 1)
+        self.assertAlmostEqual(rows[0]["hold_pct"], 2 / 3)
+        self.assertAlmostEqual(rows[0]["agreement"], 2 / 3)
+
+    def test_persist_hl_cycle_loads_panel(self) -> None:
+        import tempfile
+
+        from bagrank.hlcycle import persist_cycle
+
+        payload = {
+            "cycle_ts": "2026-09-12T21:00:00Z",
+            "listed": 3,
+            "snapped_ok": 3,
+            "snapped_err": 0,
+            "empty_books": 0,
+            "coverage": 1.0,
+            "duration_s": 1.2,
+            "status": "ok",
+            "meta_index": [
+                {
+                    "coin": "AAA",
+                    "side": "long",
+                    "wallets": 10,
+                    "hold_pct": 0.5,
+                    "agreement": 0.9,
+                    "long_n": 10,
+                    "short_n": 1,
+                    "median_leverage": 5,
+                    "mean_leverage": 5.0,
+                    "avg_conviction": 0.2,
+                    "notional_usd": 1000.0,
+                    "rank": 1,
+                }
+            ],
+            "coin_prices": [
+                {
+                    "cycle_ts": "2026-09-12T21:00:00Z",
+                    "coin": "AAA",
+                    "mark_px": 12.5,
+                    "mid_px": 12.4,
+                    "funding": 0.0001,
+                    "open_interest": 9,
+                    "prev_day_px": 11,
+                    "day_ntl_vlm": 100,
+                    "premium": 0.01,
+                    "source": "hl",
+                    "fetched_at": "2026-09-12T21:01:00Z",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bagrank.sqlite"
+            persist_cycle(path, payload)
+            conn = connect(path)
+            try:
+                panel = panel_from_sqlite(conn, venue="hyperliquid")
+                fill_panel_from_collector(conn, panel, venue="hyperliquid")
+            finally:
+                conn.close()
+        self.assertEqual(panel.n_times, 1)
+        self.assertEqual(panel.coins, ["AAA"])
+        self.assertAlmostEqual(float(panel.marks[0, 0]), 12.5)
+
+    def test_live_loop_uses_hl_board_not_neon(self) -> None:
+        import inspect
+
+        from bagrank import live
+
+        src = inspect.getsource(live.run_live)
+        self.assertIn("LiveBoard", src)
+        self.assertNotIn("sync_neon", src)
+        self.assertNotIn("maybe_sync_backup", src)
+        self.assertNotIn("NEON_BAGRANK", src)
 
 
 if __name__ == "__main__":
