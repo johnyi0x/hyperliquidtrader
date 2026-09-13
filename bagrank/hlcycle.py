@@ -427,7 +427,7 @@ def gather_cycle(info: Any, *, basket: int = BASKET_SIZE) -> dict[str, Any]:
     flags = {"all_dexes_ok": True}
     for i, addr in enumerate(addrs, start=1):
         books.append(snapshot_wallet(info, addr, flags=flags))
-        if i % 25 == 0 or i == len(addrs):
+        if i == len(addrs):
             log.info("Snapped %s/%s", i, len(addrs))
         time.sleep(SNAP_GAP_S)
     index_rows, stats = tally_holds(books)

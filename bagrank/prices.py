@@ -69,7 +69,7 @@ def fill_panel_from_collector(conn: Any, panel: Any, *, venue: str) -> dict[str,
     missing = 0
     if needed:
         missing = int(((panel.rank > 0) & (panel.marks <= 0.0)).sum())
-    log.info(
+    log.debug(
         "Collector prices | joined=%s on-board-missing=%s",
         filled,
         missing,
@@ -269,5 +269,5 @@ def overlay_hl_market(panel: Any, info: Any) -> int:
         prev = _fctx(ctx, "prevDayPx")
         if prev > 0:
             panel.prev_day[t, j] = prev
-    log.info("HL live overlay | last-bar marks=%s coins=%s", filled, panel.n_coins)
+    log.debug("HL live overlay | last-bar marks=%s coins=%s", filled, panel.n_coins)
     return filled

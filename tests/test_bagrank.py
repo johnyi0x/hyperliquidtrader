@@ -384,6 +384,22 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn("ep-from-bagrank", shown)
         self.assertNotIn("secret", shown)
 
+    def test_resolve_uses_neon_database_when_bagrank_missing(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        from bagrank.dsn import resolve_database_url
+
+        env = {
+            "NEON_DATABASE": "postgresql://u:secret@ep-live.c-5.us-east-2.aws.neon.tech/neondb",
+            "DATABASE_URL": "postgresql://u:secret@ep-other.c-7.us-east-1.aws.neon.tech/other",
+        }
+        with patch("bagrank.dsn.load_env"), patch.dict(os.environ, env, clear=True):
+            url, src = resolve_database_url()
+        self.assertEqual(src, "NEON_DATABASE")
+        self.assertIn("ep-live", url)
+        self.assertNotIn("ep-other", url)
+
     def test_railway_does_not_use_database_url(self) -> None:
         import os
         from unittest.mock import patch

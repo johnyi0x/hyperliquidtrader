@@ -123,6 +123,9 @@ def resolve_database_url(explicit: str = "") -> tuple[str, str]:
     raw = (os.environ.get("NEON_BAGRANK") or "").strip()
     if raw:
         return prepare_dsn(raw), "NEON_BAGRANK"
+    raw = (os.environ.get("NEON_DATABASE") or "").strip()
+    if raw:
+        return prepare_dsn(raw), "NEON_DATABASE"
     return "", ""
 
 

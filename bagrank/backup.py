@@ -162,6 +162,20 @@ class NeonSource(Source):
             out.append(as_utc(row["cycle_ts"]))
         return out
 
+    def list_recent_cycles(self, venue: str, limit: int) -> list[datetime]:
+        rows = self.conn.execute(
+            """
+            SELECT cycle_ts FROM collector_runs
+            WHERE venue = %s AND status = ANY(%s)
+            ORDER BY cycle_ts DESC
+            LIMIT %s
+            """,
+            (venue, list(OK_STATUS), max(1, int(limit))),
+        ).fetchall()
+        out = [as_utc(row["cycle_ts"]) for row in rows]
+        out.reverse()
+        return out
+
     def fetch_table(
         self, table: str, venue: str, cycles: list[datetime]
     ) -> list[dict[str, Any]]:
@@ -439,6 +453,39 @@ def sync(source: Source, sqlite_path: Path, *, venue: str = VENUE_DEFAULT) -> di
         return stats
     finally:
         conn.close()
+
+
+def seed_recent_board(
+    sqlite_path: Path,
+    hours: int,
+    *,
+    venue: str = VENUE_DEFAULT,
+) -> int:
+    """One-shot copy of the last N collector hours. Does not stay connected."""
+    url, _src = resolve_database_url()
+    if not url:
+        return 0
+    from .hlcycle import prune_old_hours
+
+    keep = max(1, int(hours))
+    neon = NeonSource(url)
+    try:
+        cycles = neon.list_recent_cycles(venue, keep)
+        if not cycles:
+            return 0
+        conn = connect(sqlite_path)
+        try:
+            for table in ("collector_runs", "meta_index", "coin_prices"):
+                rows = neon.fetch_table(table, venue, cycles)
+                if rows:
+                    upsert_rows(conn, table, rows, venue=venue)
+            prune_old_hours(conn, venue=venue, keep_hours=keep)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(cycles)
+    finally:
+        neon.close()
 
 
 def sync_neon(

@@ -43,18 +43,6 @@ def load_panel(sqlite_path: Path, venue: str = "hyperliquid"):
         conn.close()
 
 
-def _min_hours(spec: dict[str, Any]) -> int:
-    lag = max(0, int(spec.get("exec_lag") or 1))
-    return max(2, lag + 1)
-
-
-def _lookback_hours(spec: dict[str, Any]) -> int:
-    look = max(1, int(spec.get("lookback") or 1))
-    lag = max(0, int(spec.get("exec_lag") or 1))
-    step = max(1, int(spec.get("step_h") or 1))
-    return look * step + lag + 1
-
-
 def _weight_targets(
     holds: list[dict[str, Any]],
     *,
@@ -197,7 +185,10 @@ def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], mi
     want = {str(d["coin"]): d for d in desired}
     now = time.time()
     equity = float(client.get_account_value(force=True) or 0)
-    log.info("Live equity $%.2f want %s have %s", equity, list(want), list(have))
+    snap = (round(equity, 2), tuple(want), tuple(have))
+    if getattr(_apply_live, "_last_snap", None) != snap:
+        log.info("Live equity $%.2f want %s have %s", equity, list(want), list(have))
+        _apply_live._last_snap = snap
 
     for coin, pos in list(have.items()):
         keep = coin in want and want[coin]["side"] == pos.side
@@ -304,10 +295,18 @@ def run_live(
         except Exception as exc:
             log.warning("HL info client failed; public HTTP will still gather the board: %s", exc)
     keep_hours = max(1, int(spec.get("lookback") or 1) * max(1, int(spec.get("step_h") or 1)))
+    try:
+        from .backup import seed_recent_board
+
+        seeded = seed_recent_board(sqlite_path, keep_hours)
+        if seeded:
+            log.info("Neon backfill once: %s hours. Neon will not be queried again.", seeded)
+    except Exception as exc:
+        log.warning("Neon backfill skipped: %s", exc)
     board = LiveBoard(sqlite_path, info, keep_hours=keep_hours) if refresh_board else None
     log.info("Hourly board file %s | rolling window %sh", sqlite_path, keep_hours)
     log.info(
-        "Trading %s | board from Hyperliquid API (not Neon) | engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s",
+        "Trading %s | engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s",
         mode,
         spec.get("engine"),
         spec.get("family"),
@@ -317,16 +316,8 @@ def run_live(
         spec.get("exec_lag"),
         spec.get("lookback"),
     )
-    missing_board_at = 0.0
-    warn_lookback_at = 0.0
-    need = _min_hours(spec)
-    want = _lookback_hours(spec)
+    logged_wait = False
     while not _STOP:
-        if board is not None:
-            try:
-                board.maybe_refresh()
-            except Exception as exc:
-                log.warning("HL board gather failed: %s", exc)
         panel = load_panel(sqlite_path) if sqlite_path.exists() else None
         if panel is not None and info is not None:
             try:
@@ -334,78 +325,65 @@ def run_live(
             except Exception as exc:
                 log.warning("HL overlay failed: %s", exc)
         have = 0 if panel is None else panel.n_times
-        if have < need:
-            now = time.time()
-            if now - missing_board_at > 60:
-                log.warning(
-                    "Gathered %s/%s UTC hours from Hyperliquid. "
-                    "Need at least %s hours for exec_lag=%s (past hours cannot be rebuilt from the live API).",
-                    have,
-                    want,
-                    need,
-                    spec.get("exec_lag"),
-                )
-                missing_board_at = now
-            time.sleep(poll_s)
-            continue
-        if have < want:
-            now = time.time()
-            if now - warn_lookback_at > 300:
-                log.warning(
-                    "Only %s hours so far; lookback=%s wants %s. Trading anyway; signals match the backtest more closely after more hours.",
-                    have,
-                    spec.get("lookback"),
-                    want,
-                )
-                warn_lookback_at = now
-        holds = lagged_holdings(panel, spec)
-        equity = float(spec.get("equity") or 1000.0)
-        marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
-        if client is not None:
-            try:
-                equity = float(client.get_account_value(force=True) or equity)
-                marks.update(_mids(client))
-                for h in holds:
-                    if h["coin"] in marks:
-                        h["px"] = marks[h["coin"]]
-            except Exception as exc:
-                log.warning("Live marks/equity failed: %s", exc)
-        elif book is not None:
-            equity = book.equity(marks)
-        sized = _weight_targets(
-            holds,
-            equity=equity,
-            gross_pct=float(spec.get("gross_pct") or 95),
-            max_pair_share=float(spec.get("max_pair_share") or 0.7),
-            use_lev=int(spec.get("use_lev") or 0),
-            slots=int(spec.get("slots") or 0),
-            exposure_mode=int(spec.get("exposure_mode") or 0),
-        )
-        key = json.dumps(
-            [(d["coin"], d["side"]) for d in sized],
-            separators=(",", ":"),
-        )
-        sig_ts = to_iso(holds[0]["signal_unix"]) if holds else ""
-        bar_ts = to_iso(holds[0]["bar_unix"]) if holds else ""
-        if key != last_signal:
-            log.info(
-                "Targets bar=%s signal=%s n=%s %s",
-                bar_ts,
-                sig_ts,
-                len(sized),
-                [(d["coin"], d["side"], round(d.get("notional", 0), 1)) for d in sized],
+        if have >= keep_hours:
+            holds = lagged_holdings(panel, spec)
+            equity = float(spec.get("equity") or 1000.0)
+            marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
+            if client is not None:
+                try:
+                    equity = float(client.get_account_value(force=True) or equity)
+                    marks.update(_mids(client))
+                    for h in holds:
+                        if h["coin"] in marks:
+                            h["px"] = marks[h["coin"]]
+                except Exception as exc:
+                    log.warning("Live marks/equity failed: %s", exc)
+            elif book is not None:
+                equity = book.equity(marks)
+            sized = _weight_targets(
+                holds,
+                equity=equity,
+                gross_pct=float(spec.get("gross_pct") or 95),
+                max_pair_share=float(spec.get("max_pair_share") or 0.7),
+                use_lev=int(spec.get("use_lev") or 0),
+                slots=int(spec.get("slots") or 0),
+                exposure_mode=int(spec.get("exposure_mode") or 0),
             )
-            last_signal = key
-        if mode == "dry":
-            pass
-        elif mode == "paper" and book is not None:
-            _apply_paper(book, sized, state, int(spec.get("min_hold_h") or 0), marks)
-            log.info("PAPER equity $%.2f positions %s", book.equity(marks), list(book.positions))
-        elif mode == "live" and client is not None:
-            _apply_live(client, sized, state, int(spec.get("min_hold_h") or 0))
-        state["last_bar"] = bar_ts
-        state["last_signal"] = sig_ts
-        _save_state(state_path, state)
+            key = json.dumps(
+                [(d["coin"], d["side"]) for d in sized],
+                separators=(",", ":"),
+            )
+            sig_ts = to_iso(holds[0]["signal_unix"]) if holds else ""
+            bar_ts = to_iso(holds[0]["bar_unix"]) if holds else ""
+            changed = key != last_signal
+            if changed:
+                log.info(
+                    "Targets bar=%s signal=%s n=%s %s",
+                    bar_ts,
+                    sig_ts,
+                    len(sized),
+                    [(d["coin"], d["side"], round(d.get("notional", 0), 1)) for d in sized],
+                )
+                last_signal = key
+            if mode == "dry":
+                pass
+            elif mode == "paper" and book is not None:
+                _apply_paper(book, sized, state, int(spec.get("min_hold_h") or 0), marks)
+                if changed:
+                    log.info("PAPER equity $%.2f positions %s", book.equity(marks), list(book.positions))
+            elif mode == "live" and client is not None:
+                _apply_live(client, sized, state, int(spec.get("min_hold_h") or 0))
+            state["last_bar"] = bar_ts
+            state["last_signal"] = sig_ts
+            _save_state(state_path, state)
+        elif not logged_wait:
+            log.info("Waiting for %s lookback hours (have %s). Set NEON_DATABASE to backfill once.", keep_hours, have)
+            logged_wait = True
+        if board is not None:
+            try:
+                board.maybe_refresh()
+            except Exception as exc:
+                log.warning("HL board gather failed: %s", exc)
         time.sleep(max(5.0, float(poll_s)))
     return 0
 
