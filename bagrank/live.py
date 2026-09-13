@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -304,16 +305,7 @@ def run_live(
             log.warning("HL info client failed; public HTTP will still gather the board: %s", exc)
     keep_hours = max(1, int(spec.get("lookback") or 1) * max(1, int(spec.get("step_h") or 1)))
     board = LiveBoard(sqlite_path, info, keep_hours=keep_hours) if refresh_board else None
-    volume = Path("/data")
-    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
-    if on_railway and not volume.is_dir():
-        log.info(
-            "Hourly board file %s is on the container disk; add a Railway volume mounted at /data so lookback hours survive restart.",
-            sqlite_path,
-        )
-    else:
-        log.info("Hourly board file %s", sqlite_path)
-    log.info("Rolling board window %sh (lookback=%s step=%s)", keep_hours, spec.get("lookback"), spec.get("step_h"))
+    log.info("Hourly board file %s | rolling window %sh", sqlite_path, keep_hours)
     log.info(
         "Trading %s | board from Hyperliquid API (not Neon) | engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s",
         mode,
@@ -448,7 +440,12 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     args = p.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
     csv_path = args.csv or default_live_csv()
     raw = load_strategy(csv_path=csv_path, excel_row=args.row)
     require_strategy_row(raw, str(csv_path))
