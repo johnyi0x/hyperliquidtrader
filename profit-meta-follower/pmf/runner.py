@@ -29,8 +29,10 @@ from .copy_score import (
 )
 from .majority import (
     compact_hold_board,
+    hold_rows_from_meta,
     majority_gross_pct,
     pick_majority_targets,
+    rank_map_from_state,
     tally_holds,
 )
 from .leaderboard import load_leaderboard
@@ -1268,9 +1270,41 @@ class ProfitMetaRunner:
     def _majority_refresh_h(self) -> float:
         return float(
             getattr(self.cfg, "MAJORITY_REFRESH_HOURS", 0)
-            or getattr(self.cfg, "BASKET_REFRESH_HOURS", 2.5)
-            or 2.5
+            or getattr(self.cfg, "BASKET_REFRESH_HOURS", 1.0)
+            or 1.0
         )
+
+    def _majority_uses_collector(self) -> bool:
+        src = str(getattr(self.cfg, "MAJORITY_BOARD_SOURCE", "collector") or "collector")
+        return src.strip().lower() in ("collector", "neon", "bagrank", "api", "meta")
+
+    def _load_collector_board(self) -> tuple[list, dict[str, Any], str] | None:
+        from bagrank.board import fetch_latest_board
+
+        venue = str(getattr(self.cfg, "VENUE", "hyperliquid") or "hyperliquid")
+        board = fetch_latest_board(venue=venue)
+        if board is None or not board.rows:
+            return None
+        rows = hold_rows_from_meta(board.rows)
+        listed = int(board.listed or 0)
+        n_ok = int(board.snapped_ok or 0)
+        cov = float(board.coverage) if board.coverage is not None else (
+            (n_ok / listed) if listed else 1.0
+        )
+        stats = {
+            "source": "collector",
+            "status": board.status,
+            "listed": listed,
+            "ok": n_ok,
+            "snapped": n_ok,
+            "empty": 0,
+            "errors": 0,
+            "stale": 0,
+            "coins": len(rows),
+            "coverage": cov,
+            "cycle_ts": board.cycle_ts,
+        }
+        return rows, stats, board.cycle_ts
 
     def _force_resize_token(self) -> str:
         return str(getattr(self.cfg, "MAJORITY_FORCE_RESIZE_ID", "") or "").strip()
@@ -1368,16 +1402,32 @@ class ProfitMetaRunner:
         return True
 
     def cycle_majority(self) -> None:
-        """Hold the crowd's most-held (coin, side) book. Rebuild every N hours."""
+        """Follow collector meta_index at 1h. Rank-up enter / rank-down exit."""
         now = time.time()
         refresh_h = self._majority_refresh_h()
         last_meta = float(self.store.data.get("majority_meta_at") or 0)
+        last_cycle = str(self.store.data.get("majority_cycle_ts") or "")
+        use_collector = self._majority_uses_collector()
         due = last_meta <= 0 or (now - last_meta) / 3600.0 >= refresh_h
+        if use_collector:
+            last_check = float(self.store.data.get("majority_collector_check_at") or 0)
+            hour_unix = int(now // 3600) * 3600
+            already_this_hour = False
+            if last_cycle:
+                try:
+                    from bagrank.timeutil import to_unix
+
+                    already_this_hour = to_unix(last_cycle) >= hour_unix
+                except (TypeError, ValueError):
+                    already_this_hour = False
+            due = (not already_this_hour) and (last_check <= 0 or (now - last_check) >= 45.0)
         managed = set(str(x) for x in (self.store.data.get("managed_coins") or []))
         want_single = bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False))
         was_single = bool(self.store.data.get("majority_single_pair"))
+        force_board = False
         if want_single != was_single:
             due = True
+            force_board = True
             self.log.info(
                 "MAJORITY single-pair %s — run meta now (was %s)",
                 "on" if want_single else "off",
@@ -1387,6 +1437,7 @@ class ProfitMetaRunner:
             last_try = float(self.store.data.get("majority_single_flatten_at") or 0)
             if last_try <= 0 or (now - last_try) >= 180.0:
                 due = True
+                force_board = True
                 self.log.info(
                     "MAJORITY single-pair — flatten extras now | have=%s",
                     ",".join(sorted(managed)) or "-",
@@ -1394,7 +1445,7 @@ class ProfitMetaRunner:
         if self._force_resize_pending():
             due = True
             self.log.info(
-                "MAJORITY one-shot top-up to %.0f%% — skip 2.5h wait",
+                "MAJORITY one-shot top-up to %.0f%% — skip 1h wait",
                 majority_gross_pct(self.cfg),
             )
         if not due:
@@ -1422,45 +1473,90 @@ class ProfitMetaRunner:
             self._majority_fast_topup(now)
             return
 
-        listed = len(self.tracker.addrs)
-        if listed < 5:
-            self.log.warning("MAJORITY basket empty — waiting for leaderboard refresh")
-            return
+        rows = []
+        stats: dict[str, Any] = {}
+        cycle_ts = ""
+        listed = 0
+        n_ok = 0
+        cov = 0.0
+        min_cov = float(getattr(self.cfg, "MAJORITY_MIN_COVERAGE", 0.70) or 0.70)
+        if use_collector:
+            self.store.data["majority_collector_check_at"] = now
+            loaded = self._load_collector_board()
+            if loaded is None:
+                last_miss = float(self.store.data.get("majority_collector_miss_at") or 0)
+                if now - last_miss >= 60.0:
+                    self.log.warning(
+                        "MAJORITY waiting for collector meta_index "
+                        "(set NEON_BAGRANK or run backup_bagrank.py)"
+                    )
+                    self.store.data["majority_collector_miss_at"] = now
+                    self.store.save()
+                return
+            rows, stats, cycle_ts = loaded
+            if cycle_ts == last_cycle and not force_board:
+                if now - float(self.store.data.get("majority_idle_log_at") or 0) >= 300.0:
+                    self.log.info(
+                        "MAJORITY hold | collector %s | book=%s | equity=$%.2f",
+                        cycle_ts,
+                        self.store.data.get("majority_board_txt") or "-",
+                        float(self._last_equity or 0),
+                    )
+                    self.store.data["majority_idle_log_at"] = now
+                    self.store.save()
+                return
+            listed = int(stats.get("listed") or 0)
+            n_ok = int(stats.get("ok") or 0)
+            cov = float(stats.get("coverage") or 0)
+            self.log.info(
+                "MAJORITY collector %s | status=%s listed=%s ok=%s cov=%.0f%% coins=%s",
+                cycle_ts,
+                stats.get("status"),
+                listed,
+                n_ok,
+                cov * 100.0,
+                stats.get("coins"),
+            )
+        else:
+            listed = len(self.tracker.addrs)
+            if listed < 5:
+                self.log.warning("MAJORITY basket empty — waiting for leaderboard refresh")
+                return
+            sleep_s = float(getattr(self.cfg, "MAJORITY_SNAP_SLEEP_S", 0.12) or 0.0)
+            self.log.info(
+                "MAJORITY snap start | wallets=%s window=%s interval=%.1fh snap_sleep=%.2fs",
+                listed,
+                getattr(self.cfg, "RANK_WINDOW", "week"),
+                refresh_h,
+                sleep_s,
+            )
+            n = self.tracker.poll_all(now, sleep_s=sleep_s)
+            snaps = self.tracker.live_snapshots()
+            rows, stats = tally_holds(snaps, self.cfg, now=now)
+            n_ok = int(stats.get("ok") or 0)
+            cov = (n_ok / listed) if listed else 0.0
+            self.log.info(
+                "MAJORITY snap | polled=%s ok=%s empty=%s err=%s stale=%s cov=%.0f%% coins=%s",
+                n,
+                n_ok,
+                stats.get("empty"),
+                stats.get("errors"),
+                stats.get("stale"),
+                cov * 100.0,
+                stats.get("coins"),
+            )
         if want_single and len(managed) > 1:
             self.store.data["majority_single_flatten_at"] = now
             self.store.save()
-
-        sleep_s = float(getattr(self.cfg, "MAJORITY_SNAP_SLEEP_S", 0.12) or 0.0)
-        self.log.info(
-            "MAJORITY meta start | wallets=%s window=%s filter=off snap_sleep=%.2fs",
-            listed,
-            getattr(self.cfg, "RANK_WINDOW", "week"),
-            sleep_s,
-        )
-        n = self.tracker.poll_all(now, sleep_s=sleep_s)
-        snaps = self.tracker.live_snapshots()
-        rows, stats = tally_holds(snaps, self.cfg, now=now)
-        n_ok = int(stats.get("ok") or 0)
-        cov = (n_ok / listed) if listed else 0.0
-        min_cov = float(getattr(self.cfg, "MAJORITY_MIN_COVERAGE", 0.70) or 0.70)
-        self.log.info(
-            "MAJORITY snap | polled=%s ok=%s empty=%s err=%s stale=%s cov=%.0f%% coins=%s",
-            n,
-            n_ok,
-            stats.get("empty"),
-            stats.get("errors"),
-            stats.get("stale"),
-            cov * 100.0,
-            stats.get("coins"),
-        )
         if cov + 1e-12 < min_cov:
             self.log.warning(
-                "MAJORITY coverage %.0f%% < %.0f%% — keep current book, retry in 3 min",
+                "MAJORITY coverage %.0f%% < %.0f%% — keep current book, retry soon",
                 cov * 100.0,
                 min_cov * 100.0,
             )
-            self.store.data["majority_meta_at"] = now - refresh_h * 3600.0 + 180.0
-            self.store.save()
+            if not use_collector:
+                self.store.data["majority_meta_at"] = now - refresh_h * 3600.0 + 180.0
+                self.store.save()
             return
 
         coin_hint = [r.coin for r in rows[:24]]
@@ -1470,14 +1566,7 @@ class ProfitMetaRunner:
             self.log.warning("MAJORITY market cache: %s", exc)
 
         managed = set(str(x) for x in (self.store.data.get("managed_coins") or []))
-        prev_ranks_raw = self.store.data.get("majority_ranks") or {}
-        prev_ranks: dict[str, int] = {}
-        if isinstance(prev_ranks_raw, dict):
-            for k, v in prev_ranks_raw.items():
-                try:
-                    prev_ranks[str(k)] = int(v)
-                except (TypeError, ValueError):
-                    continue
+        prev_ranks = rank_map_from_state(self.store.data.get("majority_ranks") or {})
         held: dict[str, str] = {}
         for row in self.store.data.get("last_targets") or []:
             if not isinstance(row, dict):
@@ -1572,6 +1661,7 @@ class ProfitMetaRunner:
 
         if meta.get("seed"):
             self.store.data["majority_meta_at"] = now
+            self.store.data["majority_cycle_ts"] = cycle_ts
             self.store.data["majority_board_txt"] = board_txt
             self.store.data["majority_stats"] = stats
             self.store.save()
@@ -1603,6 +1693,7 @@ class ProfitMetaRunner:
         held_tgts = [t for t in targets if t.coin in new_managed]
         held_keys = [f"{t.side}:{t.coin}" for t in held_tgts]
         self.store.data["majority_meta_at"] = now
+        self.store.data["majority_cycle_ts"] = cycle_ts
         self.store.data["majority_single_pair"] = bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False))
         if self._force_resize_pending() and any(t.coin in new_managed for t in targets):
             self.store.data["majority_force_resize_id"] = self._force_resize_token()
@@ -1840,20 +1931,18 @@ class ProfitMetaRunner:
                 )
             elif self._is_majority_mode():
                 self.log.info(
-                    "MAJORITY portfolio running | profile=%s paper=%s wallets=%s window=%s "
-                    "pairs<=%s single=%s gross=%.0f%% resize=%s lev_div=%s min_hold=%.0f%% "
-                    "min_agr=%.0f%% refresh=%.1fh filter=off sticky=%s scope=%s",
+                    "MAJORITY portfolio running | profile=%s paper=%s source=%s "
+                    "pairs<=%s single=%s gross=%.0f%% resize=%s lev_div=%s "
+                    "rank-up/down top=%s refresh=%.1fh sticky=%s scope=%s",
                     getattr(self.cfg, "PMF_PROFILE", "local"),
                     bool(self.cfg.PAPER_TRADING),
-                    int(getattr(self.cfg, "BASKET_SIZE", 200) or 200),
-                    str(getattr(self.cfg, "RANK_WINDOW", "week") or "week"),
+                    str(getattr(self.cfg, "MAJORITY_BOARD_SOURCE", "collector") or "collector"),
                     int(getattr(self.cfg, "MAX_COINS_IN_BOOK", 4) or 4),
                     bool(getattr(self.cfg, "MAJORITY_SINGLE_PAIR", False)),
                     majority_gross_pct(self.cfg),
                     bool(getattr(self.cfg, "MAJORITY_RESIZE", False)),
                     float(getattr(self.cfg, "MAJORITY_LEVERAGE_DIV", 1) or 1),
-                    float(getattr(self.cfg, "MAJORITY_MIN_HOLD_PCT", 0.05) or 0) * 100.0,
-                    float(getattr(self.cfg, "MAJORITY_MIN_SIDE_AGREEMENT", 0.55) or 0) * 100.0,
+                    int(getattr(self.cfg, "MAJORITY_ENTER_TOP", 5) or 5),
                     self._majority_refresh_h(),
                     bool(getattr(self.cfg, "MAJORITY_STICKY", True)),
                     self.cfg.DEX_SCOPE,
@@ -1914,7 +2003,9 @@ class ProfitMetaRunner:
                     or getattr(self.cfg, "BASKET_REFRESH_HOURS", 2.5)
                     or 2.5
                 )
-                if refresh_due:
+                if refresh_due and not (
+                    self._is_majority_mode() and self._majority_uses_collector()
+                ):
                     try:
                         self.refresh_basket_if_needed()
                     except Exception as exc:

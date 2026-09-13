@@ -1,9 +1,33 @@
 .env
+
+# Local runtime, Neon sqlite backups, backtest/search dumps.
+# `git add -A` must never upload these.
 data/
 data-local/
 data-cloud/
 data-research/
 logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db
+*.nbc
+*.nbi
+
+# Bagrank output if copied out of data/ by mistake
+results.jsonl
+leaderboard.json
+last_backtest.json
+live_state.json
+/results.csv
+/leaderboard.csv
+/by_return.csv
+/by_trades.csv
+/meta.json
+run_*_from_*_until_*/
+**/run_*_from_*_until_*/
+
 __pycache__/
 *.pyc
 .venv/

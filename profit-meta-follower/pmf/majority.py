@@ -176,13 +176,13 @@ def tally_holds(
 
 
 def _eligible(row: HoldRow, cfg: Any, markets: dict[str, MarketCtx], *, exit_band: bool) -> str:
-    min_hold = float(getattr(cfg, "MAJORITY_MIN_HOLD_PCT", 0.05) or 0.0)
-    exit_hold = float(getattr(cfg, "MAJORITY_EXIT_HOLD_PCT", 0.03) or 0.0)
+    min_hold = float(getattr(cfg, "MAJORITY_MIN_HOLD_PCT", 0.0) or 0.0)
+    exit_hold = float(getattr(cfg, "MAJORITY_EXIT_HOLD_PCT", 0.0) or 0.0)
     floor = exit_hold if exit_band else min_hold
-    min_agr = float(getattr(cfg, "MAJORITY_MIN_SIDE_AGREEMENT", 0.55) or 0.0)
-    if row.hold_pct + 1e-12 < floor:
+    min_agr = float(getattr(cfg, "MAJORITY_MIN_SIDE_AGREEMENT", 0.0) or 0.0)
+    if floor > 0.0 and row.hold_pct + 1e-12 < floor:
         return "hold_pct"
-    if row.agreement + 1e-12 < min_agr:
+    if min_agr > 0.0 and row.agreement + 1e-12 < min_agr:
         return "agreement"
     ctx = markets.get(row.coin)
     if ctx is not None:
@@ -221,8 +221,60 @@ def hold_key(coin: str, side: str) -> str:
     return f"{str(coin)}|{str(side or '').strip().lower()}"
 
 
+def rank_coin_key(raw: str) -> str:
+    """Collector ranks by coin. Old live state used coin|side."""
+    return str(raw or "").split("|", 1)[0].strip()
+
+
+def rank_map_from_state(raw: Any) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        coin = rank_coin_key(str(k))
+        if not coin:
+            continue
+        try:
+            out[coin] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def board_ranks(rows: list[HoldRow]) -> dict[str, int]:
-    return {hold_key(r.coin, r.side): i for i, r in enumerate(rows, start=1)}
+    return {r.coin: i for i, r in enumerate(rows, start=1)}
+
+
+def hold_rows_from_meta(rows: list[dict[str, Any]]) -> list[HoldRow]:
+    """Collector meta_index rows → HoldRow list, preserving collector rank order."""
+    ordered = sorted(
+        rows,
+        key=lambda r: (int(r.get("rank") or 10**9), str(r.get("coin") or "")),
+    )
+    out: list[HoldRow] = []
+    for r in ordered:
+        coin = str(r.get("coin") or "")
+        if not coin:
+            continue
+        side = str(r.get("side") or "long").strip().lower()
+        if side not in ("long", "short"):
+            side = "long"
+        out.append(
+            HoldRow(
+                coin=coin,
+                side=side,
+                wallets=int(r.get("wallets") or 0),
+                hold_pct=float(r.get("hold_pct") or 0),
+                agreement=float(r.get("agreement") or 0),
+                long_n=int(r.get("long_n") or 0),
+                short_n=int(r.get("short_n") or 0),
+                median_leverage=int(r.get("median_leverage") or 1),
+                mean_leverage=float(r.get("mean_leverage") or r.get("median_leverage") or 1),
+                avg_conviction=float(r.get("avg_conviction") or 0),
+                notional_usd=float(r.get("notional_usd") or 0),
+            )
+        )
+    return out
 
 
 def majority_enter_top(cfg: Any) -> int:
@@ -278,10 +330,11 @@ def plan_rank_targets(
     """
     enter_top = majority_enter_top(cfg)
     watch_n = majority_rank_watch(cfg)
+    prev = rank_map_from_state(prev_ranks)
     current = board_ranks(annotated)
-    by_key = {hold_key(r.coin, r.side): r for r in annotated}
+    by_coin = {r.coin: r for r in annotated}
     events: list[str] = []
-    if not prev_ranks:
+    if not prev:
         persist = {k: v for k, v in current.items() if v <= watch_n}
         return [], {
             "seed": True,
@@ -295,45 +348,45 @@ def plan_rank_targets(
 
     keep_rows: list[HoldRow] = []
     for coin, side in (held or {}).items():
-        k = hold_key(coin, side)
-        row = by_key.get(k)
-        cur = current.get(k)
-        prev = int(prev_ranks[k]) if k in prev_ranks else None
+        row = by_coin.get(coin)
+        cur = current.get(coin)
+        old = int(prev[coin]) if coin in prev else None
         if row is None or cur is None:
-            events.append(f"rank-drop EXIT {coin} {side} #{prev or '?'}→off")
+            events.append(f"rank-drop EXIT {coin} {side} #{old or '?'}→off")
             continue
-        if prev is not None and cur > prev:
-            events.append(f"rank-drop EXIT {coin} {side} #{prev}→#{cur}")
+        if old is not None and cur > old:
+            events.append(f"rank-drop EXIT {coin} {row.side} #{old}→#{cur}")
             continue
+        if row.side != side:
+            events.append(f"side-flip {coin} {side}→{row.side} #{cur}")
         keep_rows.append(row)
-        if prev is None:
-            events.append(f"hold {coin} {side} #{cur}")
-        elif cur < prev:
-            events.append(f"hold {coin} {side} #{prev}→#{cur} (up)")
+        if old is None:
+            events.append(f"hold {coin} {row.side} #{cur}")
+        elif cur < old:
+            events.append(f"hold {coin} {row.side} #{old}→#{cur} (up)")
         else:
-            events.append(f"hold {coin} {side} #{cur}")
+            events.append(f"hold {coin} {row.side} #{cur}")
 
-    keep_keys = {hold_key(r.coin, r.side) for r in keep_rows}
+    keep_coins = {r.coin for r in keep_rows}
     enters: list[HoldRow] = []
     for row in annotated:
         if row.skip:
             continue
-        k = hold_key(row.coin, row.side)
-        rank = current.get(k)
+        rank = current.get(row.coin)
         if rank is None or rank > enter_top:
             continue
-        if k in keep_keys:
+        if row.coin in keep_coins:
             continue
-        old = int(prev_ranks[k]) if k in prev_ranks else watch_n + 1
+        old = int(prev[row.coin]) if row.coin in prev else watch_n + 1
         if rank < old:
             enters.append(row)
-            old_txt = f"#{old}" if k in prev_ranks else "unranked"
+            old_txt = f"#{old}" if row.coin in prev else "unranked"
             events.append(
                 f"rank-up ENTER {row.coin} {row.side} {old_txt}→#{rank}"
             )
 
     slots = max(0, enter_top - len(keep_rows))
-    enters.sort(key=lambda r: current.get(hold_key(r.coin, r.side), 10**9))
+    enters.sort(key=lambda r: current.get(r.coin, 10**9))
     skipped_cap = enters[slots:]
     enters = enters[:slots]
     for row in skipped_cap:
@@ -345,7 +398,7 @@ def plan_rank_targets(
     targets = _targets_from_picked(picked, cfg)
     persist = {k: v for k, v in current.items() if v <= watch_n}
     for row in keep_rows:
-        persist[hold_key(row.coin, row.side)] = current[hold_key(row.coin, row.side)]
+        persist[row.coin] = current[row.coin]
     return targets, {
         "seed": False,
         "ranks": current,

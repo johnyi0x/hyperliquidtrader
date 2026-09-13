@@ -31,13 +31,14 @@ MIN_ORDER_NOTIONAL_USD = 10.0
 # Override at deploy: PMF_RUN_MODE=majority|crowd|copy|copy_reverse
 RUN_MODE = "majority"
 
-# Majority portfolio (RUN_MODE=majority). Top wallets by 7d ROI, no fill-tape
-# scalper/holder filter. Each wallet votes once per (coin, side) it holds.
+# Majority portfolio (RUN_MODE=majority). Board is collector meta_index
+# (1h UTC hours). Trading adds Hyperliquid prices; this bot never writes Neon.
 # Size of each pair = that pair's share of votes × OUR_GROSS_MARGIN_PCT.
-MAJORITY_REFRESH_HOURS = 2.5
-MAJORITY_MIN_HOLD_PCT = 0.05
-MAJORITY_EXIT_HOLD_PCT = 0.03
-MAJORITY_MIN_SIDE_AGREEMENT = 0.55
+MAJORITY_BOARD_SOURCE = "collector"  # collector = Neon/local sqlite; snap = old 200-wallet poll
+MAJORITY_REFRESH_HOURS = 1.0
+MAJORITY_MIN_HOLD_PCT = 0.0
+MAJORITY_EXIT_HOLD_PCT = 0.0
+MAJORITY_MIN_SIDE_AGREEMENT = 0.0
 MAJORITY_MIN_NOTIONAL_USD = 50.0
 MAJORITY_MAX_PAIR_SHARE = 0.70
 MAJORITY_MIN_COVERAGE = 0.70
@@ -124,7 +125,7 @@ BASKET_SIZE = 200
 # Leaderboard shortlist before audit. With filters off, research gather expands to
 # RESEARCH_POOL_SIZE automatically (see qualify.shortlist).
 CANDIDATE_POOL = 200
-BASKET_REFRESH_HOURS = 2.5
+BASKET_REFRESH_HOURS = 1.0
 # Reuse a cached leaderboard dump this long (avoids re-downloading 15k+ rows).
 LEADERBOARD_CACHE_HOURS = 2.0
 

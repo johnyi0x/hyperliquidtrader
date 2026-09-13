@@ -1,10 +1,11 @@
 # Always-on worker (not a website, not a cron).
 # Set secrets in the Railway dashboard — never in this file.
+# Trades the single row in rank_live.csv (copy from a backtest CSV).
 
 [build]
 builder = "RAILPACK"
 
 [deploy]
-startCommand = "PMF_PROFILE=cloud python profit-meta-follower/run.py"
+startCommand = "python run_rank.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
