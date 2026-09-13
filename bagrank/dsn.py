@@ -144,4 +144,8 @@ def default_live_sqlite_path() -> Path:
     if override:
         p = Path(override)
         return p if p.is_absolute() else REPO / p
+    volume = Path("/data")
+    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
+    if on_railway and volume.is_dir():
+        return volume / "bagrank" / "live.sqlite"
     return REPO / "data" / "bagrank" / "live.sqlite"

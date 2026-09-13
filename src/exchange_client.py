@@ -165,13 +165,7 @@ class HyperliquidClient:
         base_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
 
         account: LocalAccount = eth_account.Account.from_key(private_key)
-        if account.address.lower() != wallet_address.lower():
-            self.logger.warning(
-                "Private key address %s differs from HYPE_WALLET_ADDRESS %s; "
-                "using wallet address for queries and key for signing.",
-                account.address,
-                wallet_address,
-            )
+        # API agent key is allowed to differ from HYPE_WALLET_ADDRESS.
 
         self._hl_guard = request_guard or RequestGuard(
             min_interval_s=0.12,

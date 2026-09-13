@@ -302,7 +302,18 @@ def run_live(
             info = _info_only()
         except Exception as exc:
             log.warning("HL info client failed; public HTTP will still gather the board: %s", exc)
-    board = LiveBoard(sqlite_path, info) if refresh_board else None
+    keep_hours = max(1, int(spec.get("lookback") or 1) * max(1, int(spec.get("step_h") or 1)))
+    board = LiveBoard(sqlite_path, info, keep_hours=keep_hours) if refresh_board else None
+    volume = Path("/data")
+    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
+    if on_railway and not volume.is_dir():
+        log.info(
+            "Hourly board file %s is on the container disk; add a Railway volume mounted at /data so lookback hours survive restart.",
+            sqlite_path,
+        )
+    else:
+        log.info("Hourly board file %s", sqlite_path)
+    log.info("Rolling board window %sh (lookback=%s step=%s)", keep_hours, spec.get("lookback"), spec.get("step_h"))
     log.info(
         "Trading %s | board from Hyperliquid API (not Neon) | engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s",
         mode,

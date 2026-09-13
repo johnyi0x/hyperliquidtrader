@@ -470,7 +470,44 @@ def gather_cycle(info: Any, *, basket: int = BASKET_SIZE) -> dict[str, Any]:
     }
 
 
-def persist_cycle(sqlite_path: Path, payload: dict[str, Any], *, venue: str = "hyperliquid") -> None:
+def prune_old_hours(conn: Any, *, venue: str, keep_hours: int) -> int:
+    """Keep only the newest keep_hours cycle timestamps."""
+    keep = max(1, int(keep_hours))
+    rows = conn.execute(
+        """
+        SELECT DISTINCT cycle_ts FROM collector_runs
+        WHERE venue = ?
+        ORDER BY cycle_ts DESC
+        """,
+        (venue,),
+    ).fetchall()
+    drop = [str(r[0]) for r in rows[keep:]]
+    if not drop:
+        return 0
+    placeholders = ",".join("?" * len(drop))
+    args = (*drop, venue)
+    for table in (
+        "meta_index",
+        "coin_prices",
+        "collector_runs",
+        "wallet_books",
+        "wallet_positions",
+        "cohort_members",
+    ):
+        conn.execute(
+            f"DELETE FROM {table} WHERE cycle_ts IN ({placeholders}) AND venue = ?",
+            args,
+        )
+    return len(drop)
+
+
+def persist_cycle(
+    sqlite_path: Path,
+    payload: dict[str, Any],
+    *,
+    venue: str = "hyperliquid",
+    keep_hours: int | None = None,
+) -> None:
     cycle = str(payload["cycle_ts"])
     conn = connect(sqlite_path)
     try:
@@ -505,16 +542,26 @@ def persist_cycle(sqlite_path: Path, payload: dict[str, Any], *, venue: str = "h
         prices = list(payload.get("coin_prices") or [])
         if prices:
             upsert_rows(conn, "coin_prices", prices, venue=venue)
+        if keep_hours is not None:
+            prune_old_hours(conn, venue=venue, keep_hours=keep_hours)
         conn.commit()
     finally:
         conn.close()
 
 
 class LiveBoard:
-    def __init__(self, sqlite_path: Path, info: Any, *, refresh_s: float = BOARD_REFRESH_S) -> None:
+    def __init__(
+        self,
+        sqlite_path: Path,
+        info: Any,
+        *,
+        refresh_s: float = BOARD_REFRESH_S,
+        keep_hours: int = 6,
+    ) -> None:
         self.sqlite_path = sqlite_path
         self.info = info
         self.refresh_s = float(refresh_s)
+        self.keep_hours = max(1, int(keep_hours))
         self.last_at = 0.0
 
     def maybe_refresh(self) -> bool:
@@ -523,7 +570,7 @@ class LiveBoard:
         if getattr(self, "last_hour", "") == hour_key and self.last_at > 0:
             return False
         payload = gather_cycle(self.info)
-        persist_cycle(self.sqlite_path, payload)
+        persist_cycle(self.sqlite_path, payload, keep_hours=self.keep_hours)
         self.last_at = now
         self.last_hour = str(payload.get("cycle_ts") or hour_key)
         log.info(

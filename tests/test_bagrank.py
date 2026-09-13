@@ -930,6 +930,70 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertEqual(panel.coins, ["AAA"])
         self.assertAlmostEqual(float(panel.marks[0, 0]), 12.5)
 
+    def test_persist_keeps_rolling_lookback_window(self) -> None:
+        import tempfile
+
+        from bagrank.hlcycle import persist_cycle
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "live.sqlite"
+            for hour in range(8):
+                cycle = f"2026-09-12T{hour:02d}:00:00Z"
+                persist_cycle(
+                    path,
+                    {
+                        "cycle_ts": cycle,
+                        "listed": 1,
+                        "snapped_ok": 1,
+                        "snapped_err": 0,
+                        "empty_books": 0,
+                        "coverage": 1.0,
+                        "duration_s": 1.0,
+                        "status": "ok",
+                        "meta_index": [
+                            {
+                                "coin": "AAA",
+                                "side": "long",
+                                "wallets": 10,
+                                "hold_pct": 0.5,
+                                "agreement": 0.9,
+                                "long_n": 10,
+                                "short_n": 0,
+                                "median_leverage": 5,
+                                "mean_leverage": 5.0,
+                                "avg_conviction": 0.2,
+                                "notional_usd": 1000.0,
+                                "rank": 1,
+                            }
+                        ],
+                        "coin_prices": [
+                            {
+                                "cycle_ts": cycle,
+                                "coin": "AAA",
+                                "mark_px": 10.0 + hour,
+                                "source": "hl",
+                                "fetched_at": cycle,
+                            }
+                        ],
+                    },
+                    keep_hours=6,
+                )
+            conn = connect(path)
+            try:
+                hours = [
+                    str(r["cycle_ts"])
+                    for r in conn.execute(
+                        "SELECT cycle_ts FROM collector_runs ORDER BY cycle_ts"
+                    )
+                ]
+                n_meta = conn.execute("SELECT COUNT(*) AS n FROM meta_index").fetchone()["n"]
+                n_px = conn.execute("SELECT COUNT(*) AS n FROM coin_prices").fetchone()["n"]
+            finally:
+                conn.close()
+        self.assertEqual(hours, [f"2026-09-12T{h:02d}:00:00Z" for h in range(2, 8)])
+        self.assertEqual(n_meta, 6)
+        self.assertEqual(n_px, 6)
+
     def test_live_loop_uses_hl_board_not_neon(self) -> None:
         import inspect
 
