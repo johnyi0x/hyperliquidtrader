@@ -352,6 +352,7 @@ def run_live(
     )
     logged_wait = False
     while not _STOP:
+        panel = load_panel(sqlite_path) if sqlite_path.exists() else None
         have = 0 if panel is None else panel.n_times
         if have >= keep_hours:
             holds = lagged_holdings(panel, spec)

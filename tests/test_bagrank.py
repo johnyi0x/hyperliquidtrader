@@ -1055,6 +1055,7 @@ class UniverseAndDsnTests(unittest.TestCase):
 
         src = inspect.getsource(live.run_live)
         self.assertIn("LiveBoard", src)
+        self.assertIn("panel = load_panel", src)
         self.assertNotIn("sync_neon", src)
         self.assertNotIn("maybe_sync_backup", src)
         self.assertNotIn("NEON_BAGRANK", src)
