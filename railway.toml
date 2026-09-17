@@ -1,6 +1,6 @@
 # Always-on worker (not a website, not a cron).
 # Set secrets in the Railway dashboard — never in this file.
-# Trades the single row in rank_live.csv (copy from a backtest CSV).
+# Papers the single row in rank_live.csv. Real orders only with: python run_rank.py --live
 
 [build]
 builder = "RAILPACK"

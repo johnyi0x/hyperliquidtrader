@@ -14,7 +14,7 @@ import numpy as np
 
 from .dsn import default_sqlite_path, load_env
 from .kernels import N_FEAT, NAME_TO_ID, STRATEGY_NAMES, build_targets, simulate
-from .panel import panel_from_sqlite, resample_closed
+from .panel import last_days, panel_from_sqlite, resample_closed
 from .prices import fill_panel_from_collector, sync_hl_gaps
 from .search import ResultStore, data_span, run_one, search_loop
 from .specio import export_search_dir
@@ -240,6 +240,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--seed", type=int, default=None)
     p.add_argument(
+        "--days",
+        type=float,
+        default=7,
+        help="Use only the latest N days of the backup, ending at the newest hour (default 7). 0 = all hours.",
+    )
+    p.add_argument(
         "--export-csv",
         type=Path,
         default=None,
@@ -249,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.export_csv:
         csv_path = export_search_dir(args.export_csv)
-        log.info("Wrote sortable CSVs. Open %s (Sharpe), by_return.csv (profit), by_trades.csv.", csv_path)
+        log.info("Wrote sortable CSVs. Open %s (Sharpe), by_return.csv (profit), by_trades.csv, by_live.csv (1x strict).", csv_path)
         log.info("Copy one row into rank_live.csv, then: python run_rank.py")
         return 0
     if not args.db.exists():
@@ -266,12 +272,24 @@ def main(argv: list[str] | None = None) -> int:
         joined = fill_panel_from_collector(conn, hourly, venue=args.venue)
         if args.fetch_hl and int(joined.get("missing") or 0) > 0:
             sync_hl_gaps(conn, hourly)
+        hourly = last_days(hourly, args.days)
+        if hourly.n_times < 3:
+            raise SystemExit(
+                f"Need more collector hours in the last {args.days} days "
+                f"(have {hourly.n_times}). Run backup_bagrank.py or pass --days 0."
+            )
+        span_now = data_span(hourly)
         log.info(
-            "Using collector prices | filled=%s missing_on_board=%s | next-bar=%s lev=%s",
+            "Using collector prices | filled=%s missing_on_board=%s | next-bar=%s lev=%s | window=%sd %s → %s (%s hours, %s bars)",
             joined.get("filled"),
             joined.get("missing"),
             args.exec_lag,
             "on" if args.use_lev else "1x",
+            args.days if args.days > 0 else "all",
+            span_now["data_from"],
+            span_now["data_until"],
+            span_now["n_hours"],
+            span_now["n_bars"],
         )
         if not args.once:
             out_dir = args.search_dir or (args.db.parent / "search")
@@ -347,11 +365,13 @@ def main(argv: list[str] | None = None) -> int:
                 r.get("min_hold_h"),
             )
         log.info(
-            "Wrote %s strategies. Open in Excel and sort as you like:\n  Sharpe  %s\n  Profit  %s\n  Trades  %s\nAll rows %s",
+            "Wrote %s strategies. Open in Excel and sort as you like:\n  Sharpe  %s\n  Profit  %s\n  Trades  %s\n  Fitness %s\n  Live    %s\nAll rows %s",
             store.n,
             store.csv_sharpe,
             store.csv_return,
             store.csv_trades,
+            store.csv_fit,
+            store.csv_live,
             store.csv_all,
         )
         log.info("Copy one row into rank_live.csv, then: python run_rank.py")

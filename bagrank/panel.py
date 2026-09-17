@@ -78,6 +78,18 @@ class RankPanel:
         )
 
 
+def last_days(panel: RankPanel, days: float) -> RankPanel:
+    """Keep bars in the latest N calendar days ending at the newest hour. days<=0 keeps all."""
+    if panel.n_times == 0 or days is None or float(days) <= 0:
+        return panel
+    t1 = int(panel.cycle_unix[-1])
+    cutoff = t1 - int(round(float(days) * 86400.0))
+    idx = np.nonzero(panel.cycle_unix >= cutoff)[0]
+    if idx.size == 0 or idx.size == panel.n_times:
+        return panel
+    return panel.take(idx)
+
+
 def _zeros(t_n: int, c_n: int) -> dict[str, np.ndarray]:
     z64 = np.zeros((t_n, c_n), dtype=np.float64)
     return {name: z64.copy() for name in EXTRA}

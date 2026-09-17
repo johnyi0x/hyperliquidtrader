@@ -399,6 +399,59 @@ def crossover_spec(rng: random.Random, a: dict[str, Any], b: dict[str, Any]) -> 
     return out
 
 
+# by_live.csv: the #1 row is what we would paper. 1x, 1 slot, next-bar+ lag,
+# enough hold/bars so a 3-slot fade clone of a leveraged lottery cannot win.
+LIVE_MAX_DD_PCT = 20.0
+LIVE_MIN_TRIPS = 10
+LIVE_MAX_SLOTS = 1
+LIVE_MIN_RETURN_PCT = 20.0
+LIVE_MIN_SHARPE = 2.0
+LIVE_MIN_BARS = 40
+LIVE_MIN_WIN_RATE_PCT = 50.0
+LIVE_MAX_TRIPS_PER_DAY = 24.0
+LIVE_MIN_HOLD_H = 6
+LIVE_MIN_EXEC_LAG = 2
+
+
+def _num(row: dict[str, Any], key: str, spec_key: str | None = None, default: float = 0.0) -> float:
+    raw = row.get(key)
+    if raw in (None, ""):
+        spec = row.get("spec") if isinstance(row.get("spec"), dict) else {}
+        raw = spec.get(spec_key or key, default)
+    try:
+        return float(raw if raw not in (None, "") else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def live_ok(row: dict[str, Any]) -> bool:
+    """True if this trial is 1x and passes the live-sane cuts. Does not change the trial."""
+    if int(_num(row, "use_lev")) != 0:
+        return False
+    if int(_num(row, "round_trips")) < LIVE_MIN_TRIPS:
+        return False
+    if float(_num(row, "max_dd_pct")) > LIVE_MAX_DD_PCT:
+        return False
+    if int(_num(row, "slots", default=99)) > LIVE_MAX_SLOTS:
+        return False
+    if float(_num(row, "return_pct")) < LIVE_MIN_RETURN_PCT:
+        return False
+    if float(_num(row, "sharpe")) < LIVE_MIN_SHARPE:
+        return False
+    if int(_num(row, "n_bars")) < LIVE_MIN_BARS:
+        return False
+    if float(_num(row, "win_rate_pct")) < LIVE_MIN_WIN_RATE_PCT:
+        return False
+    tpd = float(_num(row, "trips_per_day"))
+    if tpd > LIVE_MAX_TRIPS_PER_DAY:
+        return False
+    if int(_num(row, "min_hold_h")) < LIVE_MIN_HOLD_H:
+        return False
+    if int(_num(row, "exec_lag")) < LIVE_MIN_EXEC_LAG:
+        return False
+    return True
+
+
 def fitness(row: dict[str, Any]) -> float:
     """Prefer real profit and enough trades. Clip 1-bar Sharpe spikes."""
     ret = float(row.get("return_pct") or 0)
@@ -532,6 +585,7 @@ class ResultStore:
         self.csv_return = self.directory / "by_return.csv"
         self.csv_trades = self.directory / "by_trades.csv"
         self.csv_fit = self.directory / "by_fitness.csv"
+        self.csv_live = self.directory / "by_live.csv"
         self.span = span
         self.n = 0
         self.best: dict[str, Any] | None = None
@@ -541,6 +595,7 @@ class ResultStore:
         self.by_return: list[dict[str, Any]] = []
         self.by_trades: list[dict[str, Any]] = []
         self.by_fit: list[dict[str, Any]] = []
+        self.by_live: list[dict[str, Any]] = []
         meta = {
             **span,
             "search_started_at": started,
@@ -578,6 +633,8 @@ class ResultStore:
         self._push_top(self.by_return, flat, "return_pct")
         self._push_top(self.by_trades, flat, "round_trips")
         self._push_top(self.by_fit, flat, "fitness")
+        if live_ok(flat):
+            self._push_top(self.by_live, flat, "fitness")
 
     def _push_top(self, bucket: list[dict[str, Any]], row: dict[str, Any], key: str, keep: int = 500) -> None:
         bucket.append(row)
@@ -590,6 +647,7 @@ class ResultStore:
             write_csv(self.csv_return, self.by_return)
             write_csv(self.csv_trades, self.by_trades)
             write_csv(self.csv_fit, self.by_fit)
+            write_csv(self.csv_live, self.by_live)
         except OSError as exc:
             log.warning("Could not write ranked CSV (close Excel if it is open): %s", exc)
 
@@ -618,13 +676,14 @@ def _next_spec(
     elite_fit: list[dict[str, Any]],
     elite_ret: list[dict[str, Any]],
     elite_sh: list[dict[str, Any]],
+    elite_live: list[dict[str, Any]],
     explore_p: float,
     mut_scale: float,
 ) -> dict[str, Any]:
     roll = rng.random()
     if roll < explore_p or not elite_fit:
         return sample_spec(rng)
-    pool = elite_fit + elite_ret + elite_sh
+    pool = elite_fit + elite_ret + elite_sh + elite_live
     if roll < explore_p + 0.12 and len(pool) >= 2:
         a = rng.choice(pool)["spec"]
         b = rng.choice(pool)["spec"]
@@ -633,6 +692,8 @@ def _next_spec(
         return mutate_spec(rng, rng.choice(elite_ret)["spec"], scale=mut_scale)
     if roll < explore_p + 0.12 + 0.22 + 0.18 and elite_sh:
         return mutate_spec(rng, rng.choice(elite_sh)["spec"], scale=mut_scale)
+    if elite_live and roll < explore_p + 0.12 + 0.22 + 0.18 + 0.22:
+        return mutate_spec(rng, rng.choice(elite_live)["spec"], scale=mut_scale)
     return mutate_spec(rng, rng.choice(elite_fit)["spec"], scale=mut_scale)
 
 
@@ -657,13 +718,15 @@ def search_loop(
     rng = random.Random(seed)
     store = ResultStore(out_dir, span)
     log.info(
-        "Writing this run to %s | by_return.csv=profit  leaderboard.csv=Sharpe  by_fitness.csv=blend",
+        "Writing this run to %s | by_return.csv=profit  leaderboard.csv=Sharpe  "
+        "by_fitness.csv=blend  by_live.csv=1x 1-slot lag>=2",
         store.directory,
     )
     seen: set[str] = set()
     elite_fit: list[dict[str, Any]] = []
     elite_ret: list[dict[str, Any]] = []
     elite_sh: list[dict[str, Any]] = []
+    elite_live: list[dict[str, Any]] = []
     recent: list[dict[str, Any]] = []
     signal.signal(signal.SIGINT, _request_stop)
     if hasattr(signal, "SIGTERM"):
@@ -688,6 +751,7 @@ def search_loop(
             elite_fit=elite_fit,
             elite_ret=elite_ret,
             elite_sh=elite_sh,
+            elite_live=elite_live,
             explore_p=explore_p,
             mut_scale=mut_scale,
         )
@@ -720,6 +784,8 @@ def search_loop(
         if trips >= 2:
             _push_elite(elite_ret, row, "return_pct", 24)
             _push_elite(elite_sh, row, "sharpe", 24)
+        if live_ok(row):
+            _push_elite(elite_live, row, "fitness", 36)
         ret_now = float((store.best_ret or {}).get("return_pct") or -1e18)
         fit_now = float((store.best_fit or {}).get("fitness") or -1e18)
         if ret_now > last_best_ret + 1e-9:
@@ -733,13 +799,14 @@ def search_loop(
         else:
             idle_fit += 1
         if store.n % 25 == 0:
-            store.write_leaderboard(elite_fit + elite_ret + recent[-40:])
+            store.write_leaderboard(elite_fit + elite_ret + elite_live + recent[-40:])
             br = store.best_ret or {}
             bs = store.best or {}
             bf = store.best_fit or {}
+            bl = store.by_live[0] if store.by_live else {}
             rate = store.n / max(time.time() - t0, 1e-6)
             log.info(
-                "trials=%s (%.1f/s)  BEST RET %s%% sh=%s trips=%s gross=%s%%  |  best sh=%s ret=%s%%  |  fit=%s  idle_ret=%s  %s",
+                "trials=%s (%.1f/s)  BEST RET %s%% sh=%s trips=%s gross=%s%%  |  best sh=%s ret=%s%%  |  fit=%s  |  live %s%% sh=%s slots=%s n=%s  idle_ret=%s  %s",
                 store.n,
                 rate,
                 br.get("return_pct"),
@@ -749,16 +816,21 @@ def search_loop(
                 bs.get("sharpe"),
                 bs.get("return_pct"),
                 bf.get("fitness"),
+                bl.get("return_pct"),
+                bl.get("sharpe"),
+                bl.get("slots"),
+                len(store.by_live),
                 idle_ret,
                 store.directory.name,
             )
-    store.write_leaderboard(elite_fit + elite_ret + recent[-40:])
+    store.write_leaderboard(elite_fit + elite_ret + elite_live + recent[-40:])
     log.info(
-        "Stopped after %s trials. Open these CSVs and sort columns in Excel:\n  %s\n  %s\n  %s\n  %s\nCopy one full row into rank_live.csv then python run_rank.py",
+        "Stopped after %s trials. Open these CSVs and sort columns in Excel:\n  %s\n  %s\n  %s\n  %s\n  %s\nCopy one full row into rank_live.csv then python run_rank.py",
         store.n,
         store.csv_return,
         store.csv_sharpe,
         store.csv_fit,
         store.csv_trades,
+        store.csv_live,
     )
     return 0

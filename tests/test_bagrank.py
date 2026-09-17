@@ -850,6 +850,9 @@ class UniverseAndDsnTests(unittest.TestCase):
             self.assertEqual(by_ret[0]["return_pct"], "50")
             by_tr = read_csv_rows(folder / "by_trades.csv")
             self.assertEqual(by_tr[0]["round_trips"], "99")
+            self.assertTrue((folder / "by_fitness.csv").exists())
+            self.assertTrue((folder / "by_live.csv").exists())
+            self.assertEqual(read_csv_rows(folder / "by_live.csv"), [])
 
     def test_fitness_prefers_real_profit_over_empty_sharpe(self) -> None:
         from bagrank.search import fitness, sample_spec
@@ -862,6 +865,107 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn("size_mode", spec)
         self.assertIn("exposure_mode", spec)
         self.assertGreaterEqual(len(spec.get("weights") or spec.get("name") or ""), 1)
+
+    def test_last_days_keeps_newest_window(self) -> None:
+        from bagrank.panel import last_days
+
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(10)]
+        rows = [_meta(cycle, "AAA", 1, 10) for cycle in hours]
+        panel = panel_from_meta_rows(rows)
+        sliced = last_days(panel, 3.0 / 24.0)
+        self.assertEqual(sliced.n_times, 4)
+        self.assertEqual(int(sliced.cycle_unix[0]), int(panel.cycle_unix[6]))
+        self.assertEqual(last_days(panel, 0).n_times, 10)
+        self.assertEqual(last_days(panel, 7).n_times, 10)
+
+    def test_live_ok_requires_1x_and_strict_cuts(self) -> None:
+        from bagrank.search import live_ok
+
+        good = {
+            "use_lev": 0,
+            "round_trips": 18,
+            "max_dd_pct": 8.5,
+            "slots": 1,
+            "return_pct": 47.0,
+            "sharpe": 13.0,
+            "n_bars": 44,
+            "win_rate_pct": 66.0,
+            "trips_per_day": 3.3,
+            "min_hold_h": 6,
+            "exec_lag": 2,
+        }
+        self.assertTrue(live_ok(good))
+        self.assertFalse(live_ok(dict(good, use_lev=1)))
+        self.assertFalse(live_ok(dict(good, max_dd_pct=80)))
+        self.assertFalse(live_ok(dict(good, slots=2)))
+        self.assertFalse(live_ok(dict(good, round_trips=3)))
+        self.assertFalse(live_ok(dict(good, return_pct=5)))
+        self.assertFalse(live_ok(dict(good, min_hold_h=2)))
+        self.assertFalse(live_ok(dict(good, exec_lag=1)))
+        self.assertFalse(live_ok(dict(good, n_bars=20)))
+
+    def test_by_live_csv_keeps_only_strict_1x_rows(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from bagrank.search import ResultStore
+        from bagrank.specio import read_csv_rows
+
+        span = {
+            "data_from": "2026-01-01T00:00:00Z",
+            "data_until": "2026-01-03T00:00:00Z",
+            "data_from_unix": 1,
+            "data_until_unix": 2,
+            "n_hours": 48,
+            "n_bars": 44,
+            "n_coins": 2,
+        }
+
+        def trial(*, lev: int, ret: float, dd: float, slots: int, trips: int, family: str) -> dict:
+            return {
+                "return_pct": ret,
+                "sharpe": 13.0,
+                "fitness": ret,
+                "max_dd_pct": dd,
+                "final_equity": 1400,
+                "round_trips": trips,
+                "trips_per_day": 3.0,
+                "avg_hold_h": 6,
+                "win_rate_pct": 66,
+                "fees": 1,
+                "n_hours": 48,
+                "n_bars": 44,
+                "n_coins": 2,
+                "data_from": span["data_from"],
+                "data_until": span["data_until"],
+                "spec": {
+                    "family": family,
+                    "engine": "score",
+                    "name": family,
+                    "step_h": 3,
+                    "min_hold_h": 6,
+                    "enter_top": 30,
+                    "slots": slots,
+                    "exec_lag": 2,
+                    "use_lev": lev,
+                    "gross_pct": 125,
+                    "mode": 0,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ResultStore(Path(tmp), span)
+            store.append(trial(lev=1, ret=3000, dd=80, slots=9, trips=24, family="flip_majority"))
+            store.append(trial(lev=0, ret=48, dd=3.0, slots=3, trips=26, family="flip_majority"))
+            store.append(trial(lev=0, ret=47, dd=8.5, slots=1, trips=18, family="rank_mom"))
+            store.write_csvs()
+            live = read_csv_rows(store.csv_live)
+            self.assertEqual(len(live), 1)
+            self.assertEqual(live[0]["family"], "rank_mom")
+            self.assertEqual(live[0]["use_lev"], "0")
+            fit = read_csv_rows(store.csv_fit)
+            self.assertEqual(len(fit), 3)
+            self.assertTrue(store.csv_return.exists())
 
     def test_run_one_keeps_spec_gross_pct(self) -> None:
         from bagrank.search import run_one, sample_spec
@@ -1056,9 +1160,14 @@ class UniverseAndDsnTests(unittest.TestCase):
         src = inspect.getsource(live.run_live)
         self.assertIn("LiveBoard", src)
         self.assertIn("panel = load_panel", src)
+        self.assertIn("_mids_from_info", src)
         self.assertNotIn("sync_neon", src)
         self.assertNotIn("maybe_sync_backup", src)
         self.assertNotIn("NEON_BAGRANK", src)
+        main_src = inspect.getsource(live.main)
+        self.assertNotIn("on_railway", main_src)
+        self.assertIn('mode = "paper"', main_src)
+        self.assertIn('mode = "live"', main_src)
 
 
 if __name__ == "__main__":

@@ -233,7 +233,7 @@ def require_strategy_row(row: dict[str, str], source: str = LIVE_CSV_NAME) -> No
         return
     raise SystemExit(
         f"{source} has no strategy row. Copy one FULL row from a backtest CSV "
-        f"(leaderboard.csv / by_return.csv / by_trades.csv) and paste it as row 2 in {LIVE_CSV_NAME}."
+        f"(by_live.csv / leaderboard.csv / by_return.csv / by_trades.csv) and paste it as row 2 in {LIVE_CSV_NAME}."
     )
 
 
@@ -371,7 +371,13 @@ def export_search_dir(directory: Path) -> Path:
     by_sharpe = sorted(rows, key=lambda r: (-float(r.get("sharpe") or 0), -float(r.get("return_pct") or 0)))
     by_return = sorted(rows, key=lambda r: (-float(r.get("return_pct") or 0), -float(r.get("sharpe") or 0)))
     by_trades = sorted(rows, key=lambda r: (-float(r.get("round_trips") or 0), -float(r.get("sharpe") or 0)))
+    by_fit = sorted(rows, key=lambda r: (-float(r.get("fitness") or 0), -float(r.get("return_pct") or 0)))
+    from .search import live_ok
+
+    by_live = [r for r in by_fit if live_ok(r)]
     write_csv(directory / "leaderboard.csv", by_sharpe)
     write_csv(directory / "by_return.csv", by_return)
     write_csv(directory / "by_trades.csv", by_trades)
+    write_csv(directory / "by_fitness.csv", by_fit)
+    write_csv(directory / "by_live.csv", by_live)
     return directory / "leaderboard.csv"

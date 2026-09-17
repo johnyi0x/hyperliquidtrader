@@ -155,9 +155,11 @@ def _make_client():
     return HyperliquidClient(wallet, key, "BTC", log)
 
 
-def _mids(client) -> dict[str, float]:
+def _mids_from_info(info) -> dict[str, float]:
+    if info is None:
+        return {}
     try:
-        raw = client.info.all_mids()
+        raw = info.all_mids()
     except Exception as exc:
         log.warning("all_mids failed: %s", exc)
         return {}
@@ -171,6 +173,10 @@ def _mids(client) -> dict[str, float]:
             if v > 0:
                 out[str(coin)] = v
     return out
+
+
+def _mids(client) -> dict[str, float]:
+    return _mids_from_info(getattr(client, "info", None))
 
 
 def _pos_side(pos: Any) -> str:
@@ -358,15 +364,18 @@ def run_live(
             holds = lagged_holdings(panel, spec)
             equity = float(spec.get("equity") or 1000.0)
             marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
+            try:
+                marks.update(_mids_from_info(info))
+            except Exception as exc:
+                log.warning("HL mids failed: %s", exc)
+            for h in holds:
+                if h["coin"] in marks:
+                    h["px"] = marks[h["coin"]]
             if client is not None:
                 try:
                     equity = float(client.get_account_value(force=True) or equity)
-                    marks.update(_mids(client))
-                    for h in holds:
-                        if h["coin"] in marks:
-                            h["px"] = marks[h["coin"]]
                 except Exception as exc:
-                    log.warning("Live marks/equity failed: %s", exc)
+                    log.warning("Live equity failed: %s", exc)
             elif book is not None:
                 equity = book.equity(marks)
             sized = _weight_targets(
@@ -445,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--row", type=int, default=2, help="Excel row including header (2 = the pasted strategy)")
     p.add_argument("--db", type=Path, default=default_live_sqlite_path())
-    p.add_argument("--paper", action="store_true", help="Simulated fills (default when not on Railway)")
+    p.add_argument("--paper", action="store_true", help="Simulated fills (default). Same signals as --live.")
     p.add_argument("--live", action="store_true", help="Send real Hyperliquid orders")
     p.add_argument("--dry-run", action="store_true", help="Print targets only")
     p.add_argument("--poll", type=float, default=30.0)
@@ -472,12 +481,9 @@ def main(argv: list[str] | None = None) -> int:
     spec = spec_from_row(raw)
     if spec.get("engine") == "named" and spec.get("name") not in NAME_TO_ID:
         raise SystemExit(f"Unknown strategy name {spec.get('name')!r} in {csv_path}")
-    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
     if args.dry_run:
         mode = "dry"
-    elif args.paper:
-        mode = "paper"
-    elif args.live or on_railway:
+    elif args.live:
         mode = "live"
     else:
         mode = "paper"
