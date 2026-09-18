@@ -220,6 +220,19 @@ def shortlist_top_roi(rows: list[dict[str, Any]], *, rank_window: str = RANK_WIN
     return [addr for _roi, addr in scored[: max(1, int(limit))]]
 
 
+def shortlist_top_pnl(rows: list[dict[str, Any]], *, rank_window: str = RANK_WINDOW, limit: int = BASKET_SIZE) -> list[str]:
+    """Top wallets by window PnL (same metric as the PnL collector), not ROI."""
+    key = WINDOW_ALIAS.get(str(rank_window).strip(), str(rank_window).strip())
+    scored: list[tuple[float, str]] = []
+    for row in rows:
+        block = (row.get("windows") or {}).get(key) or (row.get("windows") or {}).get(rank_window)
+        if not isinstance(block, dict):
+            continue
+        scored.append((float(block.get("pnl") or 0), str(row["address"])))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [addr for _pnl, addr in scored[: max(1, int(limit))]]
+
+
 def fetch_leaderboard(timeout_s: float = 90.0) -> list[dict[str, Any]]:
     last: Exception | None = None
     for url in LEADERBOARD_URLS:
@@ -429,14 +442,28 @@ def should_append_hour(last_cycle: str, closed: str) -> bool:
     return closed > last_cycle
 
 
-def gather_cycle(info: Any, *, basket: int = BASKET_SIZE, cycle_ts: str | None = None) -> dict[str, Any]:
+def gather_cycle(
+    info: Any,
+    *,
+    basket: int = BASKET_SIZE,
+    cycle_ts: str | None = None,
+    rank_by: str = "roi",
+) -> dict[str, Any]:
     started = time.time()
     cycle_ts = cycle_ts or closed_cycle_ts()
     rows = fetch_leaderboard()
-    addrs = shortlist_top_roi(rows, limit=basket)
+    by = "pnl" if str(rank_by or "").strip().lower() == "pnl" else "roi"
+    if by == "pnl":
+        addrs = shortlist_top_pnl(rows, limit=basket)
+        cohort = f"top{basket}_{RANK_WINDOW}_pnl"
+        label = "top-week PnL"
+    else:
+        addrs = shortlist_top_roi(rows, limit=basket)
+        cohort = f"top{basket}_{RANK_WINDOW}"
+        label = "top-week ROI"
     if not addrs:
         raise RuntimeError("HL leaderboard shortlist empty")
-    log.info("Snapshotting %s top-week wallets from Hyperliquid", len(addrs))
+    log.info("Snapshotting %s %s wallets from Hyperliquid", len(addrs), label)
     books: list[dict[str, Any]] = []
     flags = {"all_dexes_ok": True}
     for i, addr in enumerate(addrs, start=1):
@@ -481,6 +508,8 @@ def gather_cycle(info: Any, *, basket: int = BASKET_SIZE, cycle_ts: str | None =
         "meta_index": index_rows,
         "coin_prices": prices,
         "status": "ok" if coverage >= 0.7 else ("partial" if ok else "failed"),
+        "cohort": cohort,
+        "rank_by": by,
     }
 
 
@@ -545,7 +574,7 @@ def persist_cycle(
                     "leaderboard_refreshed": 1,
                     "error": "",
                     "duration_s": payload.get("duration_s"),
-                    "cohort": f"top{BASKET_SIZE}_{RANK_WINDOW}",
+                    "cohort": payload.get("cohort") or f"top{BASKET_SIZE}_{RANK_WINDOW}",
                 }
             ],
             venue=venue,
@@ -571,11 +600,13 @@ class LiveBoard:
         *,
         refresh_s: float = BOARD_REFRESH_S,
         keep_hours: int = 6,
+        rank_by: str = "roi",
     ) -> None:
         self.sqlite_path = sqlite_path
         self.info = info
         self.refresh_s = float(refresh_s)
         self.keep_hours = max(1, int(keep_hours))
+        self.rank_by = "pnl" if str(rank_by or "").strip().lower() == "pnl" else "roi"
         self.last_at = 0.0
         self.last_hour = ""
         try:
@@ -591,12 +622,13 @@ class LiveBoard:
         closed = closed_cycle_ts()
         if not should_append_hour(self.last_hour, closed):
             return False
-        payload = gather_cycle(self.info, cycle_ts=closed)
+        payload = gather_cycle(self.info, cycle_ts=closed, rank_by=self.rank_by)
         persist_cycle(self.sqlite_path, payload, keep_hours=self.keep_hours)
         self.last_at = time.time()
         self.last_hour = str(payload.get("cycle_ts") or closed)
         log.info(
-            "HL board hour %s | coins=%s coverage=%.0f%% snapped=%s/%s in %.1fs",
+            "HL %s board hour %s | coins=%s coverage=%.0f%% snapped=%s/%s in %.1fs",
+            self.rank_by,
             payload["cycle_ts"],
             len(payload.get("meta_index") or []),
             float(payload.get("coverage") or 0) * 100.0,

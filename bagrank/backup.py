@@ -10,7 +10,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .dsn import default_sqlite_path, load_env, open_neon, redacted_dsn, resolve_database_url
+from .dsn import (
+    default_pnl_sqlite_path,
+    default_sqlite_path,
+    load_env,
+    open_neon,
+    redacted_dsn,
+    resolve_database_url,
+    resolve_pnl_database_url,
+)
 from .store import (
     CYCLE_TABLES,
     connect,
@@ -128,8 +136,8 @@ class NeonSource(Source):
                 time.sleep(delay)
         if self.conn is None:
             raise RuntimeError(
-                "Could not connect to Neon. Set NEON_BAGRANK in this repo's .env "
-                "to the collector DB URI (direct host, sslmode=require). "
+                "Could not connect to Neon. Set NEON_BAGRANK (ROI) or NEON_PNL (PnL) "
+                "in this repo's .env to the collector DB URI (direct host, sslmode=require). "
                 "Wake the project in the Neon console if it is idle. Last error: %s"
                 % last
             ) from last
@@ -488,17 +496,61 @@ def seed_recent_board(
         neon.close()
 
 
+def seed_local_hours(
+    src: Path,
+    dest: Path,
+    hours: int,
+    *,
+    venue: str = VENUE_DEFAULT,
+) -> int:
+    """Copy the last N hours from a local backup sqlite. Never talks to Neon."""
+    if not src.exists():
+        return 0
+    if src.resolve() == dest.resolve():
+        return 0
+    from .hlcycle import prune_old_hours
+
+    keep = max(1, int(hours))
+    source = SqliteSource(src)
+    try:
+        cycles = source.list_cycles(venue, None)
+        cycles = cycles[-keep:]
+        if not cycles:
+            return 0
+        conn = connect(dest)
+        try:
+            for table in ("collector_runs", "meta_index", "coin_prices"):
+                rows = source.fetch_table(table, venue, cycles)
+                if rows:
+                    upsert_rows(conn, table, rows, venue=venue)
+            prune_old_hours(conn, venue=venue, keep_hours=keep)
+            conn.commit()
+        finally:
+            conn.close()
+        return len(cycles)
+    finally:
+        source.close()
+
+
 def sync_neon(
     sqlite_path: Path,
     *,
     dsn: str = "",
     venue: str = VENUE_DEFAULT,
+    kind: str = "roi",
 ) -> dict[str, Any]:
-    url, src = resolve_database_url(dsn)
+    if kind == "pnl":
+        url, src = resolve_pnl_database_url(dsn)
+        hint = "NEON_PNL"
+        label = "PnL collector"
+    else:
+        url, src = resolve_database_url(dsn)
+        hint = "NEON_BAGRANK"
+        label = "ROI collector"
     if not url:
         raise RuntimeError(
-            "No database URL. Set NEON_BAGRANK in hl-multi-strategy-bot/.env "
-            "(read-only Neon URI for the collector). Prefer the direct host "
+            f"No database URL. Set {hint} in hl-multi-strategy-bot/.env "
+            f"(read-only Neon URI for the {label}). Prefer the direct host "
             "(no -pooler) with sslmode=require."
         )
     log.info("Connecting to Neon read-only via %s → %s", src, redacted_dsn(url))
@@ -522,11 +574,20 @@ def print_status(sqlite_path: Path, *, venue: str = VENUE_DEFAULT) -> None:
         conn.close()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, kind: str = "roi") -> int:
     load_env()
+    is_pnl = kind == "pnl"
+    sqlite_default = default_pnl_sqlite_path() if is_pnl else default_sqlite_path()
+    label = "PnL-ranked" if is_pnl else "ROI-ranked"
+    env_name = "NEON_PNL" if is_pnl else "NEON_BAGRANK"
+    sqlite_help = (
+        "Local sqlite path (default data/pnlrank/pnlrank.sqlite)"
+        if is_pnl
+        else "Local sqlite path (default data/bagrank/bagrank.sqlite)"
+    )
     p = argparse.ArgumentParser(
         description=(
-            "Read-only incremental backup of collector Neon tables to this PC. "
+            f"Read-only incremental backup of the {label} collector Neon tables to this PC. "
             "First run stores everything (including coin_prices). Later runs "
             "pull new hours plus any price backfills on older hours."
         )
@@ -534,10 +595,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--db",
         type=Path,
-        default=default_sqlite_path(),
-        help="Local sqlite path (default data/bagrank/bagrank.sqlite)",
+        default=sqlite_default,
+        help=sqlite_help,
     )
-    p.add_argument("--dsn", default="", help="Neon URI (otherwise env)")
+    p.add_argument("--dsn", default="", help=f"Neon URI (otherwise {env_name} in .env)")
     p.add_argument("--venue", default=VENUE_DEFAULT)
     p.add_argument("--status", action="store_true", help="Print local backup stats and exit")
     args = p.parse_args(argv)
@@ -548,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         print_status(args.db, venue=args.venue)
         return 0
-    sync_neon(args.db, dsn=args.dsn, venue=args.venue)
+    sync_neon(args.db, dsn=args.dsn, venue=args.venue, kind=kind)
     print_status(args.db, venue=args.venue)
     return 0
 

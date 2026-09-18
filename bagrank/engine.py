@@ -16,6 +16,9 @@ def compute_targets(panel: RankPanel, spec: dict[str, Any]) -> tuple:
     if spec.get("engine") == "named":
         name = str(spec.get("name") or "top_k")
         sid = int(NAME_TO_ID[name])
+        if name == "follow_rank1":
+            slots = 1
+            top = 1
         tc, ts, tw, tl = build_targets(
             panel.rank,
             panel.side,
@@ -126,12 +129,16 @@ def lagged_holdings(hourly: RankPanel, spec: dict[str, Any]) -> list[dict[str, A
         if sd == 0:
             continue
         px = float(panel.marks[t, c])
+        mx = 0.0
+        if getattr(panel, "max_leverage", None) is not None and c < int(panel.max_leverage.shape[0]):
+            mx = float(panel.max_leverage[c])
         out.append(
             {
                 "coin": panel.coins[c],
                 "side": "long" if sd > 0 else "short",
                 "wallets": float(tw[src, j] if tw[src, j] > 0 else 1.0),
                 "lev": float(tl[src, j] if tl[src, j] >= 1.0 else 1.0),
+                "max_lev": mx,
                 "px": px,
                 "bar_unix": int(panel.cycle_unix[t]),
                 "signal_unix": int(panel.cycle_unix[src]),

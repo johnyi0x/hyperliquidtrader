@@ -14,6 +14,7 @@ import numpy as np
 
 from .dsn import default_sqlite_path, load_env
 from .kernels import N_FEAT, NAME_TO_ID, STRATEGY_NAMES, build_targets, simulate
+from .lev import DEFAULT_LEV_X, apply_exchange_max_lev
 from .panel import last_days, panel_from_sqlite, resample_closed
 from .prices import fill_panel_from_collector, sync_hl_gaps
 from .search import ResultStore, data_span, run_one, search_loop
@@ -66,6 +67,7 @@ def default_variants() -> list[dict[str, Any]]:
         rows.append(_variant("rank_breakout", enter_top=top, slots=slots, k=14, lookback=24))
         rows.append(_variant("wallets_ema", enter_top=top, slots=slots, a=8.0, b=21.0))
         rows.append(_variant("wallets_ema", enter_top=top, slots=slots, a=21.0, b=55.0))
+    rows.append(_variant("follow_rank1", enter_top=1, slots=1))
     return rows
 
 
@@ -117,6 +119,7 @@ def run_strategies(
     use_lev: int = 0,
     bar_hours: float = 1.0,
     step_hours: int = 1,
+    lev_x: float = DEFAULT_LEV_X,
 ) -> list[dict[str, Any]]:
     variants = variants or DEFAULT_VARIANTS
     gross = max(0.01, min(1.0, float(gross_pct) / 100.0))
@@ -156,6 +159,9 @@ def run_strategies(
             int(min_hold),
             int(use_lev),
             float(bar_hours),
+            0,
+            getattr(panel, "max_leverage", None),
+            0.0 if use_lev else float(lev_x),
         )
         span_h = 0.0
         if panel.n_times >= 2:
@@ -187,11 +193,12 @@ def run_strategies(
     return rows
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, kind: str = "roi") -> int:
     load_env()
+    board = "pnl" if str(kind).strip().lower() == "pnl" else "roi"
     p = argparse.ArgumentParser(
         description=(
-            "Search rank/feature strategies on local collector hours until Ctrl+C. "
+            f"Search rank/feature strategies on the local {board.upper()} collector backup until Ctrl+C. "
             "Use --once for a single finite grid."
         )
     )
@@ -209,6 +216,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--exec-lag", type=int, default=1, help="1 = fill next bar (no same-hour trade).")
     p.add_argument("--use-lev", action="store_true", help="Multiply size by collector mean leverage.")
+    p.add_argument(
+        "--lev-x",
+        type=float,
+        default=DEFAULT_LEV_X,
+        dest="lev_x",
+        help=(
+            "When use_lev=0, size each pair at floor(maxLev / this) as a whole number. "
+            "1x when maxLev is below this (default 3)."
+        ),
+    )
     p.add_argument(
         "--enter-top",
         type=int,
@@ -255,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.export_csv:
         csv_path = export_search_dir(args.export_csv)
-        log.info("Wrote sortable CSVs. Open %s (Sharpe), by_return.csv (profit), by_trades.csv, by_live.csv (1x strict).", csv_path)
+        log.info("Wrote sortable CSVs. Open %s (Sharpe), by_return.csv (profit), by_trades.csv, by_live.csv (live-usable).", csv_path)
         log.info("Copy one row into rank_live.csv, then: python run_rank.py")
         return 0
     if not args.db.exists():
@@ -278,13 +295,18 @@ def main(argv: list[str] | None = None) -> int:
                 f"Need more collector hours in the last {args.days} days "
                 f"(have {hourly.n_times}). Run backup_bagrank.py or pass --days 0."
             )
+        mapping = apply_exchange_max_lev(hourly)
         span_now = data_span(hourly)
+        lev_label = "wallet-mean" if args.use_lev else f"lev_x={args.lev_x} (floor(maxLev/x) int, 1x if maxLev<x)"
         log.info(
-            "Using collector prices | filled=%s missing_on_board=%s | next-bar=%s lev=%s | window=%sd %s → %s (%s hours, %s bars)",
+            "Using collector prices | filled=%s missing_on_board=%s | next-bar=%s lev=%s | "
+            "HL maxLev for %s coins | board=%s | window=%sd %s → %s (%s hours, %s bars)",
             joined.get("filled"),
             joined.get("missing"),
             args.exec_lag,
-            "on" if args.use_lev else "1x",
+            lev_label,
+            len(mapping),
+            board,
             args.days if args.days > 0 else "all",
             span_now["data_from"],
             span_now["data_until"],
@@ -300,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
                 gross_pct=args.gross_pct,
                 max_pair_share=args.max_pair_share,
                 seed=args.seed,
+                lev_x=args.lev_x,
+                board=board,
             )
         variants = [dict(v) for v in DEFAULT_VARIANTS]
         if args.strategy:
@@ -308,10 +332,12 @@ def main(argv: list[str] | None = None) -> int:
             variants = [v for v in variants if v["name"] == args.strategy]
         if args.enter_top >= 0:
             for v in variants:
-                v["enter_top"] = args.enter_top
+                if v["name"] != "follow_rank1":
+                    v["enter_top"] = args.enter_top
         if args.slots > 0:
             for v in variants:
-                v["slots"] = args.slots
+                if v["name"] != "follow_rank1":
+                    v["slots"] = args.slots
         out_dir = args.search_dir or (args.db.parent / "search")
         store = ResultStore(out_dir, data_span(hourly))
         log.info("Writing CSV results to %s", store.directory)
@@ -322,12 +348,14 @@ def main(argv: list[str] | None = None) -> int:
                         "engine": "named",
                         "family": variant["name"],
                         "name": variant["name"],
+                        "board": board,
                         "step_h": int(step),
                         "min_hold_h": int(hold_h),
                         "enter_top": int(variant.get("enter_top") or 0),
                         "slots": max(1, int(variant.get("slots") or 5)),
                         "exec_lag": int(args.exec_lag),
                         "use_lev": 1 if args.use_lev else 0,
+                        "lev_x": float(args.lev_x),
                         "k": int(variant.get("k") or 1),
                         "lookback": int(variant.get("lookback") or 1),
                         "a": float(variant.get("a") or 0),

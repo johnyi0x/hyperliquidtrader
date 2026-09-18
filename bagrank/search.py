@@ -31,6 +31,7 @@ from .kernels import (
     simulate,
 )
 from .engine import compute_targets
+from .lev import DEFAULT_LEV_X, apply_exchange_max_lev
 from .panel import RankPanel, resample_closed
 from .specio import append_csv, flatten_result, write_csv
 from .timeutil import to_iso
@@ -99,6 +100,16 @@ def run_folder_name(span: dict[str, Any], started: str) -> str:
     if stamp.endswith("Z") and "T" in stamp:
         stamp = stamp[:-1] + "Z"
     return f"run_{stamp}_{tag}"
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(out):
+        return default
+    return out
 
 
 def data_span(panel: RankPanel) -> dict[str, Any]:
@@ -215,7 +226,29 @@ def _preset(name: str) -> np.ndarray:
     return w
 
 
-def sample_spec(rng: random.Random, *, named_ok: bool = True) -> dict[str, Any]:
+def sample_spec(rng: random.Random, *, named_ok: bool = True, board: str = "roi") -> dict[str, Any]:
+    by = "pnl" if str(board or "roi").strip().lower() == "pnl" else "roi"
+    if by == "pnl" and rng.random() < 0.42:
+        hold_h = rng.choice((0, 8, 12, 24, 36, 48, 72))
+        step = rng.choice((1, 2, 4, 8))
+        return {
+            "family": "follow_rank1",
+            "engine": "named",
+            "name": "follow_rank1",
+            "board": "pnl",
+            "step_h": step,
+            "min_hold_h": hold_h,
+            "enter_top": 1,
+            "slots": 1,
+            "exec_lag": rng.choice((1, 1, 2)),
+            "use_lev": 0,
+            "lev_x": DEFAULT_LEV_X,
+            "gross_pct": float(rng.choice((80, 95, 110, 125, 140))),
+            "max_pair_share": 1.0,
+            "size_mode": 0,
+            "exposure_mode": 0,
+            "lookback": 1,
+        }
     family = rng.choice(FAMILIES)
     if family == "named" and not named_ok:
         family = "composite"
@@ -251,7 +284,9 @@ def sample_spec(rng: random.Random, *, named_ok: bool = True) -> dict[str, Any]:
         "slots": slots,
         "exec_lag": exec_lag,
         "use_lev": use_lev,
+        "lev_x": DEFAULT_LEV_X,
         "engine": "score",
+        "board": by,
         "gross_pct": gross,
         "max_pair_share": pair,
         "size_mode": size_mode,
@@ -339,6 +374,8 @@ def mutate_spec(rng: random.Random, spec: dict[str, Any], *, scale: float = 0.25
         out["exposure_mode"] = int(rng.choice((0, 1, 2, 3)))
     if rng.random() < 0.2:
         out["use_lev"] = 1 - int(out.get("use_lev") or 0)
+    if out.get("lev_x") in (None, ""):
+        out["lev_x"] = DEFAULT_LEV_X
     top = int(out.get("enter_top") or 0)
     if top > 0:
         out["slots"] = min(max(1, int(out["slots"])), top)
@@ -360,6 +397,13 @@ def mutate_spec(rng: random.Random, spec: dict[str, Any], *, scale: float = 0.25
     else:
         out["k"] = rng.choice((1, 2, 3, 5, 8, 14))
         out["lookback"] = rng.choice((1, 2, 4, 8, 12, 24))
+    if out.get("name") == "follow_rank1" or out.get("family") == "follow_rank1":
+        out["engine"] = "named"
+        out["name"] = "follow_rank1"
+        out["family"] = "follow_rank1"
+        out["slots"] = 1
+        out["enter_top"] = 1
+        out["use_lev"] = 0
     return out
 
 
@@ -375,6 +419,8 @@ def crossover_spec(rng: random.Random, a: dict[str, Any], b: dict[str, Any]) -> 
         "size_mode",
         "exposure_mode",
         "use_lev",
+        "lev_x",
+        "board",
         "mode",
         "zscore",
         "lookback",
@@ -399,8 +445,9 @@ def crossover_spec(rng: random.Random, a: dict[str, Any], b: dict[str, Any]) -> 
     return out
 
 
-# by_live.csv: the #1 row is what we would paper. 1x, 1 slot, next-bar+ lag,
-# enough hold/bars so a 3-slot fade clone of a leveraged lottery cannot win.
+# by_live.csv: the #1 row is what we would paper. use_lev=0 (size via lev_x,
+# not wallet-mean lev), 1 slot, next-bar+ lag, enough hold/bars so a 3-slot
+# fade clone of a leveraged lottery cannot win.
 LIVE_MAX_DD_PCT = 20.0
 LIVE_MIN_TRIPS = 10
 LIVE_MAX_SLOTS = 1
@@ -411,6 +458,18 @@ LIVE_MIN_WIN_RATE_PCT = 50.0
 LIVE_MAX_TRIPS_PER_DAY = 24.0
 LIVE_MIN_HOLD_H = 6
 LIVE_MIN_EXEC_LAG = 2
+
+
+LIVE_PNL_MAX_DD_PCT = 25.0
+LIVE_PNL_MIN_TRIPS = 2
+LIVE_PNL_MAX_SLOTS = 1
+LIVE_PNL_MIN_RETURN_PCT = 0.0
+LIVE_PNL_MIN_SHARPE = 0.25
+LIVE_PNL_MIN_BARS = 24
+LIVE_PNL_MIN_WIN_RATE_PCT = 0.0
+LIVE_PNL_MAX_TRIPS_PER_DAY = 8.0
+LIVE_PNL_MIN_HOLD_H = 0
+LIVE_PNL_MIN_EXEC_LAG = 1
 
 
 def _num(row: dict[str, Any], key: str, spec_key: str | None = None, default: float = 0.0) -> float:
@@ -424,10 +483,44 @@ def _num(row: dict[str, Any], key: str, spec_key: str | None = None, default: fl
         return default
 
 
+def _row_board(row: dict[str, Any]) -> str:
+    raw = row.get("board")
+    if raw in (None, ""):
+        spec = row.get("spec") if isinstance(row.get("spec"), dict) else {}
+        raw = spec.get("board") or "roi"
+    return "pnl" if str(raw).strip().lower() == "pnl" else "roi"
+
+
 def live_ok(row: dict[str, Any]) -> bool:
-    """True if this trial is 1x and passes the live-sane cuts. Does not change the trial."""
+    """True if use_lev=0 (no wallet-mean lev) and the trial passes live-sane cuts.
+
+    PnL boards rotate slowly, so trip/return cuts are looser than ROI.
+    """
     if int(_num(row, "use_lev")) != 0:
         return False
+    board = _row_board(row)
+    if board == "pnl":
+        if int(_num(row, "round_trips")) < LIVE_PNL_MIN_TRIPS:
+            return False
+        if float(_num(row, "max_dd_pct")) > LIVE_PNL_MAX_DD_PCT:
+            return False
+        if int(_num(row, "slots", default=99)) > LIVE_PNL_MAX_SLOTS:
+            return False
+        if float(_num(row, "return_pct")) < LIVE_PNL_MIN_RETURN_PCT:
+            return False
+        if float(_num(row, "sharpe")) < LIVE_PNL_MIN_SHARPE:
+            return False
+        if int(_num(row, "n_bars")) < LIVE_PNL_MIN_BARS:
+            return False
+        if float(_num(row, "win_rate_pct")) < LIVE_PNL_MIN_WIN_RATE_PCT:
+            return False
+        if float(_num(row, "trips_per_day")) > LIVE_PNL_MAX_TRIPS_PER_DAY:
+            return False
+        if int(_num(row, "min_hold_h")) < LIVE_PNL_MIN_HOLD_H:
+            return False
+        if int(_num(row, "exec_lag")) < LIVE_PNL_MIN_EXEC_LAG:
+            return False
+        return True
     if int(_num(row, "round_trips")) < LIVE_MIN_TRIPS:
         return False
     if float(_num(row, "max_dd_pct")) > LIVE_MAX_DD_PCT:
@@ -454,11 +547,11 @@ def live_ok(row: dict[str, Any]) -> bool:
 
 def fitness(row: dict[str, Any]) -> float:
     """Prefer real profit and enough trades. Clip 1-bar Sharpe spikes."""
-    ret = float(row.get("return_pct") or 0)
-    sh = float(row.get("sharpe") or 0)
-    dd = max(float(row.get("max_dd_pct") or 0), 0.25)
-    trips = int(row.get("round_trips") or 0)
-    wr = float(row.get("win_rate_pct") or 0)
+    ret = _finite(row.get("return_pct"))
+    sh = _finite(row.get("sharpe"))
+    dd = max(_finite(row.get("max_dd_pct")), 0.25)
+    trips = int(_finite(row.get("round_trips")))
+    wr = _finite(row.get("win_rate_pct"))
     if trips < 1:
         return -1e6 + ret
     sh_f = max(min(sh, 8.0), 0.0)
@@ -522,6 +615,8 @@ def run_one(
     spec["exposure_mode"] = int(spec.get("exposure_mode") or 0)
     slots = max(1, int(spec.get("slots") or 5))
     span = data_span(panel)
+    lev_x = float(spec["lev_x"]) if spec.get("lev_x") not in (None, "") else DEFAULT_LEV_X
+    spec["lev_x"] = lev_x
     tc, ts, tw, tl = compute_targets(panel, spec)
     ret, dd, trips, wr, fees, final, eq, avg_hold = simulate(
         panel.marks,
@@ -539,6 +634,8 @@ def run_one(
         int(spec.get("use_lev") or 0),
         float(step),
         int(spec.get("exposure_mode") or 0),
+        getattr(panel, "max_leverage", None),
+        lev_x,
     )
     span_h = float(span["n_hours"] or 0)
     trips_day = (float(trips) / (span_h / 24.0)) if span_h >= 1.0 else float(trips)
@@ -548,15 +645,15 @@ def run_one(
         "tested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "spec": spec,
         "family": spec.get("family") or spec.get("name"),
-        "return_pct": round(float(ret), 4),
-        "max_dd_pct": round(float(dd), 4),
-        "sharpe": round(_sharpe(eq, float(step)), 4),
+        "return_pct": round(_finite(ret), 4),
+        "max_dd_pct": round(_finite(dd), 4),
+        "sharpe": round(_finite(_sharpe(eq, float(step))), 4),
         "round_trips": int(trips),
-        "trips_per_day": round(trips_day, 3),
-        "avg_hold_h": round(float(avg_hold), 3),
-        "win_rate_pct": round(float(wr), 3),
-        "fees": round(float(fees), 4),
-        "final_equity": round(float(final), 2),
+        "trips_per_day": round(_finite(trips_day), 3),
+        "avg_hold_h": round(_finite(avg_hold), 3),
+        "win_rate_pct": round(_finite(wr), 3),
+        "fees": round(_finite(fees), 4),
+        "final_equity": round(_finite(final), 2),
         "gross_pct": gross,
         "max_pair_share": pair,
         "size_mode": int(spec.get("size_mode") or 0),
@@ -627,7 +724,7 @@ class ResultStore:
         flat = flatten_result(row, run_id=self.tag)
         try:
             append_csv(self.csv_all, flat)
-        except OSError as exc:
+        except (OSError, ValueError, TypeError) as exc:
             log.warning("Could not append results.csv (close Excel if it is open): %s", exc)
         self._push_top(self.by_sharpe, flat, "sharpe")
         self._push_top(self.by_return, flat, "return_pct")
@@ -638,7 +735,7 @@ class ResultStore:
 
     def _push_top(self, bucket: list[dict[str, Any]], row: dict[str, Any], key: str, keep: int = 500) -> None:
         bucket.append(row)
-        bucket.sort(key=lambda r: -float(r.get(key) or 0))
+        bucket.sort(key=lambda r: -_finite(r.get(key), 0.0))
         del bucket[keep:]
 
     def write_csvs(self) -> None:
@@ -679,10 +776,11 @@ def _next_spec(
     elite_live: list[dict[str, Any]],
     explore_p: float,
     mut_scale: float,
+    board: str = "roi",
 ) -> dict[str, Any]:
     roll = rng.random()
     if roll < explore_p or not elite_fit:
-        return sample_spec(rng)
+        return sample_spec(rng, board=board)
     pool = elite_fit + elite_ret + elite_sh + elite_live
     if roll < explore_p + 0.12 and len(pool) >= 2:
         a = rng.choice(pool)["spec"]
@@ -705,21 +803,29 @@ def search_loop(
     gross_pct: float = 95.0,
     max_pair_share: float = 0.70,
     seed: int | None = None,
+    lev_x: float = DEFAULT_LEV_X,
+    board: str = "roi",
 ) -> int:
+    mapping = apply_exchange_max_lev(hourly)
     span = data_span(hourly)
     log.info(
-        "Search data %s → %s (%s hours, %s coins, %s 1h bars)",
+        "Search data %s → %s (%s hours, %s coins, %s 1h bars) | "
+        "lev_x=%s (use_lev=0: floor(maxLev/%s) integer, 1x if maxLev<%s; HL maxLev for %s coins)",
         span["data_from"],
         span["data_until"],
         span["n_hours"],
         span["n_coins"],
         span["n_bars"],
+        lev_x,
+        lev_x,
+        lev_x,
+        len(mapping),
     )
     rng = random.Random(seed)
     store = ResultStore(out_dir, span)
     log.info(
         "Writing this run to %s | by_return.csv=profit  leaderboard.csv=Sharpe  "
-        "by_fitness.csv=blend  by_live.csv=1x 1-slot lag>=2",
+        "by_fitness.csv=blend  by_live.csv=live-usable (no wallet-mean lev) 1-slot lag>=2",
         store.directory,
     )
     seen: set[str] = set()
@@ -754,14 +860,19 @@ def search_loop(
             elite_live=elite_live,
             explore_p=explore_p,
             mut_scale=mut_scale,
+            board=board,
         )
         if spec.get("gross_pct") in (None, ""):
             spec["gross_pct"] = gross_pct
         if spec.get("max_pair_share") in (None, ""):
             spec["max_pair_share"] = max_pair_share
+        spec["lev_x"] = float(lev_x)
+        spec["board"] = "pnl" if str(board).strip().lower() == "pnl" else "roi"
         key = spec_key(spec)
         if key in seen:
             spec = mutate_spec(rng, spec, scale=max(0.3, mut_scale))
+            spec["board"] = "pnl" if str(board).strip().lower() == "pnl" else "roi"
+            spec["lev_x"] = float(lev_x)
             key = spec_key(spec)
             if key in seen:
                 continue

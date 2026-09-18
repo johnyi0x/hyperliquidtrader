@@ -17,6 +17,7 @@ SID_RANK_RSI = 6
 SID_RANK_BREAKOUT = 7
 SID_AGREE_MOM = 8
 SID_WALLETS_EMA = 9
+SID_FOLLOW_RANK1 = 10
 
 STRATEGY_NAMES = (
     "rank_up_down",
@@ -29,6 +30,7 @@ STRATEGY_NAMES = (
     "rank_breakout",
     "agree_mom",
     "wallets_ema",
+    "follow_rank1",
 )
 
 NAME_TO_ID = {n: i for i, n in enumerate(STRATEGY_NAMES)}
@@ -152,6 +154,44 @@ def build_targets(
     k_up = param_k if param_k > 0 else 2
     giveback = param_k if param_k > 0 else 2
     cap = enter_top if enter_top > 0 else 1000000
+
+    if strategy_id == SID_FOLLOW_RANK1:
+        init_c = -1
+        init_s = 0
+        armed = False
+        for t in range(t_n):
+            lead = -1
+            best_r = 10**9
+            for c in range(c_n):
+                r = int(rank[t, c])
+                if r > 0 and r < best_r:
+                    best_r = r
+                    lead = c
+            if lead < 0:
+                continue
+            sd = int(side[t, lead])
+            if sd == 0:
+                sd = 1
+            if init_c < 0:
+                init_c = lead
+                init_s = sd
+                continue
+            if not armed:
+                if lead != init_c or sd != init_s:
+                    armed = True
+                else:
+                    continue
+            target_coin[t, 0] = lead
+            target_side[t, 0] = 1 if sd >= 0 else -1
+            ww = int(wallets[t, lead])
+            if ww < 1:
+                ww = 1
+            target_wallets[t, 0] = ww
+            lv = float(mean_lev[t, lead])
+            if lv < 1.0:
+                lv = 1.0
+            target_lev[t, 0] = lv
+        return target_coin, target_side, target_wallets, target_lev
 
     for t in range(t_n):
         want[:] = False
@@ -330,7 +370,9 @@ def simulate_nb(
     min_hold: int,
     use_lev: int,
     bar_hours: float,
-    exposure_mode: int = 0,
+    exposure_mode: int,
+    max_lev: np.ndarray,
+    lev_x: float,
 ) -> tuple:
     n_ticks = marks.shape[0]
     n_coins = marks.shape[1]
@@ -396,6 +438,12 @@ def simulate_nb(
                     lv = float(target_lev[src, j])
                     if lv < 1.0:
                         lv = 1.0
+                elif lev_x > 0.0:
+                    mx = float(max_lev[c]) if c < max_lev.shape[0] else 0.0
+                    if mx >= lev_x:
+                        lv = float(int(mx / lev_x))
+                        if lv < 1.0:
+                            lv = 1.0
                 desired_l[d] = lv
                 wsum += ww
                 d += 1
@@ -517,7 +565,18 @@ def simulate(
     use_lev: int = 1,
     bar_hours: float = 1.0,
     exposure_mode: int = 0,
+    max_lev: np.ndarray | None = None,
+    lev_x: float = 0.0,
 ) -> tuple:
+    n_coins = int(marks.shape[1]) if marks.ndim == 2 else 0
+    if max_lev is None or int(getattr(max_lev, "size", 0) or 0) < n_coins:
+        filled = np.full(n_coins, 50.0, dtype=np.float64)
+        if max_lev is not None and getattr(max_lev, "size", 0):
+            n = min(n_coins, int(max_lev.shape[0]))
+            filled[:n] = np.asarray(max_lev[:n], dtype=np.float64)
+        max_lev = filled
+    else:
+        max_lev = np.asarray(max_lev, dtype=np.float64)
     return simulate_nb(
         marks,
         target_coin,
@@ -534,6 +593,8 @@ def simulate(
         int(use_lev),
         float(bar_hours),
         int(exposure_mode),
+        max_lev,
+        float(lev_x),
     )
 
 

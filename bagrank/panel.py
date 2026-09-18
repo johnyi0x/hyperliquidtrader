@@ -46,6 +46,7 @@ class RankPanel:
     premium: np.ndarray
     volume: np.ndarray
     prev_day: np.ndarray
+    max_leverage: np.ndarray  # (C,) exchange maxLev; 50 if unknown
 
     @property
     def n_times(self) -> int:
@@ -75,6 +76,7 @@ class RankPanel:
             premium=self.premium[idx],
             volume=self.volume[idx],
             prev_day=self.prev_day[idx],
+            max_leverage=self.max_leverage,
         )
 
 
@@ -114,6 +116,7 @@ def panel_from_meta_rows(
             agreement=empty.copy(),
             mean_leverage=empty.copy(),
             marks=empty.copy(),
+            max_leverage=np.zeros(0, dtype=np.float64),
             **extras,
         )
     times: list[int] = []
@@ -170,6 +173,7 @@ def panel_from_meta_rows(
         agreement=agreement,
         mean_leverage=mean_lev,
         marks=np.zeros((t_n, c_n), dtype=np.float64),
+        max_leverage=np.full(c_n, 50.0, dtype=np.float64),
         **extras,
     )
 

@@ -11,10 +11,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .dsn import default_live_sqlite_path, load_env
+from .dsn import default_live_sqlite_path, default_pnl_sqlite_path, load_env
 from .engine import lagged_holdings
 from .hlcycle import LiveBoard
 from .kernels import NAME_TO_ID
+from .lev import DEFAULT_LEV_X, DEFAULT_MAX_LEV, apply_exchange_max_lev, fetch_exchange_max_lev, pair_size_lev
 from .panel import panel_from_sqlite
 from .prices import fill_panel_from_collector
 from .specio import default_live_csv, load_strategy, require_strategy_row, spec_from_row
@@ -25,6 +26,26 @@ log = logging.getLogger("bagrank.live")
 
 _STOP = False
 FEE = 0.0005
+
+
+def spec_board(spec: dict[str, Any]) -> str:
+    return "pnl" if str(spec.get("board") or "roi").strip().lower() == "pnl" else "roi"
+
+
+def live_hour_windows(spec: dict[str, Any]) -> tuple[int, int]:
+    """Hours of board needed to trade, and hours kept on disk.
+
+    PnL rank moves slowly so we retain 72h, but we start as soon as the spec's
+    lookback+lag bars exist (otherwise Railway sits idle for three days).
+    """
+    step = max(1, int(spec.get("step_h") or 1))
+    look = max(1, int(spec.get("lookback") or 1))
+    lag = max(0, int(spec.get("exec_lag") or 1))
+    need = max(2, (look + lag) * step)
+    keep = need
+    if spec_board(spec) == "pnl" or str(spec.get("name") or "") == "follow_rank1":
+        keep = max(keep, 72)
+    return need, keep
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -52,6 +73,8 @@ def _weight_targets(
     use_lev: int,
     slots: int = 0,
     exposure_mode: int = 0,
+    lev_x: float = DEFAULT_LEV_X,
+    max_lev: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     wsum = sum(max(float(h["wallets"]), 1e-9) for h in holds)
     if wsum <= 0:
@@ -72,14 +95,24 @@ def _weight_targets(
         weight = float(h["wallets"]) / wsum
         if max_pair_share > 0:
             weight = min(weight, float(max_pair_share))
-        lev = float(h["lev"]) if use_lev else 1.0
-        if lev < 1.0:
-            lev = 1.0
+        if use_lev:
+            lev = float(h["lev"]) if h.get("lev") else 1.0
+            if lev < 1.0:
+                lev = 1.0
+        else:
+            mx = 0.0
+            if max_lev:
+                mx = float(max_lev.get(h["coin"]) or 0)
+            if mx <= 0:
+                mx = float(h.get("max_lev") or 0)
+            if mx <= 0:
+                mx = DEFAULT_MAX_LEV
+            lev = float(int(pair_size_lev(mx, lev_x)))
         notional = equity * gross * weight * lev
         if notional <= 0:
             continue
         size = notional / px
-        out.append({**h, "notional": notional, "size": size, "weight": weight})
+        out.append({**h, "notional": notional, "size": size, "weight": weight, "lev": lev})
     return out
 
 
@@ -334,20 +367,43 @@ def run_live(
             info = _info_only()
         except Exception as exc:
             log.warning("HL info client failed; public HTTP will still gather the board: %s", exc)
-    keep_hours = max(1, int(spec.get("lookback") or 1) * max(1, int(spec.get("step_h") or 1)))
-    try:
-        from .backup import seed_recent_board
+    board_kind = spec_board(spec)
+    need_hours, keep_hours = live_hour_windows(spec)
+    lev_x = float(spec.get("lev_x") if spec.get("lev_x") not in (None, "") else DEFAULT_LEV_X)
+    spec["lev_x"] = lev_x
+    spec["board"] = board_kind
+    max_lev_map = fetch_exchange_max_lev()
+    if board_kind == "pnl":
+        try:
+            from .backup import seed_local_hours
 
-        seeded = seed_recent_board(sqlite_path, keep_hours)
-        if seeded:
-            log.info("Neon backfill once: %s hours. Neon will not be queried again.", seeded)
-    except Exception as exc:
-        log.warning("Neon backfill skipped: %s", exc)
-    board = LiveBoard(sqlite_path, info, keep_hours=keep_hours) if refresh_board else None
-    log.info("Hourly board file %s | rolling window %sh", sqlite_path, keep_hours)
+            seeded = seed_local_hours(default_pnl_sqlite_path(), sqlite_path, keep_hours)
+            if seeded:
+                log.info("Local PnL backup seed: %s hours. Neon is not used.", seeded)
+        except Exception as exc:
+            log.warning("Local PnL seed skipped: %s", exc)
+    else:
+        try:
+            from .backup import seed_recent_board
+
+            seeded = seed_recent_board(sqlite_path, keep_hours)
+            if seeded:
+                log.info("Neon backfill once: %s hours. Neon will not be queried again.", seeded)
+        except Exception as exc:
+            log.warning("Neon backfill skipped: %s", exc)
+    board = LiveBoard(sqlite_path, info, keep_hours=keep_hours, rank_by=board_kind) if refresh_board else None
     log.info(
-        "Trading %s | engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s",
+        "Hourly board file %s | trade after %sh | retain %sh | rank_by=%s",
+        sqlite_path,
+        need_hours,
+        keep_hours,
+        board_kind,
+    )
+    log.info(
+        "Trading %s | board=%s engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s | "
+        "lev_x=%s (pair uses floor(maxLev/%s) integer, 1x if maxLev<%s) | HL maxLev for %s coins",
         mode,
+        board_kind,
         spec.get("engine"),
         spec.get("family"),
         spec.get("step_h"),
@@ -355,12 +411,18 @@ def run_live(
         spec.get("slots"),
         spec.get("exec_lag"),
         spec.get("lookback"),
+        lev_x,
+        lev_x,
+        lev_x,
+        len(max_lev_map),
     )
     logged_wait = False
     while not _STOP:
         panel = load_panel(sqlite_path) if sqlite_path.exists() else None
+        if panel is not None:
+            apply_exchange_max_lev(panel, max_lev_map)
         have = 0 if panel is None else panel.n_times
-        if have >= keep_hours:
+        if have >= need_hours:
             holds = lagged_holdings(panel, spec)
             equity = float(spec.get("equity") or 1000.0)
             marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
@@ -386,6 +448,8 @@ def run_live(
                 use_lev=int(spec.get("use_lev") or 0),
                 slots=int(spec.get("slots") or 0),
                 exposure_mode=int(spec.get("exposure_mode") or 0),
+                lev_x=lev_x,
+                max_lev=max_lev_map,
             )
             key = json.dumps(
                 [(d["coin"], d["side"]) for d in sized],
@@ -428,7 +492,11 @@ def run_live(
             state["last_signal"] = sig_ts
             _save_state(state_path, state)
         elif not logged_wait:
-            log.info("Waiting for %s lookback hours (have %s). Set NEON_DATABASE to backfill once.", keep_hours, have)
+            if board_kind == "pnl":
+                hint = "Gathering PnL board from Hyperliquid. Neon is not used."
+            else:
+                hint = "Set NEON_DATABASE to backfill once."
+            log.info("Waiting for %s lookback hours (have %s). %s", need_hours, have, hint)
             logged_wait = True
         if board is not None:
             try:
@@ -453,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Defaults to rank_live.csv in the repo root",
     )
     p.add_argument("--row", type=int, default=2, help="Excel row including header (2 = the pasted strategy)")
-    p.add_argument("--db", type=Path, default=default_live_sqlite_path())
+    p.add_argument("--db", type=Path, default=None, help="Local hour sqlite (default follows board=roi/pnl)")
     p.add_argument("--paper", action="store_true", help="Simulated fills (default). Same signals as --live.")
     p.add_argument("--live", action="store_true", help="Send real Hyperliquid orders")
     p.add_argument("--dry-run", action="store_true", help="Print targets only")
@@ -481,6 +549,8 @@ def main(argv: list[str] | None = None) -> int:
     spec = spec_from_row(raw)
     if spec.get("engine") == "named" and spec.get("name") not in NAME_TO_ID:
         raise SystemExit(f"Unknown strategy name {spec.get('name')!r} in {csv_path}")
+    board_kind = spec_board(spec)
+    sqlite_path = args.db or default_live_sqlite_path(board_kind)
     if args.dry_run:
         mode = "dry"
     elif args.live:
@@ -488,9 +558,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         mode = "paper"
     log.info(
-        "Loaded %s row %s | %s %s sharpe=%s ret=%s",
+        "Loaded %s row %s | board=%s %s %s sharpe=%s ret=%s",
         csv_path.name,
         args.row,
+        board_kind,
         spec.get("family"),
         spec.get("engine"),
         raw.get("sharpe"),
@@ -498,7 +569,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     return run_live(
         spec,
-        sqlite_path=args.db,
+        sqlite_path=sqlite_path,
         mode=mode,
         poll_s=args.poll,
         refresh_board=not (args.no_refresh or args.no_sync),

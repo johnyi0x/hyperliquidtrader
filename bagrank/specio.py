@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
 
 from .kernels import FEATURE_NAMES, N_FEAT
+from .lev import DEFAULT_LEV_X
 
 WEIGHT_COLS = [f"w_{name}" for name in FEATURE_NAMES]
 LIVE_CSV_NAME = "rank_live.csv"
@@ -33,12 +35,14 @@ CSV_COLUMNS = (
     "family",
     "engine",
     "name",
+    "board",
     "step_h",
     "min_hold_h",
     "enter_top",
     "slots",
     "exec_lag",
     "use_lev",
+    "lev_x",
     "gross_pct",
     "max_pair_share",
     "size_mode",
@@ -67,11 +71,18 @@ def _cell(value: Any) -> str:
         return ""
     if isinstance(value, bool):
         return "1" if value else "0"
-    if isinstance(value, float):
-        if value == int(value) and abs(value) < 1e12:
-            if abs(value - round(value)) < 1e-9:
-                return str(int(round(value))) if abs(value) >= 1 else f"{value:.6g}"
-        return f"{value:.8g}"
+    if isinstance(value, (int, float)):
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(fv):
+            return ""
+        if abs(fv - round(fv)) < 1e-9 and abs(fv) < 1e12:
+            if abs(fv) >= 1:
+                return str(int(round(fv)))
+            return f"{fv:.6g}"
+        return f"{fv:.8g}"
     return str(value)
 
 
@@ -105,6 +116,7 @@ def flatten_result(row: dict[str, Any], *, run_id: str = "") -> dict[str, Any]:
     flat["family"] = spec.get("family") or row.get("family") or ""
     flat["engine"] = spec.get("engine") or "score"
     flat["name"] = spec.get("name") or flat["family"]
+    flat["board"] = spec.get("board") or row.get("board") or "roi"
     for key in (
         "step_h",
         "min_hold_h",
@@ -112,6 +124,7 @@ def flatten_result(row: dict[str, Any], *, run_id: str = "") -> dict[str, Any]:
         "slots",
         "exec_lag",
         "use_lev",
+        "lev_x",
         "mode",
         "zscore",
         "enter_th",
@@ -144,6 +157,10 @@ def flatten_result(row: dict[str, Any], *, run_id: str = "") -> dict[str, Any]:
         flat["exposure_mode"] = 0
     if not flat["equity"]:
         flat["equity"] = 1000
+    if flat["lev_x"] in ("", None):
+        flat["lev_x"] = DEFAULT_LEV_X
+    if not flat.get("board"):
+        flat["board"] = "roi"
     if flat["exec_lag"] in ("", None):
         flat["exec_lag"] = 1
     for i, col in enumerate(WEIGHT_COLS):
@@ -170,12 +187,14 @@ def spec_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "family": str(row.get("family") or row.get("name") or "composite"),
         "engine": engine,
         "name": str(row.get("name") or row.get("family") or "composite"),
+        "board": str(row.get("board") or "roi").strip().lower() or "roi",
         "step_h": _i("step_h", 1),
         "min_hold_h": _i("min_hold_h", 0),
         "enter_top": _i("enter_top", 0),
         "slots": max(1, _i("slots", 5)),
         "exec_lag": _i("exec_lag", 1),
         "use_lev": _i("use_lev", 0),
+        "lev_x": _f("lev_x", DEFAULT_LEV_X),
         "gross_pct": _f("gross_pct", 95.0),
         "max_pair_share": _f("max_pair_share", 0.7),
         "size_mode": _i("size_mode", 0),

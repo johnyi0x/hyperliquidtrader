@@ -5,4 +5,4 @@ alwaysApply: true
 
 # Neon connect from this PC
 
-If `backup_bagrank.py` or any Neon handshake fails with "server closed the connection unexpectedly", port 5432 reset, or direct+pooler both dying, **tell the user to turn off VPN first** before blaming Neon sleep, DSN, or the script.
+If `backup_bagrank.py`, `backup_pnl.py`, or any Neon handshake fails with "server closed the connection unexpectedly", port 5432 reset, or direct+pooler both dying, **tell the user to turn off VPN first** before blaming Neon sleep, DSN, or the script.

@@ -415,6 +415,35 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertEqual(src, "")
         self.assertEqual(url, "")
 
+    def test_resolve_pnl_uses_neon_pnl_not_roi(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        from bagrank.dsn import default_pnl_sqlite_path, resolve_pnl_database_url
+
+        path = default_pnl_sqlite_path()
+        self.assertEqual(path.name, "pnlrank.sqlite")
+        self.assertEqual(path.parent.name, "pnlrank")
+        env = {
+            "NEON_PNL": "postgresql://u:secret@ep-pnl.c-5.us-east-2.aws.neon.tech/neondb",
+            "NEON_BAGRANK": "postgresql://u:secret@ep-from-bagrank.c-5.us-east-2.aws.neon.tech/neondb",
+            "DATABASE_URL": "postgresql://u:secret@ep-other.c-7.us-east-1.aws.neon.tech/other",
+        }
+        with patch("bagrank.dsn.load_env"), patch.dict(os.environ, env, clear=True):
+            url, src = resolve_pnl_database_url()
+        self.assertEqual(src, "NEON_PNL")
+        self.assertIn("ep-pnl", url)
+        self.assertNotIn("ep-from-bagrank", url)
+        self.assertNotIn("ep-other", url)
+        roi_only = {"NEON_BAGRANK": env["NEON_BAGRANK"]}
+        with patch("bagrank.dsn.load_env"), patch("bagrank.dsn.PNL_COLLECTOR_ENV") as pnl_env, patch.dict(
+            os.environ, roi_only, clear=True
+        ):
+            pnl_env.exists.return_value = False
+            empty, empty_src = resolve_pnl_database_url()
+        self.assertEqual(empty_src, "")
+        self.assertEqual(empty, "")
+
     def test_hl_overlay_writes_last_bar_mark(self) -> None:
         from bagrank.prices import overlay_hl_market
 
@@ -729,6 +758,20 @@ class UniverseAndDsnTests(unittest.TestCase):
             [(h["coin"], h["side"]) for h in replayed],
         )
 
+    def test_csv_cell_skips_nan_and_inf(self) -> None:
+        from bagrank.specio import _cell, append_csv
+
+        self.assertEqual(_cell(float("nan")), "")
+        self.assertEqual(_cell(float("inf")), "")
+        self.assertEqual(_cell(float("-inf")), "")
+        self.assertEqual(_cell(3.0), "3")
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "one.csv"
+            append_csv(path, {"sharpe": float("nan"), "return_pct": 1.5, "family": "x"})
+
     def test_paste_csv_and_tsv_roundtrip(self) -> None:
         from bagrank.search import run_one, sample_spec
         from bagrank.specio import (
@@ -864,6 +907,7 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn("gross_pct", spec)
         self.assertIn("size_mode", spec)
         self.assertIn("exposure_mode", spec)
+        self.assertEqual(spec.get("lev_x"), 3)
         self.assertGreaterEqual(len(spec.get("weights") or spec.get("name") or ""), 1)
 
     def test_last_days_keeps_newest_window(self) -> None:
@@ -903,6 +947,19 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertFalse(live_ok(dict(good, min_hold_h=2)))
         self.assertFalse(live_ok(dict(good, exec_lag=1)))
         self.assertFalse(live_ok(dict(good, n_bars=20)))
+        pnl = dict(
+            good,
+            board="pnl",
+            round_trips=3,
+            return_pct=4.0,
+            sharpe=0.8,
+            win_rate_pct=40.0,
+            trips_per_day=1.2,
+            min_hold_h=0,
+            exec_lag=1,
+        )
+        self.assertTrue(live_ok(pnl))
+        self.assertFalse(live_ok(dict(pnl, board="roi")))
 
     def test_by_live_csv_keeps_only_strict_1x_rows(self) -> None:
         import tempfile
@@ -1161,13 +1218,233 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn("LiveBoard", src)
         self.assertIn("panel = load_panel", src)
         self.assertIn("_mids_from_info", src)
+        self.assertIn("seed_local_hours", src)
+        self.assertIn("rank_by", src)
         self.assertNotIn("sync_neon", src)
+        self.assertIn("fetch_exchange_max_lev", src)
+        self.assertIn("apply_exchange_max_lev", src)
         self.assertNotIn("maybe_sync_backup", src)
         self.assertNotIn("NEON_BAGRANK", src)
         main_src = inspect.getsource(live.main)
         self.assertNotIn("on_railway", main_src)
         self.assertIn('mode = "paper"', main_src)
         self.assertIn('mode = "live"', main_src)
+        self.assertIn("need_hours", src)
+        self.assertIn("rank_by=board_kind", src)
+        self.assertIn("Gathering PnL board from Hyperliquid", src)
+        self.assertNotIn("NEON_PNL", src)
+
+    def test_pnl_spec_trades_before_72h_retain(self) -> None:
+        from bagrank.live import live_hour_windows, spec_board
+
+        spec = {
+            "board": "pnl",
+            "name": "funding_follow",
+            "lookback": 4,
+            "step_h": 4,
+            "exec_lag": 1,
+        }
+        self.assertEqual(spec_board(spec), "pnl")
+        need, keep = live_hour_windows(spec)
+        self.assertEqual(need, 20)
+        self.assertEqual(keep, 72)
+        roi_need, roi_keep = live_hour_windows({"board": "roi", "lookback": 4, "step_h": 2, "exec_lag": 2})
+        self.assertEqual(roi_need, 12)
+        self.assertEqual(roi_keep, 12)
+
+    def test_railway_deploys_real_money(self) -> None:
+        from pathlib import Path
+
+        text = (Path(__file__).resolve().parent.parent / "railway.toml").read_text(encoding="utf-8")
+        self.assertIn("python run_rank.py --live", text)
+        self.assertNotIn('startCommand = "python run_rank.py"', text)
+
+
+class PairSizeLevTests(unittest.TestCase):
+    def test_pair_size_lev_uses_x_only_when_max_allows(self) -> None:
+        from bagrank.lev import apply_exchange_max_lev, pair_size_lev
+
+        self.assertEqual(pair_size_lev(10, 5), 2.0)
+        self.assertEqual(pair_size_lev(20, 5), 4.0)
+        self.assertEqual(pair_size_lev(5, 5), 1.0)
+        self.assertEqual(pair_size_lev(3, 5), 1.0)
+        self.assertEqual(pair_size_lev(10, 3), 3.0)
+        self.assertEqual(pair_size_lev(11, 3), 3.0)
+        self.assertEqual(pair_size_lev(20, 3), 6.0)
+        self.assertEqual(pair_size_lev(50, 3), 16.0)
+        self.assertEqual(pair_size_lev(3, 3), 1.0)
+        self.assertEqual(pair_size_lev(2, 3), 1.0)
+        self.assertEqual(pair_size_lev(0, 3), 1.0)
+        self.assertEqual(pair_size_lev(50, 0), 1.0)
+        self.assertEqual(pair_size_lev(10, 3) % 1, 0.0)
+
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(6)]
+        rows = [_meta(cycle, "AAA", 1, 50) for cycle in hours]
+        panel = panel_from_meta_rows(rows)
+        apply_exchange_max_lev(panel, {"AAA": 3})
+        self.assertEqual(float(panel.max_leverage[0]), 3.0)
+
+    def test_simulate_lev_x_five_vs_max_below_x(self) -> None:
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(8)]
+        rows = [_meta(cycle, "AAA", 1, 50) for cycle in hours]
+        panel = panel_from_meta_rows(rows)
+        for i in range(panel.n_times):
+            panel.marks[i, 0] = 100.0 + 8.0 * i
+        tc, ts, tw, tl = build_targets(
+            panel.rank,
+            panel.side,
+            panel.wallets,
+            panel.hold_pct,
+            panel.agreement,
+            panel.mean_leverage,
+            SID_TOP_K,
+            1,
+            1,
+            1,
+            1,
+            0.0,
+            0.0,
+        )
+        kw = dict(
+            fee_rate=0.0005,
+            gross_frac=1.0,
+            initial_equity=1000.0,
+            max_slots=1,
+            max_pair_share=1.0,
+            exec_lag=1,
+            min_hold=0,
+            use_lev=0,
+            bar_hours=1.0,
+            exposure_mode=0,
+        )
+        *_a, final1, _eq1, _h1 = simulate(
+            panel.marks, tc, ts, tw, tl, max_lev=np.array([50.0]), lev_x=0.0, **kw
+        )
+        *_b, final5, _eq5, _h5 = simulate(
+            panel.marks, tc, ts, tw, tl, max_lev=np.array([50.0]), lev_x=5.0, **kw
+        )
+        *_c, final_lo, _eq_lo, _h_lo = simulate(
+            panel.marks, tc, ts, tw, tl, max_lev=np.array([3.0]), lev_x=5.0, **kw
+        )
+        self.assertGreater(final5, final1)
+        self.assertAlmostEqual(final_lo, final1, places=4)
+
+    def test_live_weight_targets_follow_pair_max_lev(self) -> None:
+        from bagrank.live import _weight_targets
+
+        holds = [{"coin": "ETH", "wallets": 10, "px": 100.0, "side": "short", "lev": 1.0}]
+        hi = _weight_targets(
+            holds,
+            equity=1000.0,
+            gross_pct=100.0,
+            max_pair_share=1.0,
+            use_lev=0,
+            slots=1,
+            lev_x=3,
+            max_lev={"ETH": 50},
+        )
+        mid = _weight_targets(
+            holds,
+            equity=1000.0,
+            gross_pct=100.0,
+            max_pair_share=1.0,
+            use_lev=0,
+            slots=1,
+            lev_x=3,
+            max_lev={"ETH": 11},
+        )
+        lo = _weight_targets(
+            holds,
+            equity=1000.0,
+            gross_pct=100.0,
+            max_pair_share=1.0,
+            use_lev=0,
+            slots=1,
+            lev_x=3,
+            max_lev={"ETH": 3},
+        )
+        self.assertEqual(len(hi), 1)
+        self.assertEqual(hi[0]["lev"], 16)
+        self.assertAlmostEqual(hi[0]["notional"], 16000.0)
+        self.assertEqual(mid[0]["lev"], 3)
+        self.assertAlmostEqual(mid[0]["notional"], 3000.0)
+        self.assertEqual(lo[0]["lev"], 1)
+        self.assertAlmostEqual(lo[0]["notional"], 1000.0)
+
+    def test_pnl_backup_and_backtest_clis_are_separate(self) -> None:
+        import inspect
+        from pathlib import Path
+
+        from bagrank.backup import main as backup_main
+        from bagrank.dsn import default_pnl_sqlite_path, default_sqlite_path
+
+        root = Path(__file__).resolve().parent.parent
+        self.assertTrue((root / "backup_pnl.py").exists())
+        self.assertTrue((root / "run_pnl_backtest.py").exists())
+        self.assertTrue((root / "backup_bagrank.py").exists())
+        self.assertTrue((root / "run_rank_backtest.py").exists())
+        self.assertNotEqual(default_pnl_sqlite_path(), default_sqlite_path())
+        src = inspect.getsource(backup_main)
+        self.assertIn('kind == "pnl"', src)
+        self.assertIn("NEON_PNL", src)
+
+
+class FollowRank1Tests(unittest.TestCase):
+    def test_skips_existing_leader_until_fresh_move(self) -> None:
+        from bagrank.engine import compute_targets
+
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(5)]
+        rows: list[dict] = []
+        for i, cycle in enumerate(hours):
+            if i < 2:
+                rows.append(_meta(cycle, "AAA", 1, 50))
+                rows.append(_meta(cycle, "BBB", 2, 40))
+            else:
+                rows.append(_meta(cycle, "BBB", 1, 50))
+                rows.append(_meta(cycle, "AAA", 2, 40))
+        panel = panel_from_meta_rows(rows)
+        panel.marks[:] = 10.0
+        tc, ts, _tw, _tl = compute_targets(
+            panel,
+            {"engine": "named", "name": "follow_rank1", "slots": 3, "enter_top": 10},
+        )
+        self.assertEqual(int(tc[0, 0]), -1)
+        self.assertEqual(int(tc[1, 0]), -1)
+        bbb = panel.coins.index("BBB")
+        self.assertEqual(int(tc[2, 0]), bbb)
+        self.assertEqual(int(tc[3, 0]), bbb)
+        self.assertEqual(int(tc[4, 0]), bbb)
+
+    def test_shortlist_pnl_ranks_by_pnl_not_roi(self) -> None:
+        from bagrank.hlcycle import shortlist_top_pnl, shortlist_top_roi
+
+        hi_roi = "0x" + "a" * 40
+        hi_pnl = "0x" + "b" * 40
+        rows = [
+            {"address": hi_roi, "windows": {"perpWeek": {"roi": 9.0, "pnl": 10.0}}},
+            {"address": hi_pnl, "windows": {"perpWeek": {"roi": 1.0, "pnl": 100.0}}},
+        ]
+        self.assertEqual(shortlist_top_roi(rows, limit=1), [hi_roi])
+        self.assertEqual(shortlist_top_pnl(rows, limit=1), [hi_pnl])
+
+    def test_spec_board_roundtrip(self) -> None:
+        from bagrank.specio import flatten_result, spec_from_row
+
+        spec = {
+            "engine": "named",
+            "name": "follow_rank1",
+            "family": "follow_rank1",
+            "board": "pnl",
+            "slots": 1,
+            "enter_top": 1,
+            "use_lev": 0,
+            "exec_lag": 1,
+        }
+        flat = flatten_result({"return_pct": 1, "spec": spec})
+        self.assertEqual(flat["board"], "pnl")
+        back = spec_from_row({k: str(flat.get(k, "") or "") for k in flat})
+        self.assertEqual(back["board"], "pnl")
+        self.assertEqual(back["name"], "follow_rank1")
 
 
 if __name__ == "__main__":

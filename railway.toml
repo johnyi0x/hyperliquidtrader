@@ -1,11 +1,12 @@
 # Always-on worker (not a website, not a cron).
-# Set secrets in the Railway dashboard — never in this file.
-# Papers the single row in rank_live.csv. Real orders only with: python run_rank.py --live
+# Real-money orders from rank_live.csv (board=pnl or roi).
+# Railway secrets required: HYPE_WALLET_ADDRESS, HYPE_PRIVATE_KEY
+# Local paper: python run_rank.py
 
 [build]
 builder = "RAILPACK"
 
 [deploy]
-startCommand = "python run_rank.py"
+startCommand = "python run_rank.py --live"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10

@@ -18,6 +18,12 @@ COLLECTOR_ENV = (
     / "portfolio_data_collection"
     / ".env"
 )
+PNL_COLLECTOR_ENV = (
+    REPO.parent
+    / "portfolio_data_platform"
+    / "portfolio_data_collection_pnl"
+    / ".env"
+)
 
 CONNECT_TIMEOUT_S = 60
 
@@ -129,6 +135,27 @@ def resolve_database_url(explicit: str = "") -> tuple[str, str]:
     return "", ""
 
 
+def resolve_pnl_database_url(explicit: str = "") -> tuple[str, str]:
+    """PnL collector Neon. Never uses NEON_BAGRANK or the ROI collector DATABASE_URL."""
+    if explicit.strip():
+        return prepare_dsn(explicit), "--dsn"
+    load_env()
+    raw = (os.environ.get("NEON_PNL") or "").strip()
+    if raw:
+        return prepare_dsn(raw), "NEON_PNL"
+    if PNL_COLLECTOR_ENV.exists():
+        try:
+            from dotenv import dotenv_values
+
+            extra = dotenv_values(PNL_COLLECTOR_ENV) or {}
+        except Exception:
+            extra = {}
+        raw = str(extra.get("DATABASE_URL") or extra.get("NEON_PNL") or "").strip()
+        if raw:
+            return prepare_dsn(raw), "pnl collector DATABASE_URL"
+    return "", ""
+
+
 def database_url(explicit: str = "") -> str:
     url, _src = resolve_database_url(explicit)
     return url
@@ -142,7 +169,26 @@ def default_sqlite_path() -> Path:
     return REPO / "data" / "bagrank" / "bagrank.sqlite"
 
 
-def default_live_sqlite_path() -> Path:
+def default_pnl_sqlite_path() -> Path:
+    override = (os.environ.get("PNL_SQLITE") or os.environ.get("PNLRANK_SQLITE") or "").strip()
+    if override:
+        p = Path(override)
+        return p if p.is_absolute() else REPO / p
+    return REPO / "data" / "pnlrank" / "pnlrank.sqlite"
+
+
+def default_live_sqlite_path(board: str = "roi") -> Path:
+    by = "pnl" if str(board or "").strip().lower() == "pnl" else "roi"
+    if by == "pnl":
+        override = (os.environ.get("PNL_LIVE_SQLITE") or "").strip()
+        if override:
+            p = Path(override)
+            return p if p.is_absolute() else REPO / p
+        volume = Path("/data")
+        on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
+        if on_railway and volume.is_dir():
+            return volume / "pnlrank" / "live.sqlite"
+        return REPO / "data" / "pnlrank" / "live.sqlite"
     override = (os.environ.get("BAGRANK_LIVE_SQLITE") or "").strip()
     if override:
         p = Path(override)

@@ -1,10 +1,15 @@
 """Live rank trader. Reads rank_live.csv (header + one copied backtest row).
 
 Rebuilds the hourly bag-rank board from Hyperliquid (leaderboard + wallet
-snapshots), same tally as the collector. Neon is not used.
+snapshots), same tally as the collector. Neon is not used for PnL; ROI may
+seed lookback hours once from NEON_DATABASE then never again.
 
-Paper (default):  python run_rank.py
-Live (real $):    python run_rank.py --live
+`board=pnl` in the CSV row snapshots top-week PnL wallets (like the PnL
+collector). `board=roi` (default) snapshots top-week ROI wallets.
+
+Paper (local default):  python run_rank.py
+Live (real $):          python run_rank.py --live
+Railway deploy:         python run_rank.py --live
 """
 
 from __future__ import annotations
