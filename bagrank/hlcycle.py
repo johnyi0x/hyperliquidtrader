@@ -16,7 +16,7 @@ from typing import Any
 import requests
 
 from .store import connect, local_max_cycle, upsert_rows
-from .timeutil import floor_hour, to_iso
+from .timeutil import as_utc, floor_hour, to_iso
 
 log = logging.getLogger("bagrank.hlcycle")
 
@@ -442,6 +442,40 @@ def should_append_hour(last_cycle: str, closed: str) -> bool:
     return closed > last_cycle
 
 
+def next_cycle_to_gather(last_cycle: str, closed: str) -> str:
+    """Next hour after last_cycle, never skip ahead to `closed`.
+
+    PnL snapshots take 2–20 minutes. If we always gather `closed`, a long
+    snap that fails or overruns the next hour would leave a hole.
+    """
+    if not should_append_hour(last_cycle, closed):
+        return ""
+    if not last_cycle:
+        return closed
+    nxt = to_iso(as_utc(last_cycle) + timedelta(hours=1))
+    if nxt > closed:
+        return ""
+    return nxt
+
+
+# PnL collector (and our own 200-wallet snap) often finishes 2–20 min after
+# the hour close. Wait the short end so we do not start at HH:00:00.
+PNL_GATHER_SETTLE_S = 120.0
+
+
+def cycle_ready_to_gather(
+    cycle_ts: str,
+    *,
+    now: datetime | None = None,
+    settle_s: float = 0.0,
+) -> bool:
+    """True once the labeled hour has been closed for settle_s seconds."""
+    if not cycle_ts:
+        return False
+    ready_at = as_utc(cycle_ts) + timedelta(hours=1) + timedelta(seconds=max(0.0, float(settle_s)))
+    return as_utc(now or datetime.now(timezone.utc)) >= ready_at
+
+
 def gather_cycle(
     info: Any,
     *,
@@ -620,9 +654,13 @@ class LiveBoard:
 
     def maybe_refresh(self) -> bool:
         closed = closed_cycle_ts()
-        if not should_append_hour(self.last_hour, closed):
+        target = next_cycle_to_gather(self.last_hour, closed)
+        if not target:
             return False
-        payload = gather_cycle(self.info, cycle_ts=closed, rank_by=self.rank_by)
+        settle = PNL_GATHER_SETTLE_S if self.rank_by == "pnl" else 0.0
+        if not cycle_ready_to_gather(target, settle_s=settle):
+            return False
+        payload = gather_cycle(self.info, cycle_ts=target, rank_by=self.rank_by)
         persist_cycle(self.sqlite_path, payload, keep_hours=self.keep_hours)
         self.last_at = time.time()
         self.last_hour = str(payload.get("cycle_ts") or closed)

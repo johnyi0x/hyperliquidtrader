@@ -435,6 +435,18 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn("ep-pnl", url)
         self.assertNotIn("ep-from-bagrank", url)
         self.assertNotIn("ep-other", url)
+        live_env = {
+            "NEON_DATABASE_PNL": "postgresql://u:secret@ep-live-pnl.c-5.us-east-2.aws.neon.tech/neondb",
+            "NEON_PNL": env["NEON_PNL"],
+            "NEON_DATABASE": "postgresql://u:secret@ep-roi.c-5.us-east-2.aws.neon.tech/neondb",
+            "NEON_BAGRANK": env["NEON_BAGRANK"],
+        }
+        with patch("bagrank.dsn.load_env"), patch.dict(os.environ, live_env, clear=True):
+            url, src = resolve_pnl_database_url()
+        self.assertEqual(src, "NEON_DATABASE_PNL")
+        self.assertIn("ep-live-pnl", url)
+        self.assertNotIn("ep-pnl.c-5", url)
+        self.assertNotIn("ep-roi", url)
         roi_only = {"NEON_BAGRANK": env["NEON_BAGRANK"]}
         with patch("bagrank.dsn.load_env"), patch("bagrank.dsn.PNL_COLLECTOR_ENV") as pnl_env, patch.dict(
             os.environ, roi_only, clear=True
@@ -591,6 +603,26 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertEqual(closed_cycle_ts(now), "2026-09-13T02:00:00Z")
         self.assertFalse(should_append_hour("2026-09-13T02:00:00Z", "2026-09-13T02:00:00Z"))
         self.assertTrue(should_append_hour("2026-09-13T02:00:00Z", "2026-09-13T03:00:00Z"))
+
+    def test_pnl_gather_catches_up_one_hour_and_waits_settle(self) -> None:
+        from datetime import datetime, timezone
+
+        from bagrank.hlcycle import cycle_ready_to_gather, next_cycle_to_gather
+
+        self.assertEqual(
+            next_cycle_to_gather("2026-09-18T11:00:00Z", "2026-09-18T13:00:00Z"),
+            "2026-09-18T12:00:00Z",
+        )
+        self.assertEqual(next_cycle_to_gather("2026-09-18T13:00:00Z", "2026-09-18T13:00:00Z"), "")
+        self.assertEqual(next_cycle_to_gather("", "2026-09-18T13:00:00Z"), "2026-09-18T13:00:00Z")
+        at_hour = datetime(2026, 9, 18, 14, 0, 0, tzinfo=timezone.utc)
+        self.assertFalse(
+            cycle_ready_to_gather("2026-09-18T13:00:00Z", now=at_hour, settle_s=120)
+        )
+        later = datetime(2026, 9, 18, 14, 2, 0, tzinfo=timezone.utc)
+        self.assertTrue(
+            cycle_ready_to_gather("2026-09-18T13:00:00Z", now=later, settle_s=120)
+        )
 
     def test_score_wallet_flow_picks_rising_wallets(self) -> None:
         import numpy as np
@@ -1218,6 +1250,8 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn("LiveBoard", src)
         self.assertIn("panel = load_panel", src)
         self.assertIn("_mids_from_info", src)
+        self.assertIn("seed_recent_board", src)
+        self.assertIn('kind="pnl"', src)
         self.assertIn("seed_local_hours", src)
         self.assertIn("rank_by", src)
         self.assertNotIn("sync_neon", src)
@@ -1231,7 +1265,7 @@ class UniverseAndDsnTests(unittest.TestCase):
         self.assertIn('mode = "live"', main_src)
         self.assertIn("need_hours", src)
         self.assertIn("rank_by=board_kind", src)
-        self.assertIn("Gathering PnL board from Hyperliquid", src)
+        self.assertIn("NEON_DATABASE_PNL", src)
         self.assertNotIn("NEON_PNL", src)
 
     def test_pnl_spec_trades_before_72h_retain(self) -> None:

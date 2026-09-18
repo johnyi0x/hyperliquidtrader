@@ -136,8 +136,9 @@ class NeonSource(Source):
                 time.sleep(delay)
         if self.conn is None:
             raise RuntimeError(
-                "Could not connect to Neon. Set NEON_BAGRANK (ROI) or NEON_PNL (PnL) "
-                "in this repo's .env to the collector DB URI (direct host, sslmode=require). "
+                "Could not connect to Neon. Set NEON_BAGRANK (ROI) or "
+                "NEON_DATABASE_PNL / NEON_PNL (PnL) in this repo's .env "
+                "(direct host, sslmode=require). If the handshake resets, turn VPN off first. "
                 "Wake the project in the Neon console if it is idle. Last error: %s"
                 % last
             ) from last
@@ -468,9 +469,17 @@ def seed_recent_board(
     hours: int,
     *,
     venue: str = VENUE_DEFAULT,
+    kind: str = "roi",
 ) -> int:
-    """One-shot copy of the last N collector hours. Does not stay connected."""
-    url, _src = resolve_database_url()
+    """One-shot copy of the last N finished collector hours. Does not stay connected.
+
+    PnL collector cycles often take 2–20 minutes, so only status=ok/partial hours
+    are copied (an in-progress hour is skipped). Live then rolls forward on HL.
+    """
+    if str(kind or "").strip().lower() == "pnl":
+        url, src = resolve_pnl_database_url()
+    else:
+        url, src = resolve_database_url()
     if not url:
         return 0
     from .hlcycle import prune_old_hours
@@ -491,6 +500,12 @@ def seed_recent_board(
             conn.commit()
         finally:
             conn.close()
+        log.info(
+            "Neon %s seed via %s: %s finished hours (lookback only, then Hyperliquid).",
+            kind,
+            src,
+            len(cycles),
+        )
         return len(cycles)
     finally:
         neon.close()
@@ -541,7 +556,7 @@ def sync_neon(
 ) -> dict[str, Any]:
     if kind == "pnl":
         url, src = resolve_pnl_database_url(dsn)
-        hint = "NEON_PNL"
+        hint = "NEON_DATABASE_PNL or NEON_PNL"
         label = "PnL collector"
     else:
         url, src = resolve_database_url(dsn)
@@ -579,7 +594,7 @@ def main(argv: list[str] | None = None, *, kind: str = "roi") -> int:
     is_pnl = kind == "pnl"
     sqlite_default = default_pnl_sqlite_path() if is_pnl else default_sqlite_path()
     label = "PnL-ranked" if is_pnl else "ROI-ranked"
-    env_name = "NEON_PNL" if is_pnl else "NEON_BAGRANK"
+    env_name = "NEON_DATABASE_PNL / NEON_PNL" if is_pnl else "NEON_BAGRANK"
     sqlite_help = (
         "Local sqlite path (default data/pnlrank/pnlrank.sqlite)"
         if is_pnl

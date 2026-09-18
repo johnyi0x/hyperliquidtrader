@@ -375,18 +375,25 @@ def run_live(
     max_lev_map = fetch_exchange_max_lev()
     if board_kind == "pnl":
         try:
-            from .backup import seed_local_hours
+            from .backup import seed_local_hours, seed_recent_board
 
-            seeded = seed_local_hours(default_pnl_sqlite_path(), sqlite_path, keep_hours)
+            seeded = seed_recent_board(sqlite_path, need_hours, kind="pnl")
             if seeded:
-                log.info("Local PnL backup seed: %s hours. Neon is not used.", seeded)
+                log.info(
+                    "Neon PnL seed once: %s hours (lookback only). Neon will not be queried again.",
+                    seeded,
+                )
+            else:
+                seeded = seed_local_hours(default_pnl_sqlite_path(), sqlite_path, need_hours)
+                if seeded:
+                    log.info("Local PnL backup seed: %s hours. Neon was not used.", seeded)
         except Exception as exc:
-            log.warning("Local PnL seed skipped: %s", exc)
+            log.warning("PnL lookback seed skipped: %s", exc)
     else:
         try:
             from .backup import seed_recent_board
 
-            seeded = seed_recent_board(sqlite_path, keep_hours)
+            seeded = seed_recent_board(sqlite_path, need_hours, kind="roi")
             if seeded:
                 log.info("Neon backfill once: %s hours. Neon will not be queried again.", seeded)
         except Exception as exc:
@@ -493,7 +500,7 @@ def run_live(
             _save_state(state_path, state)
         elif not logged_wait:
             if board_kind == "pnl":
-                hint = "Gathering PnL board from Hyperliquid. Neon is not used."
+                hint = "Set NEON_DATABASE_PNL to backfill lookback once, then Hyperliquid rolls the window."
             else:
                 hint = "Set NEON_DATABASE to backfill once."
             log.info("Waiting for %s lookback hours (have %s). %s", need_hours, have, hint)

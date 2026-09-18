@@ -136,10 +136,13 @@ def resolve_database_url(explicit: str = "") -> tuple[str, str]:
 
 
 def resolve_pnl_database_url(explicit: str = "") -> tuple[str, str]:
-    """PnL collector Neon. Never uses NEON_BAGRANK or the ROI collector DATABASE_URL."""
+    """PnL collector Neon. Never uses NEON_BAGRANK, NEON_DATABASE, or ROI DATABASE_URL."""
     if explicit.strip():
         return prepare_dsn(explicit), "--dsn"
     load_env()
+    raw = (os.environ.get("NEON_DATABASE_PNL") or "").strip()
+    if raw:
+        return prepare_dsn(raw), "NEON_DATABASE_PNL"
     raw = (os.environ.get("NEON_PNL") or "").strip()
     if raw:
         return prepare_dsn(raw), "NEON_PNL"

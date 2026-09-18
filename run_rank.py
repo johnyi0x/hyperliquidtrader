@@ -1,8 +1,9 @@
 """Live rank trader. Reads rank_live.csv (header + one copied backtest row).
 
 Rebuilds the hourly bag-rank board from Hyperliquid (leaderboard + wallet
-snapshots), same tally as the collector. Neon is not used for PnL; ROI may
-seed lookback hours once from NEON_DATABASE then never again.
+snapshots), same tally as the collector. At boot only, copies enough lookback
+hours from Neon (`NEON_DATABASE` for ROI, `NEON_DATABASE_PNL` for PnL) then
+never queries Neon again.
 
 `board=pnl` in the CSV row snapshots top-week PnL wallets (like the PnL
 collector). `board=roi` (default) snapshots top-week ROI wallets.
