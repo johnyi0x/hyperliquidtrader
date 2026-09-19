@@ -107,6 +107,44 @@ def apply_size_weights(panel: RankPanel, tc: np.ndarray, tw: np.ndarray, spec: d
     return out
 
 
+def board_rank1(hourly: RankPanel, spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Current board #1 on the strategy's closed step bar (coin + side + lev)."""
+    step = max(1, int(spec.get("step_h") or 1))
+    panel = resample_closed(hourly, step)
+    if panel.n_times < 1:
+        return None
+    t = panel.n_times - 1
+    lead = -1
+    best_r = 10**9
+    for c in range(panel.n_coins):
+        r = int(panel.rank[t, c])
+        if r > 0 and r < best_r:
+            best_r = r
+            lead = c
+    if lead < 0:
+        return None
+    sd = int(panel.side[t, lead])
+    side = "long" if sd >= 0 else "short"
+    lev = float(panel.mean_leverage[t, lead]) if panel.mean_leverage is not None else 1.0
+    if lev < 1.0:
+        lev = 1.0
+    wallets = float(panel.wallets[t, lead]) if panel.wallets is not None else 1.0
+    px = float(panel.marks[t, lead]) if panel.marks is not None else 0.0
+    mx = 0.0
+    if getattr(panel, "max_leverage", None) is not None and lead < int(panel.max_leverage.shape[0]):
+        mx = float(panel.max_leverage[lead])
+    return {
+        "coin": panel.coins[lead],
+        "side": side,
+        "wallets": max(wallets, 1.0),
+        "lev": lev,
+        "max_lev": mx,
+        "px": px,
+        "bar_unix": int(panel.cycle_unix[t]),
+        "signal_unix": int(panel.cycle_unix[t]),
+    }
+
+
 def lagged_holdings(hourly: RankPanel, spec: dict[str, Any]) -> list[dict[str, Any]]:
     """Same names the simulator would hold at the last bar (next-bar fill)."""
     step = max(1, int(spec.get("step_h") or 1))

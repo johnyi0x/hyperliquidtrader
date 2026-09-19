@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .dsn import default_live_sqlite_path, default_pnl_sqlite_path, load_env
-from .engine import lagged_holdings
+from .engine import board_rank1, lagged_holdings
 from .hlcycle import LiveBoard
 from .kernels import NAME_TO_ID
 from .lev import DEFAULT_LEV_X, DEFAULT_MAX_LEV, apply_exchange_max_lev, fetch_exchange_max_lev, pair_size_lev
@@ -46,6 +46,55 @@ def live_hour_windows(spec: dict[str, Any]) -> tuple[int, int]:
     if spec_board(spec) == "pnl" or str(spec.get("name") or "") == "follow_rank1":
         keep = max(keep, 72)
     return need, keep
+
+
+def reset_follow_rank1_boot_gate(state: dict[str, Any]) -> None:
+    """Each process start: ignore history arming; wait for a fresh #1 from now."""
+    state.pop("follow_armed", None)
+    state.pop("follow_seed_coin", None)
+    state.pop("follow_seed_side", None)
+
+
+def gate_follow_rank1_holds(
+    holds: list[dict[str, Any]],
+    panel: Any,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Stay flat on the boot #1; after the first fresh #1 change, follow #1.
+
+    Neon/HL history can already arm the kernel mid-rally. Live must not enter
+    that stale leader — seed whatever is #1 at boot, wait for coin/side change,
+    then use normal lagged targets (which track later #1 flips).
+    """
+    lead = board_rank1(panel, spec)
+    if lead is None:
+        return []
+    coin = str(lead["coin"])
+    side = str(lead["side"])
+    seed_coin = state.get("follow_seed_coin")
+    if not seed_coin:
+        state["follow_seed_coin"] = coin
+        state["follow_seed_side"] = side
+        state["follow_armed"] = False
+        log.info(
+            "follow_rank1: seeded boot #1 %s %s — flat until a new #1 appears",
+            coin,
+            side,
+        )
+        return []
+    if not state.get("follow_armed"):
+        if coin == str(seed_coin) and side == str(state.get("follow_seed_side") or side):
+            return []
+        state["follow_armed"] = True
+        log.info(
+            "follow_rank1: fresh #1 %s %s (was %s %s) — armed; following #1 changes from here",
+            coin,
+            side,
+            seed_coin,
+            state.get("follow_seed_side"),
+        )
+    return holds
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -354,6 +403,12 @@ def run_live(
         signal.signal(signal.SIGTERM, _request_stop)
     state_path = state_path or (sqlite_path.parent / "live_state.json")
     state = _load_state(state_path)
+    if str(spec.get("name") or "") == "follow_rank1":
+        reset_follow_rank1_boot_gate(state)
+        log.info(
+            "follow_rank1: on this boot will seed the current PnL/ROI #1 and stay flat "
+            "until that #1 changes, then follow every later #1 flip"
+        )
     last_signal = ""
     client = None
     book = None
@@ -431,6 +486,8 @@ def run_live(
         have = 0 if panel is None else panel.n_times
         if have >= need_hours:
             holds = lagged_holdings(panel, spec)
+            if str(spec.get("name") or "") == "follow_rank1":
+                holds = gate_follow_rank1_holds(holds, panel, spec, state)
             equity = float(spec.get("equity") or 1000.0)
             marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
             try:

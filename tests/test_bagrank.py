@@ -1449,6 +1449,46 @@ class FollowRank1Tests(unittest.TestCase):
         self.assertEqual(int(tc[3, 0]), bbb)
         self.assertEqual(int(tc[4, 0]), bbb)
 
+    def test_live_gate_waits_for_fresh_rank1_then_follows(self) -> None:
+        from bagrank.engine import lagged_holdings
+        from bagrank.live import gate_follow_rank1_holds, reset_follow_rank1_boot_gate
+
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(6)]
+        rows: list[dict] = []
+        for i, cycle in enumerate(hours):
+            if i < 4:
+                rows.append(_meta(cycle, "AAA", 1, 50))
+                rows.append(_meta(cycle, "BBB", 2, 40))
+            else:
+                rows.append(_meta(cycle, "BBB", 1, 50))
+                rows.append(_meta(cycle, "AAA", 2, 40))
+        panel = panel_from_meta_rows(rows)
+        panel.marks[:] = 10.0
+        spec = {
+            "engine": "named",
+            "name": "follow_rank1",
+            "board": "pnl",
+            "step_h": 1,
+            "exec_lag": 1,
+            "slots": 1,
+            "enter_top": 1,
+        }
+        # History already flipped AAA→BBB so kernel is armed; live must still wait.
+        early = panel_from_meta_rows(rows[:4])
+        early.marks[:] = 10.0
+        state: dict = {}
+        reset_follow_rank1_boot_gate(state)
+        flat = gate_follow_rank1_holds(lagged_holdings(early, spec), early, spec, state)
+        self.assertEqual(flat, [])
+        self.assertEqual(state["follow_seed_coin"], "AAA")
+        self.assertFalse(state["follow_armed"])
+        still = gate_follow_rank1_holds(lagged_holdings(early, spec), early, spec, state)
+        self.assertEqual(still, [])
+        armed_holds = gate_follow_rank1_holds(lagged_holdings(panel, spec), panel, spec, state)
+        self.assertTrue(state["follow_armed"])
+        self.assertEqual(state["follow_seed_coin"], "AAA")
+        self.assertTrue(any(h["coin"] == "BBB" for h in armed_holds))
+
     def test_shortlist_pnl_ranks_by_pnl_not_roi(self) -> None:
         from bagrank.hlcycle import shortlist_top_pnl, shortlist_top_roi
 
