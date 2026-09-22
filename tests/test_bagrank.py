@@ -1659,6 +1659,35 @@ class FollowRank1Tests(unittest.TestCase):
         self.assertEqual(_maker_attempts(), 5)
         self.assertEqual(_maker_wait_s(), 20.0)
 
+    def test_fit_open_size_caps_to_margin(self) -> None:
+        from bagrank.live import _fit_open_size, _weight_targets
+
+        class _Client:
+            sz_decimals = 4
+
+            def get_account_value(self, force=False):
+                return 54.0
+
+        # CSV gross 140% at 25x would ask ~$1890 notional / ~0.022 BTC @ 87k.
+        oversized = 0.0224
+        fitted = _fit_open_size(_Client(), oversized, 87000.0, 25)
+        self.assertLess(fitted, oversized)
+        # 90% equity * lev / px, floored to sz decimals
+        max_sz = (54.0 * 0.90 * 25) / 87000.0
+        self.assertLessEqual(fitted, max_sz + 1e-12)
+        self.assertGreater(fitted, max_sz * 0.9)
+        # Weight targets clamp gross_pct>100 down to 100%.
+        w = _weight_targets(
+            [{"coin": "BTC", "wallets": 1, "px": 87000.0, "side": "long", "lev": 25}],
+            equity=54.0,
+            gross_pct=140.0,
+            max_pair_share=1.0,
+            use_lev=1,
+            slots=1,
+        )
+        self.assertEqual(len(w), 1)
+        self.assertAlmostEqual(w[0]["notional"] / 25.0, 54.0, places=4)
+
     def test_shortlist_pnl_ranks_by_pnl_not_roi(self) -> None:
         from bagrank.hlcycle import shortlist_top_pnl, shortlist_top_roi
 

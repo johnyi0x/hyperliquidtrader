@@ -210,12 +210,13 @@ def _weight_targets(
         return []
     n = len(holds)
     slot_n = max(int(slots or n), 1)
-    gross = max(0.05, min(2.0, float(gross_pct) / 100.0))
+    # Margin ≈ equity * gross * weight; keep gross ≤ 1 so opens fit account equity.
+    gross = max(0.05, min(1.0, float(gross_pct) / 100.0))
     if int(exposure_mode) == 1:
         gross *= n / float(slot_n)
     elif int(exposure_mode) == 2:
         gross *= (n / float(slot_n)) ** 0.5
-    gross = max(0.05, min(2.0, gross))
+    gross = max(0.05, min(1.0, gross))
     out: list[dict[str, Any]] = []
     for h in holds:
         px = float(h.get("px") or 0)
@@ -437,6 +438,34 @@ def _live_maker_close(client, coin: str) -> bool:
     return ok
 
 
+def _fit_open_size(client, size: float, px: float, lev: int) -> float:
+    """Cap size so isolated margin (notional/lev) fits ~90% of free equity."""
+    from src.pricing import floor_size
+
+    equity = float(client.get_account_value(force=True) or 0)
+    lev_i = max(1, int(lev))
+    px_f = float(px or 0)
+    if equity <= 0 or px_f <= 0:
+        return 0.0
+    max_ntl = equity * 0.90 * float(lev_i)
+    fitted = min(float(size), max_ntl / px_f)
+    out = floor_size(fitted, client.sz_decimals)
+    if out <= 0:
+        from src.pricing import round_size
+
+        out = round_size(fitted, client.sz_decimals)
+    if fitted + 1e-12 < float(size):
+        log.info(
+            "Size capped to margin: equity=$%.2f lev=%sx max_ntl=$%.1f sz %.6f -> %.6f",
+            equity,
+            lev_i,
+            max_ntl,
+            size,
+            out,
+        )
+    return out
+
+
 def _live_maker_open(client, coin: str, side: str, size: float, lev: int) -> bool:
     """Open via post-only mid limits, market only if unfilled after retries."""
     from src.market_resolver import resolve_market
@@ -444,34 +473,75 @@ def _live_maker_open(client, coin: str, side: str, size: float, lev: int) -> boo
 
     market = resolve_market(client.info, coin)
     client.apply_market(market)
-    size = floor_size(float(size), client.sz_decimals)
-    if size <= 0:
-        size = round_size(float(size), client.sz_decimals)
-    if size <= 0:
-        log.warning("Open %s size rounds to zero — skip", coin)
-        return False
     try:
-        client.set_leverage(max(1, int(lev)))
+        mids = _mids(client)
+        px = float(mids.get(coin) or 0)
+    except Exception:
+        px = 0.0
+    if px <= 0:
+        try:
+            l2 = client.l2_book()
+            bids, asks = l2["levels"][0], l2["levels"][1]
+            px = (float(bids[0]["px"]) + float(asks[0]["px"])) / 2.0
+        except Exception as exc:
+            log.warning("No mid for %s: %s", coin, exc)
+            return False
+
+    lev_i = max(1, int(lev))
+    try:
+        client.set_leverage(lev_i)
     except Exception as exc:
         log.warning("set_leverage %s failed (continuing): %s", coin, exc)
+
+    size = _fit_open_size(client, size, px, lev_i)
+    if size <= 0:
+        log.warning("Open %s size rounds to zero after margin fit — skip", coin)
+        return False
+
     try:
         client.cancel_entry_orders_for_coin()
     except Exception:
         pass
+
     is_buy = str(side) == "long"
-    log.info(
-        "LIVE maker-open %s %s sz=%s (post-only mid x%s @ %.0fs, then market)",
-        coin,
-        side,
-        size,
-        _maker_attempts(),
-        _maker_wait_s(),
-    )
-    ex = _order_executor(client)
-    ok = ex.execute_mid_open(is_buy, size)
-    if not ok:
-        log.warning("Maker-open %s incomplete — will retry next cycle", coin)
-    return ok
+    # Shrink + retry on insufficient margin (equity/buffer edge cases).
+    for shrink in range(4):
+        sz = floor_size(size * (0.85 ** shrink), client.sz_decimals)
+        if sz <= 0:
+            sz = round_size(size * (0.85 ** shrink), client.sz_decimals)
+        if sz <= 0:
+            break
+        log.info(
+            "LIVE maker-open %s %s sz=%s (post-only mid x%s @ %.0fs, then market)%s",
+            coin,
+            side,
+            sz,
+            _maker_attempts(),
+            _maker_wait_s(),
+            f" shrink={shrink}" if shrink else "",
+        )
+        try:
+            ex = _order_executor(client)
+            ok = ex.execute_mid_open(is_buy, sz)
+            if ok:
+                return True
+            log.warning("Maker-open %s incomplete — will retry next cycle", coin)
+            return False
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "insufficient margin" in msg:
+                log.warning(
+                    "Open %s insufficient margin at sz=%s — shrinking: %s",
+                    coin,
+                    sz,
+                    exc,
+                )
+                time.sleep(0.5)
+                continue
+            log.warning("Open %s failed: %s", coin, exc)
+            return False
+    log.warning("Open %s failed after margin shrinks — retry next cycle", coin)
+    return False
 
 
 def _apply_live(
@@ -774,10 +844,12 @@ def run_live(
                         log.warning("Live equity failed: %s", exc)
                 elif book is not None:
                     equity = book.equity(marks)
+                # CSV may have gross_pct>100 (backtest); live needs margin headroom.
+                live_gross = min(float(spec.get("gross_pct") or 95), 95.0)
                 sized = _weight_targets(
                     holds,
                     equity=equity,
-                    gross_pct=float(spec.get("gross_pct") or 95),
+                    gross_pct=live_gross,
                     max_pair_share=float(spec.get("max_pair_share") or 0.7),
                     use_lev=int(spec.get("use_lev") or 0),
                     slots=int(spec.get("slots") or 0),
