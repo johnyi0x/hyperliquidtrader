@@ -1450,7 +1450,6 @@ class FollowRank1Tests(unittest.TestCase):
         self.assertEqual(int(tc[4, 0]), bbb)
 
     def test_live_gate_waits_for_fresh_rank1_then_follows(self) -> None:
-        from bagrank.engine import lagged_holdings
         from bagrank.live import gate_follow_rank1_holds, reset_follow_rank1_boot_gate
 
         hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(6)]
@@ -1468,26 +1467,177 @@ class FollowRank1Tests(unittest.TestCase):
             "engine": "named",
             "name": "follow_rank1",
             "board": "pnl",
-            "step_h": 1,
-            "exec_lag": 1,
+            "step_h": 8,
+            "exec_lag": 2,
             "slots": 1,
             "enter_top": 1,
         }
-        # History already flipped AAA→BBB so kernel is armed; live must still wait.
         early = panel_from_meta_rows(rows[:4])
         early.marks[:] = 10.0
         state: dict = {}
         reset_follow_rank1_boot_gate(state)
-        flat = gate_follow_rank1_holds(lagged_holdings(early, spec), early, spec, state)
+        flat = gate_follow_rank1_holds([], early, spec, state, held={})
         self.assertEqual(flat, [])
         self.assertEqual(state["follow_seed_coin"], "AAA")
         self.assertFalse(state["follow_armed"])
-        still = gate_follow_rank1_holds(lagged_holdings(early, spec), early, spec, state)
+        still = gate_follow_rank1_holds([], early, spec, state, held={})
         self.assertEqual(still, [])
-        armed_holds = gate_follow_rank1_holds(lagged_holdings(panel, spec), panel, spec, state)
+        armed_holds = gate_follow_rank1_holds([], panel, spec, state, held={})
         self.assertTrue(state["follow_armed"])
-        self.assertEqual(state["follow_seed_coin"], "AAA")
-        self.assertTrue(any(h["coin"] == "BBB" for h in armed_holds))
+        self.assertEqual(len(armed_holds), 1)
+        self.assertEqual(armed_holds[0]["coin"], "BBB")
+
+    def test_redeploy_keeps_open_rank1_btc(self) -> None:
+        """Railway redeploy with BTC open while BTC is still #1 must keep BTC."""
+        from bagrank.live import gate_follow_rank1_holds, reset_follow_rank1_boot_gate
+
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(3)]
+        rows: list[dict] = []
+        for cycle in hours:
+            rows.append(_meta(cycle, "BTC", 1, 80))
+            rows.append(_meta(cycle, "ETH", 2, 20))
+        panel = panel_from_meta_rows(rows)
+        panel.marks[:] = 10.0
+        spec = {"name": "follow_rank1", "board": "pnl", "step_h": 8, "exec_lag": 2}
+        state: dict = {}
+        reset_follow_rank1_boot_gate(state)
+        # Flat would wait — but exchange already has BTC long (#1).
+        holds = gate_follow_rank1_holds(
+            [], panel, spec, state, held={"BTC": "long"}
+        )
+        self.assertEqual(len(holds), 1)
+        self.assertEqual(holds[0]["coin"], "BTC")
+        self.assertTrue(state["follow_armed"])
+        # Still #1 next cycle — keep targeting BTC (apply will not close).
+        again = gate_follow_rank1_holds(
+            [], panel, spec, state, held={"BTC": "long"}
+        )
+        self.assertEqual(again[0]["coin"], "BTC")
+
+    def test_redeploy_flips_when_open_is_not_rank1(self) -> None:
+        from bagrank.live import gate_follow_rank1_holds, reset_follow_rank1_boot_gate
+
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(2)]
+        rows: list[dict] = []
+        for cycle in hours:
+            rows.append(_meta(cycle, "ETH", 1, 80))
+            rows.append(_meta(cycle, "BTC", 2, 20))
+        panel = panel_from_meta_rows(rows)
+        panel.marks[:] = 10.0
+        spec = {"name": "follow_rank1", "board": "pnl"}
+        state: dict = {}
+        reset_follow_rank1_boot_gate(state)
+        holds = gate_follow_rank1_holds(
+            [], panel, spec, state, held={"BTC": "long"}
+        )
+        self.assertEqual(holds[0]["coin"], "ETH")
+        self.assertTrue(state["follow_armed"])
+
+    def test_live_gate_ignores_stale_lagged_kernel_eth(self) -> None:
+        """Reproduce log bug: lagged kernel said ETH while hourly board #1 is BTC."""
+        from bagrank.engine import lagged_holdings
+        from bagrank.live import gate_follow_rank1_holds
+
+        hours = [f"2026-01-01T{h:02d}:00:00Z" for h in range(24)]
+        rows: list[dict] = []
+        for i, cycle in enumerate(hours):
+            if i < 8:
+                rows.append(_meta(cycle, "ETH", 1, 50))
+                rows.append(_meta(cycle, "BTC", 2, 40))
+            elif i < 16:
+                rows.append(_meta(cycle, "BTC", 1, 50))
+                rows.append(_meta(cycle, "ETH", 2, 40))
+            else:
+                rows.append(_meta(cycle, "BTC", 1, 80))
+                rows.append(_meta(cycle, "ETH", 2, 20))
+        panel = panel_from_meta_rows(rows)
+        panel.marks[:] = 10.0
+        spec = {
+            "engine": "named",
+            "name": "follow_rank1",
+            "board": "pnl",
+            "step_h": 8,
+            "exec_lag": 2,
+            "slots": 1,
+            "enter_top": 1,
+        }
+        state: dict = {
+            "follow_seed_coin": "ETH",
+            "follow_seed_side": "long",
+            "follow_armed": True,
+        }
+        lagged = lagged_holdings(panel, spec)
+        live = gate_follow_rank1_holds(lagged, panel, spec, state, held={"BTC": "long"})
+        self.assertEqual(len(live), 1)
+        self.assertEqual(live[0]["coin"], "BTC")
+        if lagged and lagged[0]["coin"] != "BTC":
+            self.assertNotEqual(lagged[0]["coin"], live[0]["coin"])
+
+    def test_follow_rank1_live_windows_are_small(self) -> None:
+        from bagrank.live import live_hour_windows
+
+        need, keep = live_hour_windows(
+            {"name": "follow_rank1", "board": "pnl", "step_h": 8, "lookback": 6, "exec_lag": 2}
+        )
+        self.assertEqual(need, 2)
+        self.assertEqual(keep, 72)
+
+    def test_follow_rank1_normalize_forces_one_slot(self) -> None:
+        from bagrank.live import normalize_follow_rank1_spec
+
+        spec = normalize_follow_rank1_spec(
+            {"name": "follow_rank1", "family": "named", "slots": 8, "enter_top": 0}
+        )
+        self.assertEqual(spec["slots"], 1)
+        self.assertEqual(spec["enter_top"], 1)
+        self.assertEqual(spec["family"], "follow_rank1")
+        self.assertEqual(spec["max_pair_share"], 1.0)
+
+    def test_follow_rank1_force_flip_closes_old_before_open(self) -> None:
+        import time as time_mod
+
+        from bagrank.live import PaperBook, _apply_paper
+
+        book = PaperBook(1000.0)
+        book.positions["BTC"] = {"side": "long", "size": 1.0, "entry": 100.0}
+        state = {"opened": {"BTC": time_mod.time()}}
+        desired = [
+            {"coin": "ETH", "side": "long", "size": 1.0, "px": 10.0, "notional": 100.0}
+        ]
+        _apply_paper(
+            book,
+            desired,
+            state,
+            min_hold_h=24,
+            marks={"BTC": 100.0, "ETH": 10.0},
+            slots=8,
+            force_flip=True,
+        )
+        self.assertNotIn("BTC", book.positions)
+        self.assertIn("ETH", book.positions)
+        self.assertEqual(len(book.positions), 1)
+
+    def test_follow_rank1_soft_open_blocks_double_entry(self) -> None:
+        import time as time_mod
+
+        from bagrank.live import PaperBook, _apply_paper
+
+        book = PaperBook(1000.0)
+        # Exchange has not reported the fill yet, but we already sent the open.
+        state = {"opened": {"ETH": time_mod.time()}}
+        desired = [
+            {"coin": "ETH", "side": "long", "size": 1.0, "px": 10.0, "notional": 100.0}
+        ]
+        _apply_paper(
+            book,
+            desired,
+            state,
+            min_hold_h=0,
+            marks={"ETH": 10.0},
+            slots=1,
+            force_flip=True,
+        )
+        self.assertEqual(book.positions, {})
 
     def test_shortlist_pnl_ranks_by_pnl_not_roi(self) -> None:
         from bagrank.hlcycle import shortlist_top_pnl, shortlist_top_roi

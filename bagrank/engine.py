@@ -107,6 +107,11 @@ def apply_size_weights(panel: RankPanel, tc: np.ndarray, tw: np.ndarray, spec: d
     return out
 
 
+def hourly_board_rank1(hourly: RankPanel) -> dict[str, Any] | None:
+    """Latest finished hour's meta_index rank=1 (same coin the bagrank PnL site shows)."""
+    return board_rank1(hourly, {"step_h": 1})
+
+
 def board_rank1(hourly: RankPanel, spec: dict[str, Any]) -> dict[str, Any] | None:
     """Current board #1 on the strategy's closed step bar (coin + side + lev)."""
     step = max(1, int(spec.get("step_h") or 1))

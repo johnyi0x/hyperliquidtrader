@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .dsn import default_live_sqlite_path, default_pnl_sqlite_path, load_env
-from .engine import board_rank1, lagged_holdings
+from .engine import hourly_board_rank1, lagged_holdings
 from .hlcycle import LiveBoard
 from .kernels import NAME_TO_ID
 from .lev import DEFAULT_LEV_X, DEFAULT_MAX_LEV, apply_exchange_max_lev, fetch_exchange_max_lev, pair_size_lev
@@ -35,24 +35,39 @@ def spec_board(spec: dict[str, Any]) -> str:
 def live_hour_windows(spec: dict[str, Any]) -> tuple[int, int]:
     """Hours of board needed to trade, and hours kept on disk.
 
-    PnL rank moves slowly so we retain 72h, but we start as soon as the spec's
-    lookback+lag bars exist (otherwise Railway sits idle for three days).
+    follow_rank1 only needs the latest finished HL hour (rank=1). Keep 72h so a
+    missed gather still has recent boards. Other strategies need lookback+lag bars.
     """
+    if str(spec.get("name") or "") == "follow_rank1":
+        return 2, 72
     step = max(1, int(spec.get("step_h") or 1))
     look = max(1, int(spec.get("lookback") or 1))
     lag = max(0, int(spec.get("exec_lag") or 1))
     need = max(2, (look + lag) * step)
     keep = need
-    if spec_board(spec) == "pnl" or str(spec.get("name") or "") == "follow_rank1":
+    if spec_board(spec) == "pnl":
         keep = max(keep, 72)
     return need, keep
 
 
+def normalize_follow_rank1_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """follow_rank1 live: one slot on latest HL week-PnL board #1."""
+    if str(spec.get("name") or "") != "follow_rank1":
+        return spec
+    spec["engine"] = "named"
+    spec["family"] = "follow_rank1"
+    spec["board"] = "pnl"
+    spec["slots"] = 1
+    spec["enter_top"] = 1
+    spec["max_pair_share"] = 1.0
+    return spec
+
+
 def reset_follow_rank1_boot_gate(state: dict[str, Any]) -> None:
-    """Each process start: ignore history arming; wait for a fresh #1 from now."""
-    state.pop("follow_armed", None)
-    state.pop("follow_seed_coin", None)
-    state.pop("follow_seed_side", None)
+    """Clear follow_* boot flags. Does not touch exchange positions or opened{}."""
+    for key in list(state.keys()):
+        if str(key).startswith("follow_"):
+            state.pop(key, None)
 
 
 def gate_follow_rank1_holds(
@@ -60,41 +75,106 @@ def gate_follow_rank1_holds(
     panel: Any,
     spec: dict[str, Any],
     state: dict[str, Any],
+    *,
+    held: dict[str, str] | None = None,
+    now: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Stay flat on the boot #1; after the first fresh #1 change, follow #1.
+    """Hold exactly the latest finished-hour HL week-PnL board #1 (1 coin).
 
-    Neon/HL history can already arm the kernel mid-rally. Live must not enter
-    that stale leader — seed whatever is #1 at boot, wait for coin/side change,
-    then use normal lagged targets (which track later #1 flips).
+    Redeploy-safe:
+    - If exchange already has any position → always target current #1 (keep if
+      it matches, flip if not). Never flatten a still-#1 BTC on restart.
+    - If flat → seed boot #1 and stay flat until hourly #1 changes, then enter.
+
+    Ignores lagged kernel / CSV step_h / exec_lag (backtest-only params).
     """
-    lead = board_rank1(panel, spec)
+    del holds, spec, now
+    lead = hourly_board_rank1(panel)
     if lead is None:
         return []
     coin = str(lead["coin"])
     side = str(lead["side"])
+    bar_unix = int(lead.get("bar_unix") or 0)
+    stamp = (coin, side, bar_unix)
+    if state.get("follow_last_logged") != stamp:
+        log.info(
+            "follow_rank1: HL week-PnL board #1 %s %s @ %s",
+            coin,
+            side,
+            to_iso(bar_unix) if bar_unix else "?",
+        )
+        state["follow_last_logged"] = stamp
+
+    held_map = {str(c): str(s) for c, s in (held or {}).items() if c and s}
+
+    # Already in the market (e.g. Railway redeploy with BTC open): track #1.
+    if held_map:
+        state["follow_armed"] = True
+        if not state.get("follow_seed_coin"):
+            state["follow_seed_coin"] = coin
+            state["follow_seed_side"] = side
+        matching = coin in held_map and held_map[coin] == side
+        if matching and len(held_map) == 1:
+            return [lead]
+        if not matching:
+            log.info(
+                "follow_rank1: exchange has %s but #1 is %s %s — will flip",
+                list(held_map.items()),
+                coin,
+                side,
+            )
+        elif len(held_map) > 1:
+            log.info(
+                "follow_rank1: extra positions %s — keep only #1 %s %s",
+                list(held_map),
+                coin,
+                side,
+            )
+        return [lead]
+
+    # Flat: wait for a fresh #1 change before first entry.
     seed_coin = state.get("follow_seed_coin")
     if not seed_coin:
         state["follow_seed_coin"] = coin
         state["follow_seed_side"] = side
         state["follow_armed"] = False
         log.info(
-            "follow_rank1: seeded boot #1 %s %s — flat until a new #1 appears",
+            "follow_rank1: flat seed #1 %s %s — wait for hourly #1 change before entry",
             coin,
             side,
         )
         return []
+
     if not state.get("follow_armed"):
         if coin == str(seed_coin) and side == str(state.get("follow_seed_side") or side):
             return []
         state["follow_armed"] = True
         log.info(
-            "follow_rank1: fresh #1 %s %s (was %s %s) — armed; following #1 changes from here",
+            "follow_rank1: #1 changed to %s %s (was %s %s) — enter and follow #1",
             coin,
             side,
             seed_coin,
             state.get("follow_seed_side"),
         )
-    return holds
+
+    return [lead]
+
+
+def _held_sides_from_exchange(client) -> dict[str, str] | None:
+    """Return coin→side, or None if the query failed (do not treat as flat)."""
+    try:
+        ok, positions = client.fetch_open_positions(force=True)
+    except Exception as exc:
+        log.warning("Position query failed: %s", exc)
+        return None
+    if not ok:
+        log.warning("Position query failed — skip targeting this cycle")
+        return None
+    return {str(coin): str(pos.side) for coin, pos in positions}
+
+
+def _held_sides_from_book(book: "PaperBook") -> dict[str, str]:
+    return {str(c): str(p.get("side") or "") for c, p in book.positions.items()}
 
 
 def _request_stop(_signum=None, _frame=None) -> None:
@@ -273,18 +353,39 @@ def _occupied_slots(
     state: dict[str, Any],
     min_hold_h: int,
     now: float,
+    *,
+    respect_min_hold: bool = True,
 ) -> list[str]:
-    """Coins that still fill a slot (wanted, or locked by min-hold). Same as backtest."""
+    """Coins that still fill a slot (wanted, soft-open, or locked by min-hold)."""
     held: list[str] = []
     for coin, pos in have.items():
         side = _pos_side(pos)
         keep = coin in want and want[coin]["side"] == side
-        if keep or not _can_exit(state, coin, min_hold_h, now):
+        locked = respect_min_hold and not _can_exit(state, coin, min_hold_h, now)
+        if keep or locked:
+            held.append(coin)
+    # Exchange lag: treat a just-opened want coin as occupying until it appears in have.
+    for coin, opened_at in list((state.get("opened") or {}).items()):
+        if coin in held:
+            continue
+        if coin not in want:
+            continue
+        if coin in have and _pos_side(have[coin]) == want[coin]["side"]:
+            continue
+        if (now - float(opened_at or 0)) <= 180.0:
             held.append(coin)
     return held
 
 
-def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], min_hold_h: int, slots: int = 1) -> None:
+def _apply_live(
+    client,
+    desired: list[dict[str, Any]],
+    state: dict[str, Any],
+    min_hold_h: int,
+    slots: int = 1,
+    *,
+    force_flip: bool = False,
+) -> None:
     from src.market_resolver import resolve_market
     from src.pricing import round_size
 
@@ -293,6 +394,8 @@ def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], mi
         log.warning("Position query failed — skip this cycle")
         return
     have = {coin: pos for coin, pos in positions}
+    if force_flip and desired:
+        desired = desired[:1]
     want = {str(d["coin"]): d for d in desired}
     now = time.time()
     equity = float(client.get_account_value(force=True) or 0)
@@ -301,29 +404,67 @@ def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], mi
         log.info("Live equity $%.2f want %s have %s", equity, list(want), list(have))
         _apply_live._last_snap = snap
 
+    slot_n = 1 if force_flip else max(int(slots or 1), 1)
+
     for coin, pos in list(have.items()):
         keep = coin in want and want[coin]["side"] == pos.side
         if keep:
             continue
-        if not _can_exit(state, coin, min_hold_h, now):
+        if not force_flip and not _can_exit(state, coin, min_hold_h, now):
             log.info("Min-hold: keep %s", coin)
             continue
-        try:
-            market = resolve_market(client.info, coin)
-            client.apply_market(market)
-            client.place_market_close()
-            (state.setdefault("opened", {})).pop(coin, None)
-            log.info("LIVE close %s", coin)
-        except Exception as exc:
-            log.warning("Close %s failed: %s", coin, exc)
+        closed = False
+        for attempt in range(1, 4):
+            try:
+                market = resolve_market(client.info, coin)
+                client.apply_market(market)
+                client.place_market_close()
+                (state.setdefault("opened", {})).pop(coin, None)
+                log.info(
+                    "LIVE close %s%s%s",
+                    coin,
+                    " (flip)" if force_flip else "",
+                    f" attempt={attempt}" if attempt > 1 else "",
+                )
+                closed = True
+                break
+            except Exception as exc:
+                log.warning("Close %s failed (attempt %s/3): %s", coin, attempt, exc)
+                time.sleep(min(2.0 * attempt, 5.0))
+        if not closed:
+            log.warning("Close %s still failing — will retry next cycle", coin)
 
     ok, positions = client.fetch_open_positions(force=True)
     have = {coin: pos for coin, pos in (positions if ok else [])}
-    occupied = _occupied_slots(have, want, state, min_hold_h, now)
-    free = max(0, max(int(slots or 1), 1) - len(occupied))
+    for coin in list((state.get("opened") or {})):
+        if coin not in have and coin not in want:
+            (state.setdefault("opened", {})).pop(coin, None)
+    occupied = _occupied_slots(
+        have,
+        want,
+        state,
+        min_hold_h,
+        now,
+        respect_min_hold=not force_flip,
+    )
+    stray = [c for c in have if c not in want or _pos_side(have[c]) != want[c]["side"]]
+    if stray:
+        log.info("Waiting to clear stray positions before open: %s", stray)
+        return
+    # Hard cap: never more than one live position for force_flip / slots=1.
+    if slot_n <= 1 and have:
+        for coin, d in want.items():
+            if coin in have and _pos_side(have[coin]) == d["side"]:
+                return
+        if have:
+            log.info("Slot full with %s — skip open until flat", list(have))
+            return
+    free = max(0, slot_n - len(occupied))
     mids = _mids(client)
     for coin, d in want.items():
         if coin in have and _pos_side(have[coin]) == d["side"]:
+            continue
+        if coin in occupied:
             continue
         if free <= 0:
             continue
@@ -332,23 +473,40 @@ def _apply_live(client, desired: list[dict[str, Any]], state: dict[str, Any], mi
             log.warning("No price for %s — skip open", coin)
             continue
         size = float(d["size"]) if d.get("size") else float(d["notional"]) / px
-        try:
-            market = resolve_market(client.info, coin)
-            client.apply_market(market)
-            size = round_size(size, client.sz_decimals)
-            if size <= 0:
-                continue
-            lev = max(1, int(d.get("lev") or 1))
+        opened = False
+        for attempt in range(1, 4):
             try:
-                client.set_leverage(lev)
-            except Exception:
-                pass
-            client.place_market_open(d["side"] == "long", size)
-            state.setdefault("opened", {})[coin] = now
-            free -= 1
-            log.info("LIVE open %s %s sz=%s", coin, d["side"], size)
-        except Exception as exc:
-            log.warning("Open %s failed: %s", coin, exc)
+                market = resolve_market(client.info, coin)
+                client.apply_market(market)
+                size = round_size(size, client.sz_decimals)
+                if size <= 0:
+                    break
+                lev = max(1, int(d.get("lev") or 1))
+                try:
+                    client.set_leverage(lev)
+                except Exception:
+                    pass
+                client.place_market_open(d["side"] == "long", size)
+                state.setdefault("opened", {})[coin] = now
+                free -= 1
+                occupied.append(coin)
+                log.info(
+                    "LIVE open %s %s sz=%s%s",
+                    coin,
+                    d["side"],
+                    size,
+                    f" attempt={attempt}" if attempt > 1 else "",
+                )
+                opened = True
+                break
+            except Exception as exc:
+                log.warning("Open %s failed (attempt %s/3): %s", coin, attempt, exc)
+                time.sleep(min(2.0 * attempt, 5.0))
+        if not opened:
+            log.warning("Open %s still failing — will retry next cycle", coin)
+        # Only one open per cycle when force_flip.
+        if force_flip and opened:
+            break
 
 
 def _apply_paper(
@@ -358,25 +516,44 @@ def _apply_paper(
     min_hold_h: int,
     marks: dict[str, float],
     slots: int = 1,
+    *,
+    force_flip: bool = False,
 ) -> None:
     now = time.time()
+    if force_flip and desired:
+        desired = desired[:1]
     want = {str(d["coin"]): d for d in desired}
+    slot_n = 1 if force_flip else max(int(slots or 1), 1)
     for coin in list(book.positions):
         pos = book.positions[coin]
         keep = coin in want and want[coin]["side"] == pos["side"]
         if keep:
             continue
-        if not _can_exit(state, coin, min_hold_h, now):
+        if not force_flip and not _can_exit(state, coin, min_hold_h, now):
             log.info("Min-hold: keep %s", coin)
             continue
         book.close(coin, marks.get(coin) or float(pos.get("entry") or 0))
         (state.setdefault("opened", {})).pop(coin, None)
-    occupied = _occupied_slots(book.positions, want, state, min_hold_h, now)
-    free = max(0, max(int(slots or 1), 1) - len(occupied))
+    occupied = _occupied_slots(
+        book.positions,
+        want,
+        state,
+        min_hold_h,
+        now,
+        respect_min_hold=not force_flip,
+    )
+    stray = [
+        c
+        for c in book.positions
+        if c not in want or book.positions[c]["side"] != want[c]["side"]
+    ]
+    if stray:
+        return
+    free = max(0, slot_n - len(occupied))
     for coin, d in want.items():
         if coin in book.positions and book.positions[coin]["side"] == d["side"]:
             continue
-        if free <= 0:
+        if coin in occupied or free <= 0:
             continue
         px = marks.get(coin) or float(d.get("px") or 0)
         if px <= 0:
@@ -387,6 +564,8 @@ def _apply_paper(
         book.open(coin, d["side"], size, px)
         state.setdefault("opened", {})[coin] = now
         free -= 1
+        occupied.append(coin)
+
 
 
 def run_live(
@@ -401,13 +580,15 @@ def run_live(
     signal.signal(signal.SIGINT, _request_stop)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _request_stop)
+    normalize_follow_rank1_spec(spec)
+    is_follow = str(spec.get("name") or "") == "follow_rank1"
     state_path = state_path or (sqlite_path.parent / "live_state.json")
     state = _load_state(state_path)
-    if str(spec.get("name") or "") == "follow_rank1":
+    if is_follow:
         reset_follow_rank1_boot_gate(state)
         log.info(
-            "follow_rank1: on this boot will seed the current PnL/ROI #1 and stay flat "
-            "until that #1 changes, then follow every later #1 flip"
+            "follow_rank1: HL week-PnL #1 only (1 slot). Redeploy keeps an open #1; "
+            "if flat, waits for #1 change before first entry; flips when #1 changes."
         )
     last_signal = ""
     client = None
@@ -480,93 +661,123 @@ def run_live(
     )
     logged_wait = False
     while not _STOP:
-        panel = load_panel(sqlite_path) if sqlite_path.exists() else None
-        if panel is not None:
-            apply_exchange_max_lev(panel, max_lev_map)
-        have = 0 if panel is None else panel.n_times
-        if have >= need_hours:
-            holds = lagged_holdings(panel, spec)
-            if str(spec.get("name") or "") == "follow_rank1":
-                holds = gate_follow_rank1_holds(holds, panel, spec, state)
-            equity = float(spec.get("equity") or 1000.0)
-            marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
-            try:
-                marks.update(_mids_from_info(info))
-            except Exception as exc:
-                log.warning("HL mids failed: %s", exc)
-            for h in holds:
-                if h["coin"] in marks:
-                    h["px"] = marks[h["coin"]]
-            if client is not None:
+        try:
+            panel = load_panel(sqlite_path) if sqlite_path.exists() else None
+            if panel is not None:
+                apply_exchange_max_lev(panel, max_lev_map)
+            have = 0 if panel is None else panel.n_times
+            if have >= need_hours:
+                held: dict[str, str] | None = {}
+                skip_apply = False
+                if is_follow:
+                    if client is not None:
+                        held = _held_sides_from_exchange(client)
+                        if held is None:
+                            skip_apply = True
+                            held = {}
+                    elif book is not None:
+                        held = _held_sides_from_book(book)
+                    holds = gate_follow_rank1_holds([], panel, spec, state, held=held)
+                else:
+                    holds = lagged_holdings(panel, spec)
+                equity = float(spec.get("equity") or 1000.0)
+                marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
                 try:
-                    equity = float(client.get_account_value(force=True) or equity)
+                    marks.update(_mids_from_info(info))
                 except Exception as exc:
-                    log.warning("Live equity failed: %s", exc)
-            elif book is not None:
-                equity = book.equity(marks)
-            sized = _weight_targets(
-                holds,
-                equity=equity,
-                gross_pct=float(spec.get("gross_pct") or 95),
-                max_pair_share=float(spec.get("max_pair_share") or 0.7),
-                use_lev=int(spec.get("use_lev") or 0),
-                slots=int(spec.get("slots") or 0),
-                exposure_mode=int(spec.get("exposure_mode") or 0),
-                lev_x=lev_x,
-                max_lev=max_lev_map,
-            )
-            key = json.dumps(
-                [(d["coin"], d["side"]) for d in sized],
-                separators=(",", ":"),
-            )
-            sig_ts = to_iso(holds[0]["signal_unix"]) if holds else ""
-            bar_ts = to_iso(holds[0]["bar_unix"]) if holds else ""
-            changed = key != last_signal
-            if changed:
-                log.info(
-                    "Targets bar=%s signal=%s n=%s %s",
-                    bar_ts,
-                    sig_ts,
-                    len(sized),
-                    [(d["coin"], d["side"], round(d.get("notional", 0), 1)) for d in sized],
+                    log.warning("HL mids failed: %s", exc)
+                for h in holds:
+                    if h["coin"] in marks:
+                        h["px"] = marks[h["coin"]]
+                if client is not None:
+                    try:
+                        equity = float(client.get_account_value(force=True) or equity)
+                    except Exception as exc:
+                        log.warning("Live equity failed: %s", exc)
+                elif book is not None:
+                    equity = book.equity(marks)
+                sized = _weight_targets(
+                    holds,
+                    equity=equity,
+                    gross_pct=float(spec.get("gross_pct") or 95),
+                    max_pair_share=float(spec.get("max_pair_share") or 0.7),
+                    use_lev=int(spec.get("use_lev") or 0),
+                    slots=int(spec.get("slots") or 0),
+                    exposure_mode=int(spec.get("exposure_mode") or 0),
+                    lev_x=lev_x,
+                    max_lev=max_lev_map,
                 )
-                last_signal = key
-            if mode == "dry":
-                pass
-            elif mode == "paper" and book is not None:
-                _apply_paper(
-                    book,
-                    sized,
-                    state,
-                    int(spec.get("min_hold_h") or 0),
-                    marks,
-                    slots=int(spec.get("slots") or 1),
+                key = json.dumps(
+                    [(d["coin"], d["side"]) for d in sized],
+                    separators=(",", ":"),
                 )
+                sig_ts = to_iso(holds[0]["signal_unix"]) if holds else ""
+                bar_ts = to_iso(holds[0]["bar_unix"]) if holds else ""
+                changed = key != last_signal
                 if changed:
-                    log.info("PAPER equity $%.2f positions %s", book.equity(marks), list(book.positions))
-            elif mode == "live" and client is not None:
-                _apply_live(
-                    client,
-                    sized,
-                    state,
-                    int(spec.get("min_hold_h") or 0),
-                    slots=int(spec.get("slots") or 1),
-                )
-            state["last_bar"] = bar_ts
-            state["last_signal"] = sig_ts
-            _save_state(state_path, state)
-        elif not logged_wait:
-            if board_kind == "pnl":
-                hint = "Set NEON_DATABASE_PNL to backfill lookback once, then Hyperliquid rolls the window."
-            else:
-                hint = "Set NEON_DATABASE to backfill once."
-            log.info("Waiting for %s lookback hours (have %s). %s", need_hours, have, hint)
-            logged_wait = True
-        if board is not None:
-            try:
-                board.maybe_refresh()
-            except Exception as exc:
-                log.warning("HL board gather failed: %s", exc)
+                    log.info(
+                        "Targets bar=%s signal=%s n=%s %s",
+                        bar_ts,
+                        sig_ts,
+                        len(sized),
+                        [(d["coin"], d["side"], round(d.get("notional", 0), 1)) for d in sized],
+                    )
+                    last_signal = key
+                if skip_apply:
+                    log.info("Skip apply this cycle (position query failed)")
+                elif mode == "dry":
+                    pass
+                elif mode == "paper" and book is not None:
+                    try:
+                        _apply_paper(
+                            book,
+                            sized,
+                            state,
+                            int(spec.get("min_hold_h") or 0),
+                            marks,
+                            slots=int(spec.get("slots") or 1),
+                            force_flip=is_follow,
+                        )
+                    except Exception as exc:
+                        log.warning("Paper apply failed (will retry next poll): %s", exc)
+                    if changed:
+                        log.info(
+                            "PAPER equity $%.2f positions %s",
+                            book.equity(marks),
+                            list(book.positions),
+                        )
+                elif mode == "live" and client is not None:
+                    try:
+                        _apply_live(
+                            client,
+                            sized,
+                            state,
+                            int(spec.get("min_hold_h") or 0),
+                            slots=int(spec.get("slots") or 1),
+                            force_flip=is_follow,
+                        )
+                    except Exception as exc:
+                        log.warning("Live apply failed (will retry next poll): %s", exc)
+                state["last_bar"] = bar_ts
+                state["last_signal"] = sig_ts
+                try:
+                    _save_state(state_path, state)
+                except Exception as exc:
+                    log.warning("State save failed: %s", exc)
+            elif not logged_wait:
+                if board_kind == "pnl":
+                    hint = "Optional NEON_DATABASE_PNL warm-start; else HL gathers hours."
+                else:
+                    hint = "Set NEON_DATABASE to backfill once."
+                log.info("Waiting for %s lookback hours (have %s). %s", need_hours, have, hint)
+                logged_wait = True
+            if board is not None:
+                try:
+                    board.maybe_refresh()
+                except Exception as exc:
+                    log.warning("HL board gather failed (will retry): %s", exc)
+        except Exception as exc:
+            log.exception("Live loop error (continuing): %s", exc)
         time.sleep(max(5.0, float(poll_s)))
     return 0
 
@@ -610,7 +821,7 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = args.csv or default_live_csv()
     raw = load_strategy(csv_path=csv_path, excel_row=args.row)
     require_strategy_row(raw, str(csv_path))
-    spec = spec_from_row(raw)
+    spec = normalize_follow_rank1_spec(spec_from_row(raw))
     if spec.get("engine") == "named" and spec.get("name") not in NAME_TO_ID:
         raise SystemExit(f"Unknown strategy name {spec.get('name')!r} in {csv_path}")
     board_kind = spec_board(spec)
