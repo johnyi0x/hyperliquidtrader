@@ -377,6 +377,103 @@ def _occupied_slots(
     return held
 
 
+def _maker_wait_s() -> float:
+    try:
+        return max(5.0, float(os.environ.get("BAGRANK_MAKER_WAIT_S") or 20))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def _maker_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("BAGRANK_MAKER_ATTEMPTS") or 5))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _order_executor(client):
+    """Post-only mid → wait → reprice → market fallback (maker fees when possible)."""
+    from src.order_executor import OrderExecutor
+
+    wait_s = _maker_wait_s()
+    attempts = _maker_attempts()
+    return OrderExecutor(
+        client,
+        wait_seconds=int(wait_s),
+        max_attempts=attempts,
+        logger=log,
+        use_market_orders=False,
+        mid_limit_then_market=True,
+        mid_limit_wait_seconds=wait_s,
+        mid_limit_attempts=attempts,
+    )
+
+
+def _live_maker_close(client, coin: str) -> bool:
+    """Fully close coin via post-only mid limits, market only if unfilled."""
+    from src.market_resolver import resolve_market
+
+    market = resolve_market(client.info, coin)
+    client.apply_market(market)
+    try:
+        client.cancel_all_orders_for_coin()
+    except Exception as exc:
+        log.warning("Cancel orders on %s before close: %s", coin, exc)
+    pos = client.get_position(force=True)
+    if pos is None:
+        return True
+    log.info(
+        "LIVE maker-close %s %s sz=%s (post-only mid x%s @ %.0fs, then market)",
+        coin,
+        pos.side,
+        pos.size,
+        _maker_attempts(),
+        _maker_wait_s(),
+    )
+    ex = _order_executor(client)
+    ok = ex.execute_mid_close_full()
+    if not ok:
+        log.warning("Maker-close %s incomplete — will retry next cycle", coin)
+    return ok
+
+
+def _live_maker_open(client, coin: str, side: str, size: float, lev: int) -> bool:
+    """Open via post-only mid limits, market only if unfilled after retries."""
+    from src.market_resolver import resolve_market
+    from src.pricing import floor_size, round_size
+
+    market = resolve_market(client.info, coin)
+    client.apply_market(market)
+    size = floor_size(float(size), client.sz_decimals)
+    if size <= 0:
+        size = round_size(float(size), client.sz_decimals)
+    if size <= 0:
+        log.warning("Open %s size rounds to zero — skip", coin)
+        return False
+    try:
+        client.set_leverage(max(1, int(lev)))
+    except Exception as exc:
+        log.warning("set_leverage %s failed (continuing): %s", coin, exc)
+    try:
+        client.cancel_entry_orders_for_coin()
+    except Exception:
+        pass
+    is_buy = str(side) == "long"
+    log.info(
+        "LIVE maker-open %s %s sz=%s (post-only mid x%s @ %.0fs, then market)",
+        coin,
+        side,
+        size,
+        _maker_attempts(),
+        _maker_wait_s(),
+    )
+    ex = _order_executor(client)
+    ok = ex.execute_mid_open(is_buy, size)
+    if not ok:
+        log.warning("Maker-open %s incomplete — will retry next cycle", coin)
+    return ok
+
+
 def _apply_live(
     client,
     desired: list[dict[str, Any]],
@@ -386,9 +483,6 @@ def _apply_live(
     *,
     force_flip: bool = False,
 ) -> None:
-    from src.market_resolver import resolve_market
-    from src.pricing import round_size
-
     ok, positions = client.fetch_open_positions(force=True)
     if not ok:
         log.warning("Position query failed — skip this cycle")
@@ -409,30 +503,19 @@ def _apply_live(
     for coin, pos in list(have.items()):
         keep = coin in want and want[coin]["side"] == pos.side
         if keep:
+            # Soft: matching #1 — do not resize, cancel, or re-enter.
             continue
         if not force_flip and not _can_exit(state, coin, min_hold_h, now):
             log.info("Min-hold: keep %s", coin)
             continue
-        closed = False
-        for attempt in range(1, 4):
-            try:
-                market = resolve_market(client.info, coin)
-                client.apply_market(market)
-                client.place_market_close()
+        try:
+            if _live_maker_close(client, coin):
                 (state.setdefault("opened", {})).pop(coin, None)
-                log.info(
-                    "LIVE close %s%s%s",
-                    coin,
-                    " (flip)" if force_flip else "",
-                    f" attempt={attempt}" if attempt > 1 else "",
-                )
-                closed = True
-                break
-            except Exception as exc:
-                log.warning("Close %s failed (attempt %s/3): %s", coin, attempt, exc)
-                time.sleep(min(2.0 * attempt, 5.0))
-        if not closed:
-            log.warning("Close %s still failing — will retry next cycle", coin)
+                log.info("LIVE close %s done%s", coin, " (flip)" if force_flip else "")
+            else:
+                log.warning("Close %s not flat yet — retry next cycle", coin)
+        except Exception as exc:
+            log.warning("Close %s failed: %s", coin, exc)
 
     ok, positions = client.fetch_open_positions(force=True)
     have = {coin: pos for coin, pos in (positions if ok else [])}
@@ -451,7 +534,6 @@ def _apply_live(
     if stray:
         log.info("Waiting to clear stray positions before open: %s", stray)
         return
-    # Hard cap: never more than one live position for force_flip / slots=1.
     if slot_n <= 1 and have:
         for coin, d in want.items():
             if coin in have and _pos_side(have[coin]) == d["side"]:
@@ -473,39 +555,28 @@ def _apply_live(
             log.warning("No price for %s — skip open", coin)
             continue
         size = float(d["size"]) if d.get("size") else float(d["notional"]) / px
-        opened = False
-        for attempt in range(1, 4):
-            try:
-                market = resolve_market(client.info, coin)
-                client.apply_market(market)
-                size = round_size(size, client.sz_decimals)
-                if size <= 0:
-                    break
-                lev = max(1, int(d.get("lev") or 1))
-                try:
-                    client.set_leverage(lev)
-                except Exception:
-                    pass
-                client.place_market_open(d["side"] == "long", size)
+        lev = max(1, int(d.get("lev") or 1))
+        try:
+            if _live_maker_open(client, coin, str(d["side"]), size, lev):
                 state.setdefault("opened", {})[coin] = now
                 free -= 1
                 occupied.append(coin)
-                log.info(
-                    "LIVE open %s %s sz=%s%s",
-                    coin,
-                    d["side"],
-                    size,
-                    f" attempt={attempt}" if attempt > 1 else "",
-                )
-                opened = True
-                break
-            except Exception as exc:
-                log.warning("Open %s failed (attempt %s/3): %s", coin, attempt, exc)
-                time.sleep(min(2.0 * attempt, 5.0))
-        if not opened:
-            log.warning("Open %s still failing — will retry next cycle", coin)
-        # Only one open per cycle when force_flip.
-        if force_flip and opened:
+                log.info("LIVE open %s %s done", coin, d["side"])
+            else:
+                ok2, positions2 = client.fetch_open_positions(force=True)
+                if ok2 and any(c == coin for c, _ in positions2):
+                    state.setdefault("opened", {})[coin] = now
+                    occupied.append(coin)
+                    free = max(0, free - 1)
+                    log.warning(
+                        "Open %s partial fill — holding soft slot until reconciled",
+                        coin,
+                    )
+                else:
+                    log.warning("Open %s failed — retry next cycle", coin)
+        except Exception as exc:
+            log.warning("Open %s failed: %s", coin, exc)
+        if force_flip:
             break
 
 
@@ -589,6 +660,13 @@ def run_live(
         log.info(
             "follow_rank1: HL week-PnL #1 only (1 slot). Redeploy keeps an open #1; "
             "if flat, waits for #1 change before first entry; flips when #1 changes."
+        )
+    if mode == "live":
+        log.info(
+            "LIVE orders: post-only mid limits x%s every %.0fs, then market leftover "
+            "(BAGRANK_MAKER_WAIT_S / BAGRANK_MAKER_ATTEMPTS)",
+            _maker_attempts(),
+            _maker_wait_s(),
         )
     last_signal = ""
     client = None

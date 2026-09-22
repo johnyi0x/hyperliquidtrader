@@ -1639,6 +1639,26 @@ class FollowRank1Tests(unittest.TestCase):
         )
         self.assertEqual(book.positions, {})
 
+    def test_maker_mid_price_stays_post_only(self) -> None:
+        from src.pricing import limit_would_take, mid_post_only_price
+
+        l2 = {
+            "levels": [
+                [{"px": "100.0", "sz": "1"}, {"px": "99.9", "sz": "1"}],
+                [{"px": "100.2", "sz": "1"}, {"px": "100.3", "sz": "1"}],
+            ]
+        }
+        buy = mid_post_only_price(l2, True, 4)
+        sell = mid_post_only_price(l2, False, 4)
+        self.assertFalse(limit_would_take(l2, True, buy))
+        self.assertFalse(limit_would_take(l2, False, sell))
+
+    def test_maker_defaults(self) -> None:
+        from bagrank.live import _maker_attempts, _maker_wait_s
+
+        self.assertEqual(_maker_attempts(), 5)
+        self.assertEqual(_maker_wait_s(), 20.0)
+
     def test_shortlist_pnl_ranks_by_pnl_not_roi(self) -> None:
         from bagrank.hlcycle import shortlist_top_pnl, shortlist_top_roi
 

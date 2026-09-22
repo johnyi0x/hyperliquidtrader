@@ -287,6 +287,22 @@ class OrderExecutor:
             return False
         return True
 
+    def execute_mid_open(self, is_buy: bool, target_sz: float) -> bool:
+        """Post-only mid limits (reprice/wait), then market any leftover — no TP/SL."""
+        with self._lock:
+            self.client.cancel_entry_orders_for_coin()
+            ok = self._fill_mid_limit_then_market(
+                is_buy=is_buy,
+                target_sz=target_sz,
+                reduce_only=False,
+            )
+            self.client.cancel_entry_orders_for_coin()
+            return ok
+
+    def execute_mid_close_full(self) -> bool:
+        """Close entire position: post-only mid retries, then market remainder."""
+        return self.execute_mid_limit_close()
+
     def execute_close(self, is_buy: bool, target_sz: float) -> bool:
         with self._lock:
             return self._execute_close_unlocked(is_buy, target_sz)
