@@ -1,4 +1,4 @@
-"""Live rank trader. Reads rank_live.csv (header + one copied backtest row).
+"""Live rank trader. Reads rank_live.csv (header + one strategy row).
 
 Rebuilds the hourly bag-rank board from Hyperliquid (leaderboard + wallet
 snapshots), same tally as the collector. At boot only, copies enough lookback

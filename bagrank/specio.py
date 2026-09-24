@@ -245,6 +245,26 @@ def default_live_csv() -> Path:
     return REPO_ROOT / LIVE_CSV_NAME
 
 
+def latest_by_live_csv() -> Path | None:
+    """Newest non-empty by_live.csv under data/. Row 2 of that file is the live pick."""
+    root = REPO_ROOT / "data"
+    if not root.exists():
+        return None
+    best: Path | None = None
+    best_m = -1.0
+    for path in root.rglob("by_live.csv"):
+        try:
+            if path.stat().st_size < 80:
+                continue
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > best_m:
+            best_m = mtime
+            best = path
+    return best
+
+
 def require_strategy_row(row: dict[str, str], source: str = LIVE_CSV_NAME) -> None:
     if str(row.get("engine") or "").strip():
         return

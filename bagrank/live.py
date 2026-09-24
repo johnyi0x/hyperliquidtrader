@@ -33,13 +33,11 @@ def spec_board(spec: dict[str, Any]) -> str:
 
 
 def live_hour_windows(spec: dict[str, Any]) -> tuple[int, int]:
-    """Hours of board needed to trade, and hours kept on disk.
+    """Hours of closed board needed to trade, and hours kept on disk.
 
-    follow_rank1 only needs the latest finished HL hour (rank=1). Keep 72h so a
-    missed gather still has recent boards. Other strategies need lookback+lag bars.
+    Same lookback + exec_lag the backtest kernel sees. Keep at least 72h on a
+    PnL board so a missed gather still has recent closed hours.
     """
-    if str(spec.get("name") or "") == "follow_rank1":
-        return 2, 72
     step = max(1, int(spec.get("step_h") or 1))
     look = max(1, int(spec.get("lookback") or 1))
     lag = max(0, int(spec.get("exec_lag") or 1))
@@ -210,13 +208,13 @@ def _weight_targets(
         return []
     n = len(holds)
     slot_n = max(int(slots or n), 1)
-    # Margin ≈ equity * gross * weight; keep gross ≤ 1 so opens fit account equity.
-    gross = max(0.05, min(1.0, float(gross_pct) / 100.0))
+    # Same gross clamp as search.run_one / simulate_nb (0.05 .. 2.0).
+    gross = max(0.05, min(2.0, float(gross_pct) / 100.0))
     if int(exposure_mode) == 1:
         gross *= n / float(slot_n)
     elif int(exposure_mode) == 2:
         gross *= (n / float(slot_n)) ** 0.5
-    gross = max(0.05, min(1.0, gross))
+    gross = max(0.05, min(2.0, gross))
     out: list[dict[str, Any]] = []
     for h in holds:
         px = float(h.get("px") or 0)
@@ -721,16 +719,15 @@ def run_live(
     signal.signal(signal.SIGINT, _request_stop)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _request_stop)
-    normalize_follow_rank1_spec(spec)
-    is_follow = str(spec.get("name") or "") == "follow_rank1"
     state_path = state_path or (sqlite_path.parent / "live_state.json")
     state = _load_state(state_path)
-    if is_follow:
-        reset_follow_rank1_boot_gate(state)
-        log.info(
-            "follow_rank1: HL week-PnL #1 only (1 slot). Redeploy keeps an open #1; "
-            "if flat, waits for #1 change before first entry; flips when #1 changes."
-        )
+    log.info(
+        "Signals match the backtest kernel (lagged closed bars, min-hold, CSV slots/gross). "
+        "family=%s engine=%s name=%s",
+        spec.get("family"),
+        spec.get("engine"),
+        spec.get("name"),
+    )
     if mode == "live":
         log.info(
             "LIVE orders: post-only mid limits x%s every %.0fs, then market leftover "
@@ -815,19 +812,7 @@ def run_live(
                 apply_exchange_max_lev(panel, max_lev_map)
             have = 0 if panel is None else panel.n_times
             if have >= need_hours:
-                held: dict[str, str] | None = {}
-                skip_apply = False
-                if is_follow:
-                    if client is not None:
-                        held = _held_sides_from_exchange(client)
-                        if held is None:
-                            skip_apply = True
-                            held = {}
-                    elif book is not None:
-                        held = _held_sides_from_book(book)
-                    holds = gate_follow_rank1_holds([], panel, spec, state, held=held)
-                else:
-                    holds = lagged_holdings(panel, spec)
+                holds = lagged_holdings(panel, spec)
                 equity = float(spec.get("equity") or 1000.0)
                 marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
                 try:
@@ -844,12 +829,10 @@ def run_live(
                         log.warning("Live equity failed: %s", exc)
                 elif book is not None:
                     equity = book.equity(marks)
-                # CSV may have gross_pct>100 (backtest); live needs margin headroom.
-                live_gross = min(float(spec.get("gross_pct") or 95), 95.0)
                 sized = _weight_targets(
                     holds,
                     equity=equity,
-                    gross_pct=live_gross,
+                    gross_pct=float(spec.get("gross_pct") or 95),
                     max_pair_share=float(spec.get("max_pair_share") or 0.7),
                     use_lev=int(spec.get("use_lev") or 0),
                     slots=int(spec.get("slots") or 0),
@@ -864,6 +847,21 @@ def run_live(
                 sig_ts = to_iso(holds[0]["signal_unix"]) if holds else ""
                 bar_ts = to_iso(holds[0]["bar_unix"]) if holds else ""
                 changed = key != last_signal
+                log.info(
+                    "Cycle hours=%s closed_bar=%s signal_bar=%s lag=%s gross=%s%% slots=%s hold=%sh targets=%s",
+                    have,
+                    bar_ts or "-",
+                    sig_ts or "-",
+                    spec.get("exec_lag"),
+                    spec.get("gross_pct"),
+                    spec.get("slots"),
+                    spec.get("min_hold_h"),
+                    [
+                        (d["coin"], d["side"], round(float(d.get("notional") or 0), 1), f"{d.get('lev')}x")
+                        for d in sized
+                    ]
+                    or "FLAT",
+                )
                 if changed:
                     log.info(
                         "Targets bar=%s signal=%s n=%s %s",
@@ -873,9 +871,7 @@ def run_live(
                         [(d["coin"], d["side"], round(d.get("notional", 0), 1)) for d in sized],
                     )
                     last_signal = key
-                if skip_apply:
-                    log.info("Skip apply this cycle (position query failed)")
-                elif mode == "dry":
+                if mode == "dry":
                     pass
                 elif mode == "paper" and book is not None:
                     try:
@@ -886,7 +882,6 @@ def run_live(
                             int(spec.get("min_hold_h") or 0),
                             marks,
                             slots=int(spec.get("slots") or 1),
-                            force_flip=is_follow,
                         )
                     except Exception as exc:
                         log.warning("Paper apply failed (will retry next poll): %s", exc)
@@ -904,7 +899,6 @@ def run_live(
                             state,
                             int(spec.get("min_hold_h") or 0),
                             slots=int(spec.get("slots") or 1),
-                            force_flip=is_follow,
                         )
                     except Exception as exc:
                         log.warning("Live apply failed (will retry next poll): %s", exc)
@@ -943,9 +937,9 @@ def main(argv: list[str] | None = None) -> int:
         "--csv",
         type=Path,
         default=None,
-        help="Defaults to rank_live.csv in the repo root",
+        help="Strategy CSV. Default: rank_live.csv in the repo root (the one committed row).",
     )
-    p.add_argument("--row", type=int, default=2, help="Excel row including header (2 = the pasted strategy)")
+    p.add_argument("--row", type=int, default=2, help="Excel row including header (2 = top by_live row)")
     p.add_argument("--db", type=Path, default=None, help="Local hour sqlite (default follows board=roi/pnl)")
     p.add_argument("--paper", action="store_true", help="Simulated fills (default). Same signals as --live.")
     p.add_argument("--live", action="store_true", help="Send real Hyperliquid orders")
@@ -969,9 +963,10 @@ def main(argv: list[str] | None = None) -> int:
         force=True,
     )
     csv_path = args.csv or default_live_csv()
-    raw = load_strategy(csv_path=csv_path, excel_row=args.row)
+    excel_row = args.row
+    raw = load_strategy(csv_path=csv_path, excel_row=excel_row)
     require_strategy_row(raw, str(csv_path))
-    spec = normalize_follow_rank1_spec(spec_from_row(raw))
+    spec = spec_from_row(raw)
     if spec.get("engine") == "named" and spec.get("name") not in NAME_TO_ID:
         raise SystemExit(f"Unknown strategy name {spec.get('name')!r} in {csv_path}")
     board_kind = spec_board(spec)
@@ -983,14 +978,35 @@ def main(argv: list[str] | None = None) -> int:
     else:
         mode = "paper"
     log.info(
-        "Loaded %s row %s | board=%s %s %s sharpe=%s ret=%s",
-        csv_path.name,
-        args.row,
+        "Loaded %s row %s | board=%s family=%s engine=%s name=%s | "
+        "sharpe=%s ret=%s%% dd=%s%% trips=%s | step=%sh hold=%sh slots=%s lag=%s "
+        "lookback=%s gross=%s%% use_lev=%s lev_x=%s size_mode=%s exposure=%s "
+        "enter_top=%s mode=%s enter_th=%s exit_th=%s | run=%s",
+        csv_path,
+        excel_row,
         board_kind,
         spec.get("family"),
         spec.get("engine"),
+        spec.get("name"),
         raw.get("sharpe"),
         raw.get("return_pct"),
+        raw.get("max_dd_pct"),
+        raw.get("round_trips"),
+        spec.get("step_h"),
+        spec.get("min_hold_h"),
+        spec.get("slots"),
+        spec.get("exec_lag"),
+        spec.get("lookback"),
+        spec.get("gross_pct"),
+        spec.get("use_lev"),
+        spec.get("lev_x"),
+        spec.get("size_mode"),
+        spec.get("exposure_mode"),
+        spec.get("enter_top"),
+        spec.get("mode"),
+        spec.get("enter_th"),
+        spec.get("exit_th"),
+        raw.get("run_id"),
     )
     return run_live(
         spec,

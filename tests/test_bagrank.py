@@ -1573,13 +1573,13 @@ class FollowRank1Tests(unittest.TestCase):
         if lagged and lagged[0]["coin"] != "BTC":
             self.assertNotEqual(lagged[0]["coin"], live[0]["coin"])
 
-    def test_follow_rank1_live_windows_are_small(self) -> None:
+    def test_live_windows_follow_lookback_and_lag(self) -> None:
         from bagrank.live import live_hour_windows
 
         need, keep = live_hour_windows(
-            {"name": "follow_rank1", "board": "pnl", "step_h": 8, "lookback": 6, "exec_lag": 2}
+            {"name": "concentrated", "board": "pnl", "step_h": 2, "lookback": 6, "exec_lag": 1}
         )
-        self.assertEqual(need, 2)
+        self.assertEqual(need, 14)
         self.assertEqual(keep, 72)
 
     def test_follow_rank1_normalize_forces_one_slot(self) -> None:
@@ -1676,7 +1676,7 @@ class FollowRank1Tests(unittest.TestCase):
         max_sz = (54.0 * 0.90 * 25) / 87000.0
         self.assertLessEqual(fitted, max_sz + 1e-12)
         self.assertGreater(fitted, max_sz * 0.9)
-        # Weight targets clamp gross_pct>100 down to 100%.
+        # Same gross as the backtest kernel: 140% is kept (cap is 200%, not 100%).
         w = _weight_targets(
             [{"coin": "BTC", "wallets": 1, "px": 87000.0, "side": "long", "lev": 25}],
             equity=54.0,
@@ -1686,7 +1686,7 @@ class FollowRank1Tests(unittest.TestCase):
             slots=1,
         )
         self.assertEqual(len(w), 1)
-        self.assertAlmostEqual(w[0]["notional"] / 25.0, 54.0, places=4)
+        self.assertAlmostEqual(w[0]["notional"] / 25.0, 54.0 * 1.4, places=4)
 
     def test_shortlist_pnl_ranks_by_pnl_not_roi(self) -> None:
         from bagrank.hlcycle import shortlist_top_pnl, shortlist_top_roi
