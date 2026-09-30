@@ -461,7 +461,7 @@ LIVE_MIN_EXEC_LAG = 2
 
 
 LIVE_PNL_MAX_DD_PCT = 25.0
-LIVE_PNL_MIN_TRIPS = 2
+LIVE_PNL_MIN_TRIPS_PER_DAY = 1.0
 LIVE_PNL_MAX_SLOTS = 1
 LIVE_PNL_MIN_RETURN_PCT = 0.0
 LIVE_PNL_MIN_SHARPE = 0.25
@@ -492,15 +492,18 @@ def _row_board(row: dict[str, Any]) -> str:
 
 
 def live_ok(row: dict[str, Any]) -> bool:
-    """True if use_lev=0 (no wallet-mean lev) and the trial passes live-sane cuts.
+    """True if size is floor(maxLev / lev_x) and the trial passes live-sane cuts.
 
-    PnL boards rotate slowly, so trip/return cuts are looser than ROI.
+    use_lev must be 0. lev_x must be above 1 so the row is not full exchange
+    max on every coin. PnL needs at least one round trip per day.
     """
     if int(_num(row, "use_lev")) != 0:
         return False
+    if float(_num(row, "lev_x", default=DEFAULT_LEV_X)) <= 1.0:
+        return False
     board = _row_board(row)
     if board == "pnl":
-        if int(_num(row, "round_trips")) < LIVE_PNL_MIN_TRIPS:
+        if float(_num(row, "trips_per_day")) < LIVE_PNL_MIN_TRIPS_PER_DAY:
             return False
         if float(_num(row, "max_dd_pct")) > LIVE_PNL_MAX_DD_PCT:
             return False
@@ -825,7 +828,8 @@ def search_loop(
     store = ResultStore(out_dir, span)
     log.info(
         "Writing this run to %s | by_return.csv=profit  leaderboard.csv=Sharpe  "
-        "by_fitness.csv=blend  by_live.csv=live-usable (no wallet-mean lev) 1-slot lag>=2",
+        "by_fitness.csv=blend  by_live.csv=live-usable (floor(maxLev/lev_x), lev_x>1, "
+        "PnL >=1 trip/day) 1-slot",
         store.directory,
     )
     seen: set[str] = set()

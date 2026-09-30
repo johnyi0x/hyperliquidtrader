@@ -992,6 +992,8 @@ class UniverseAndDsnTests(unittest.TestCase):
         )
         self.assertTrue(live_ok(pnl))
         self.assertFalse(live_ok(dict(pnl, board="roi")))
+        self.assertFalse(live_ok(dict(pnl, trips_per_day=0.4)))
+        self.assertFalse(live_ok(dict(pnl, lev_x=1)))
 
     def test_by_live_csv_keeps_only_strict_1x_rows(self) -> None:
         import tempfile
