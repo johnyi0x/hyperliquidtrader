@@ -548,17 +548,39 @@ def gather_cycle(
 
 
 def prune_old_hours(conn: Any, *, venue: str, keep_hours: int) -> int:
-    """Keep only the newest keep_hours cycle timestamps."""
+    """Keep the newest keep_hours cycles that actually have a board.
+
+    A collector run with no meta_index rows is deleted first, so one empty
+    hour cannot occupy a slot and leave the live board one hour short forever.
+    """
     keep = max(1, int(keep_hours))
-    rows = conn.execute(
+    empty = conn.execute(
         """
-        SELECT DISTINCT cycle_ts FROM collector_runs
-        WHERE venue = ?
-        ORDER BY cycle_ts DESC
+        SELECT DISTINCT r.cycle_ts
+        FROM collector_runs r
+        WHERE r.venue = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM meta_index m
+            WHERE m.venue = r.venue AND m.cycle_ts = r.cycle_ts
+          )
         """,
         (venue,),
     ).fetchall()
-    drop = [str(r[0]) for r in rows[keep:]]
+    drop = [str(r[0]) for r in empty]
+    rows = conn.execute(
+        """
+        SELECT DISTINCT r.cycle_ts
+        FROM collector_runs r
+        WHERE r.venue = ?
+          AND EXISTS (
+            SELECT 1 FROM meta_index m
+            WHERE m.venue = r.venue AND m.cycle_ts = r.cycle_ts
+          )
+        ORDER BY r.cycle_ts DESC
+        """,
+        (venue,),
+    ).fetchall()
+    drop.extend(str(r[0]) for r in rows[keep:])
     if not drop:
         return 0
     placeholders = ",".join("?" * len(drop))

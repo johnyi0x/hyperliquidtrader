@@ -185,6 +185,27 @@ class NeonSource(Source):
         out.reverse()
         return out
 
+    def list_recent_board_cycles(self, venue: str, limit: int) -> list[datetime]:
+        """Newest finished hours that have meta_index rows. Empty runs are skipped."""
+        rows = self.conn.execute(
+            """
+            SELECT r.cycle_ts
+            FROM collector_runs r
+            WHERE r.venue = %s
+              AND r.status = ANY(%s)
+              AND EXISTS (
+                SELECT 1 FROM meta_index m
+                WHERE m.venue = r.venue AND m.cycle_ts = r.cycle_ts
+              )
+            ORDER BY r.cycle_ts DESC
+            LIMIT %s
+            """,
+            (venue, list(OK_STATUS), max(1, int(limit))),
+        ).fetchall()
+        out = [as_utc(row["cycle_ts"]) for row in rows]
+        out.reverse()
+        return out
+
     def fetch_table(
         self, table: str, venue: str, cycles: list[datetime]
     ) -> list[dict[str, Any]]:
@@ -279,6 +300,26 @@ class SqliteSource(Source):
                 (venue, to_iso(after)),
             ).fetchall()
         return [as_utc(r["cycle_ts"]) for r in rows]
+
+    def list_recent_board_cycles(self, venue: str, limit: int) -> list[datetime]:
+        rows = self.conn.execute(
+            """
+            SELECT r.cycle_ts
+            FROM collector_runs r
+            WHERE r.venue = ?
+              AND r.status IN ('ok', 'partial')
+              AND EXISTS (
+                SELECT 1 FROM meta_index m
+                WHERE m.venue = r.venue AND m.cycle_ts = r.cycle_ts
+              )
+            ORDER BY r.cycle_ts DESC
+            LIMIT ?
+            """,
+            (venue, max(1, int(limit))),
+        ).fetchall()
+        out = [as_utc(r["cycle_ts"]) for r in rows]
+        out.reverse()
+        return out
 
     def fetch_table(
         self, table: str, venue: str, cycles: list[datetime]
@@ -471,10 +512,11 @@ def seed_recent_board(
     venue: str = VENUE_DEFAULT,
     kind: str = "roi",
 ) -> int:
-    """One-shot copy of the last N finished collector hours. Does not stay connected.
+    """One-shot copy of the last N finished hours that have a board.
 
-    PnL collector cycles often take 2–20 minutes, so only status=ok/partial hours
-    are copied (an in-progress hour is skipped). Live then rolls forward on HL.
+    Empty collector runs are skipped, and the next older hour with meta_index
+    rows is taken instead, so one hole does not leave live one hour short.
+    An in-progress hour is skipped. Live then rolls forward on HL.
     """
     if str(kind or "").strip().lower() == "pnl":
         url, src = resolve_pnl_database_url()
@@ -487,7 +529,7 @@ def seed_recent_board(
     keep = max(1, int(hours))
     neon = NeonSource(url)
     try:
-        cycles = neon.list_recent_cycles(venue, keep)
+        cycles = neon.list_recent_board_cycles(venue, keep)
         if not cycles:
             return 0
         conn = connect(sqlite_path)
@@ -528,8 +570,7 @@ def seed_local_hours(
     keep = max(1, int(hours))
     source = SqliteSource(src)
     try:
-        cycles = source.list_cycles(venue, None)
-        cycles = cycles[-keep:]
+        cycles = source.list_recent_board_cycles(venue, keep)
         if not cycles:
             return 0
         conn = connect(dest)

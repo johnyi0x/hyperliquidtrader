@@ -165,6 +165,53 @@ class BagrankBackupTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_prune_skips_empty_hour_and_keeps_usable_board(self) -> None:
+        import tempfile
+
+        from bagrank.hlcycle import prune_old_hours
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "live.sqlite"
+            hours = [f"2026-01-01T0{h}:00:00Z" for h in range(6)]
+            _seed(db, [hours[0], hours[1], hours[3], hours[4], hours[5]])
+            conn = connect(db)
+            try:
+                upsert_rows(conn, "collector_runs", [_run(hours[2])], venue="hyperliquid")
+                conn.commit()
+                prune_old_hours(conn, venue="hyperliquid", keep_hours=4)
+                conn.commit()
+                left = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT cycle_ts FROM meta_index ORDER BY cycle_ts"
+                    )
+                ]
+                runs = [r[0] for r in conn.execute("SELECT cycle_ts FROM collector_runs")]
+            finally:
+                conn.close()
+            self.assertNotIn(hours[2], runs)
+            self.assertEqual(left, [hours[1], hours[3], hours[4], hours[5]])
+
+    def test_board_cycle_list_skips_empty_hour(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "src.sqlite"
+            hours = [f"2026-01-01T0{h}:00:00Z" for h in range(4)]
+            _seed(db, [hours[0], hours[1], hours[3]])
+            conn = connect(db)
+            try:
+                upsert_rows(conn, "collector_runs", [_run(hours[2])], venue="hyperliquid")
+                conn.commit()
+            finally:
+                conn.close()
+            source = SqliteSource(db)
+            try:
+                got = [c.strftime("%Y-%m-%dT%H:%M:%SZ") for c in source.list_recent_board_cycles("hyperliquid", 3)]
+            finally:
+                source.close()
+            self.assertEqual(got, [hours[0], hours[1], hours[3]])
+
     def test_late_price_backfill_updates_old_hour(self) -> None:
         import tempfile
 
