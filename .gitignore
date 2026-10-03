@@ -2,6 +2,7 @@
 
 # Local runtime, Neon sqlite backups, backtest/search dumps.
 # `git add -A` must never upload these.
+BACKTEST.txt
 data/
 data-local/
 data-cloud/
