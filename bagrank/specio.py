@@ -63,6 +63,7 @@ CSV_COLUMNS = (
     *WEIGHT_COLS,
     "tested_at",
     "run_id",
+    "reverse",
 )
 
 
@@ -113,6 +114,7 @@ def flatten_result(row: dict[str, Any], *, run_id: str = "") -> dict[str, Any]:
         if key in row:
             flat[key] = row[key]
     flat["run_id"] = run_id or row.get("run_id") or ""
+    flat["reverse"] = spec.get("reverse", row.get("reverse", 0)) or 0
     flat["family"] = spec.get("family") or row.get("family") or ""
     flat["engine"] = spec.get("engine") or "score"
     flat["name"] = spec.get("name") or flat["family"]
@@ -214,6 +216,7 @@ def spec_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "b": _f("b", 0.0),
         "weights": weights,
         "features": list(FEATURE_NAMES),
+        "reverse": 1 if _i("reverse", 0) else 0,
     }
     return spec
 

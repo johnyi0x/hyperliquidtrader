@@ -191,6 +191,20 @@ def load_panel(sqlite_path: Path, venue: str = "hyperliquid"):
         conn.close()
 
 
+def reverse_hold_sides(holds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Swap the strategy's long and short. Coin, size, and leverage stay the same."""
+    out: list[dict[str, Any]] = []
+    for hold in holds:
+        row = dict(hold)
+        side = str(row.get("side") or "")
+        if side == "long":
+            row["side"] = "short"
+        elif side == "short":
+            row["side"] = "long"
+        out.append(row)
+    return out
+
+
 def _weight_targets(
     holds: list[dict[str, Any]],
     *,
@@ -789,6 +803,7 @@ def run_live(
     )
     log.info(
         "Trading %s | board=%s engine=%s family=%s step=%sh hold=%sh slots=%s lag=%s lookback=%s | "
+        "reverse=%s | "
         "lev_x=%s (pair uses floor(maxLev/%s) integer, 1x if maxLev<%s) | HL maxLev for %s coins",
         mode,
         board_kind,
@@ -799,6 +814,7 @@ def run_live(
         spec.get("slots"),
         spec.get("exec_lag"),
         spec.get("lookback"),
+        "on" if int(spec.get("reverse") or 0) else "off",
         lev_x,
         lev_x,
         lev_x,
@@ -813,6 +829,8 @@ def run_live(
             have = 0 if panel is None else panel.n_times
             if have >= need_hours:
                 holds = lagged_holdings(panel, spec)
+                if int(spec.get("reverse") or 0):
+                    holds = reverse_hold_sides(holds)
                 equity = float(spec.get("equity") or 1000.0)
                 marks = {h["coin"]: float(h["px"]) for h in holds if h.get("px")}
                 try:
@@ -848,7 +866,7 @@ def run_live(
                 bar_ts = to_iso(holds[0]["bar_unix"]) if holds else ""
                 changed = key != last_signal
                 log.info(
-                    "Cycle hours=%s closed_bar=%s signal_bar=%s lag=%s gross=%s%% slots=%s hold=%sh targets=%s",
+                    "Cycle hours=%s closed_bar=%s signal_bar=%s lag=%s gross=%s%% slots=%s hold=%sh reverse=%s targets=%s",
                     have,
                     bar_ts or "-",
                     sig_ts or "-",
@@ -856,6 +874,7 @@ def run_live(
                     spec.get("gross_pct"),
                     spec.get("slots"),
                     spec.get("min_hold_h"),
+                    "on" if int(spec.get("reverse") or 0) else "off",
                     [
                         (d["coin"], d["side"], round(float(d.get("notional") or 0), 1), f"{d.get('lev')}x")
                         for d in sized
@@ -981,7 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
         "Loaded %s row %s | board=%s family=%s engine=%s name=%s | "
         "sharpe=%s ret=%s%% dd=%s%% trips=%s | step=%sh hold=%sh slots=%s lag=%s "
         "lookback=%s gross=%s%% use_lev=%s lev_x=%s size_mode=%s exposure=%s "
-        "enter_top=%s mode=%s enter_th=%s exit_th=%s | run=%s",
+        "enter_top=%s mode=%s enter_th=%s exit_th=%s reverse=%s | run=%s",
         csv_path,
         excel_row,
         board_kind,
@@ -1006,6 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
         spec.get("mode"),
         spec.get("enter_th"),
         spec.get("exit_th"),
+        "on" if int(spec.get("reverse") or 0) else "off",
         raw.get("run_id"),
     )
     return run_live(
