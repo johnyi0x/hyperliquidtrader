@@ -14,10 +14,10 @@ class ReverseLiveTests(unittest.TestCase):
         self.assertEqual([row["coin"] for row in out], ["BTC", "ETH"])
         self.assertEqual(holds[0]["side"], "long")
 
-    def test_live_row_loads_reverse_on(self) -> None:
+    def test_live_row_loads_reverse_off(self) -> None:
         from bagrank.specio import default_live_csv, load_csv_row, spec_from_row
 
         spec = spec_from_row(load_csv_row(default_live_csv()))
-        self.assertEqual(spec["family"], "oi_thrust")
-        self.assertEqual(spec["reverse"], 1)
-        self.assertEqual(spec_from_row({"family": "oi_thrust", "engine": "score"})["reverse"], 0)
+        self.assertEqual(spec["family"], "rank_accel")
+        self.assertEqual(spec["reverse"], 0)
+        self.assertEqual(spec_from_row({"family": "rank_accel", "engine": "score"})["reverse"], 0)
