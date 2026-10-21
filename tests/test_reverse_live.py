@@ -18,6 +18,6 @@ class ReverseLiveTests(unittest.TestCase):
         from bagrank.specio import default_live_csv, load_csv_row, spec_from_row
 
         spec = spec_from_row(load_csv_row(default_live_csv()))
-        self.assertEqual(spec["family"], "price_confirm")
+        self.assertEqual(spec["family"], "divergence")
         self.assertEqual(spec["reverse"], 0)
-        self.assertEqual(spec_from_row({"family": "price_confirm", "engine": "score"})["reverse"], 0)
+        self.assertEqual(spec_from_row({"family": "divergence", "engine": "score"})["reverse"], 0)
