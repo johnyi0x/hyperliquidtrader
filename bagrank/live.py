@@ -304,13 +304,86 @@ def _save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def strategy_fingerprint(spec: dict[str, Any]) -> str:
+    """Identity of the live CSV row. Changes on redeploy of a new strategy."""
+    weights = spec.get("weights") or []
+    if isinstance(weights, dict):
+        weight_bits = [f"{k}:{weights[k]}" for k in sorted(weights)]
+    else:
+        weight_bits = [str(x) for x in weights]
+    parts = [
+        str(spec.get("run_id") or ""),
+        str(spec.get("family") or ""),
+        str(spec.get("name") or ""),
+        str(spec.get("engine") or ""),
+        str(int(spec.get("mode") or 0)),
+        str(int(spec.get("step_h") or 0)),
+        str(int(spec.get("min_hold_h") or 0)),
+        str(int(spec.get("exec_lag") or 0)),
+        str(int(spec.get("lookback") or 0)),
+        str(int(spec.get("slots") or 1)),
+        str(float(spec.get("gross_pct") or 0)),
+        str(float(spec.get("enter_th") or 0)),
+        str(float(spec.get("exit_th") or 0)),
+        str(int(spec.get("zscore") or 0)),
+        str(int(spec.get("reverse") or 0)),
+        "|".join(weight_bits),
+    ]
+    return "\n".join(parts)
+
+
+def mark_strategy_rotation(state: dict[str, Any], spec: dict[str, Any]) -> bool:
+    """If the CSV row changed, require a flat book before any new open."""
+    fp = strategy_fingerprint(spec)
+    prev = str(state.get("strategy_fp") or "")
+    if prev and prev != fp:
+        state["rotate_flat"] = True
+        state["strategy_fp"] = fp
+        log.info(
+            "Strategy row changed — close every open coin before the new target (old hold ignored)"
+        )
+        return True
+    if not prev:
+        state["strategy_fp"] = fp
+    return bool(state.get("rotate_flat"))
+
+
 def _can_exit(state: dict[str, Any], coin: str, min_hold_h: int, now: float) -> bool:
+    if state.get("rotate_flat"):
+        return True
     if min_hold_h <= 0:
         return True
     opened = (state.get("opened") or {}).get(coin)
     if not opened:
         return True
     return (now - float(opened)) >= min_hold_h * 3600.0
+
+
+def _positions_by_coin(client) -> tuple[bool, dict[str, Any]]:
+    ok, positions = client.fetch_open_positions(force=True)
+    if not ok:
+        return False, {}
+    return True, {str(coin): pos for coin, pos in positions}
+
+
+def _margin_says_flat(client, *, equity: float | None = None) -> bool:
+    """False when the book looks empty but most equity is still locked in margin."""
+    try:
+        eq = float(equity if equity is not None else client.get_account_value(force=True) or 0)
+        avail = float(client.get_available_margin(force=True) or 0)
+    except Exception as exc:
+        log.warning("Margin flat-check failed: %s", exc)
+        return True
+    if eq <= 1.0:
+        return True
+    if avail < eq * 0.35:
+        log.warning(
+            "Position list empty but margin mostly used (equity=$%.2f available=$%.2f) — treat as NOT flat",
+            eq,
+            avail,
+        )
+        return False
+    return True
 
 
 def _info_only():
@@ -542,6 +615,22 @@ def _live_maker_open(client, coin: str, side: str, size: float, lev: int) -> boo
         except Exception as exc:
             msg = str(exc).lower()
             if "insufficient margin" in msg:
+                ok_pos, have_now = _positions_by_coin(client)
+                other = [c for c in have_now if c != coin]
+                if ok_pos and other:
+                    log.warning(
+                        "Open %s blocked: other positions still open %s (likely missed on first fetch)",
+                        coin,
+                        other,
+                    )
+                    return False
+                if ok_pos and coin in have_now:
+                    log.warning(
+                        "Open %s hit insufficient margin but %s is already open — stop",
+                        coin,
+                        coin,
+                    )
+                    return True
                 log.warning(
                     "Open %s insufficient margin at sz=%s — shrinking: %s",
                     coin,
@@ -565,27 +654,36 @@ def _apply_live(
     *,
     force_flip: bool = False,
 ) -> None:
-    ok, positions = client.fetch_open_positions(force=True)
+    rotating = bool(state.get("rotate_flat"))
+    if rotating:
+        force_flip = True
+        desired = []
+    ok, have = _positions_by_coin(client)
     if not ok:
         log.warning("Position query failed — skip this cycle")
         return
-    have = {coin: pos for coin, pos in positions}
     if force_flip and desired:
         desired = desired[:1]
     want = {str(d["coin"]): d for d in desired}
     now = time.time()
     equity = float(client.get_account_value(force=True) or 0)
-    snap = (round(equity, 2), tuple(want), tuple(have))
+    snap = (round(equity, 2), tuple(want), tuple(have), rotating)
     if getattr(_apply_live, "_last_snap", None) != snap:
-        log.info("Live equity $%.2f want %s have %s", equity, list(want), list(have))
+        log.info(
+            "Live equity $%.2f want %s have %s%s",
+            equity,
+            list(want),
+            list(have),
+            " | rotating flat" if rotating else "",
+        )
         _apply_live._last_snap = snap
 
     slot_n = 1 if force_flip else max(int(slots or 1), 1)
 
     for coin, pos in list(have.items()):
-        keep = coin in want and want[coin]["side"] == pos.side
+        keep = (not rotating) and coin in want and want[coin]["side"] == _pos_side(pos)
         if keep:
-            # Soft: matching #1 — do not resize, cancel, or re-enter.
+            # Soft: matching target — do not resize, cancel, or re-enter.
             continue
         if not force_flip and not _can_exit(state, coin, min_hold_h, now):
             log.info("Min-hold: keep %s", coin)
@@ -593,17 +691,35 @@ def _apply_live(
         try:
             if _live_maker_close(client, coin):
                 (state.setdefault("opened", {})).pop(coin, None)
-                log.info("LIVE close %s done%s", coin, " (flip)" if force_flip else "")
+                log.info(
+                    "LIVE close %s done%s",
+                    coin,
+                    " (strategy rotate)" if rotating else (" (flip)" if force_flip else ""),
+                )
             else:
                 log.warning("Close %s not flat yet — retry next cycle", coin)
         except Exception as exc:
             log.warning("Close %s failed: %s", coin, exc)
 
-    ok, positions = client.fetch_open_positions(force=True)
-    have = {coin: pos for coin, pos in (positions if ok else [])}
+    ok, have = _positions_by_coin(client)
+    if not ok:
+        log.warning("Position query failed after closes — skip opens")
+        return
     for coin in list((state.get("opened") or {})):
         if coin not in have and coin not in want:
             (state.setdefault("opened", {})).pop(coin, None)
+
+    if rotating:
+        if have:
+            log.info("Strategy rotate: still open %s — no new entry until flat", list(have))
+            return
+        if not _margin_says_flat(client, equity=equity):
+            log.info("Strategy rotate: margin still locked — no new entry until free")
+            return
+        state["rotate_flat"] = False
+        log.info("Strategy rotate complete — book flat, next cycle may open the new target")
+        return
+
     occupied = _occupied_slots(
         have,
         want,
@@ -623,6 +739,12 @@ def _apply_live(
         if have:
             log.info("Slot full with %s — skip open until flat", list(have))
             return
+    if want and not have and not _margin_says_flat(client, equity=equity):
+        log.warning(
+            "Skip open: fetch shows flat but margin is locked — will retry after positions appear"
+        )
+        state["rotate_flat"] = True
+        return
     free = max(0, slot_n - len(occupied))
     mids = _mids(client)
     for coin, d in want.items():
@@ -645,8 +767,8 @@ def _apply_live(
                 occupied.append(coin)
                 log.info("LIVE open %s %s done", coin, d["side"])
             else:
-                ok2, positions2 = client.fetch_open_positions(force=True)
-                if ok2 and any(c == coin for c, _ in positions2):
+                ok2, have2 = _positions_by_coin(client)
+                if ok2 and coin in have2:
                     state.setdefault("opened", {})[coin] = now
                     occupied.append(coin)
                     free = max(0, free - 1)
@@ -654,6 +776,14 @@ def _apply_live(
                         "Open %s partial fill — holding soft slot until reconciled",
                         coin,
                     )
+                elif ok2 and have2:
+                    log.warning(
+                        "Open %s aborted; unexpected open coins %s — rotate flat next",
+                        coin,
+                        list(have2),
+                    )
+                    state["rotate_flat"] = True
+                    return
                 else:
                     log.warning("Open %s failed — retry next cycle", coin)
         except Exception as exc:
@@ -673,13 +803,17 @@ def _apply_paper(
     force_flip: bool = False,
 ) -> None:
     now = time.time()
+    rotating = bool(state.get("rotate_flat"))
+    if rotating:
+        force_flip = True
+        desired = []
     if force_flip and desired:
         desired = desired[:1]
     want = {str(d["coin"]): d for d in desired}
     slot_n = 1 if force_flip else max(int(slots or 1), 1)
     for coin in list(book.positions):
         pos = book.positions[coin]
-        keep = coin in want and want[coin]["side"] == pos["side"]
+        keep = (not rotating) and coin in want and want[coin]["side"] == pos["side"]
         if keep:
             continue
         if not force_flip and not _can_exit(state, coin, min_hold_h, now):
@@ -687,6 +821,11 @@ def _apply_paper(
             continue
         book.close(coin, marks.get(coin) or float(pos.get("entry") or 0))
         (state.setdefault("opened", {})).pop(coin, None)
+    if rotating:
+        if book.positions:
+            return
+        state["rotate_flat"] = False
+        return
     occupied = _occupied_slots(
         book.positions,
         want,
@@ -735,6 +874,11 @@ def run_live(
         signal.signal(signal.SIGTERM, _request_stop)
     state_path = state_path or (sqlite_path.parent / "live_state.json")
     state = _load_state(state_path)
+    if mark_strategy_rotation(state, spec):
+        try:
+            _save_state(state_path, state)
+        except Exception as exc:
+            log.warning("State save failed after strategy rotate mark: %s", exc)
     log.info(
         "Signals match the backtest kernel (lagged closed bars, min-hold, CSV slots/gross). "
         "family=%s engine=%s name=%s",
