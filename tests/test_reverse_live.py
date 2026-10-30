@@ -19,9 +19,9 @@ class ReverseLiveTests(unittest.TestCase):
         from bagrank.specio import default_live_csv, load_csv_row, spec_from_row
 
         spec = spec_from_row(load_csv_row(default_live_csv()))
-        self.assertEqual(spec["family"], "anti_rank")
+        self.assertEqual(spec["family"], "composite")
         self.assertEqual(spec["reverse"], 0)
-        self.assertEqual(spec_from_row({"family": "anti_rank", "engine": "score"})["reverse"], 0)
+        self.assertEqual(spec_from_row({"family": "composite", "engine": "score"})["reverse"], 0)
 
     def test_strategy_change_marks_rotate_flat(self) -> None:
         from bagrank.live import mark_strategy_rotation, strategy_fingerprint
