@@ -342,9 +342,14 @@ class PaperHyperliquidClient(HyperliquidClient):
     # ------------------------------------------------------------------ #
     # Leverage / orders (overrides — never hit the real exchange)
     # ------------------------------------------------------------------ #
-    def set_leverage(self, leverage: int, is_cross: bool = True) -> None:
+    def set_leverage(self, leverage: int, is_cross: bool | None = None) -> None:
         requested = max(1, int(leverage))
         self._paper_leverage = min(requested, max(1, int(self.max_leverage)))
+        if is_cross is None:
+            is_cross = not bool(getattr(self, "only_isolated", False))
+        if bool(getattr(self, "only_isolated", False)):
+            is_cross = False
+        self._paper_is_cross = bool(is_cross)
 
     @staticmethod
     def _fill_result(sz: float, px: float) -> dict[str, Any]:

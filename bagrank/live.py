@@ -574,9 +574,16 @@ def _live_maker_open(client, coin: str, side: str, size: float, lev: int) -> boo
 
     lev_i = max(1, int(lev))
     try:
+        # isolated-only / HIP-3 coins must not get a cross leverage update
         client.set_leverage(lev_i)
     except Exception as exc:
-        log.warning("set_leverage %s failed (continuing): %s", coin, exc)
+        log.warning(
+            "set_leverage %s to %sx failed — skip open (wrong venue leverage risk): %s",
+            coin,
+            lev_i,
+            exc,
+        )
+        return False
 
     size = _fit_open_size(client, size, px, lev_i)
     if size <= 0:

@@ -372,22 +372,31 @@ class HyperliquidClient:
 
     def apply_market(self, market: MarketSpec) -> None:
         """Switch active perp using a known MarketSpec (no meta round-trip)."""
-        if (
+        same = (
             self.coin == market.api_coin
             and self.market.sz_decimals == market.sz_decimals
             and (self.perp_dex or "") == (market.perp_dex or "")
-        ):
-            return
+        )
         self.market = market
         self.coin = market.api_coin
         self.perp_dex = market.perp_dex
         self.only_isolated = market.only_isolated
         self.sz_decimals = market.sz_decimals
         self.max_leverage = market.max_leverage
+        if same:
+            return
         self.invalidate_user_state()
         self._ensure_sdk_asset_maps()
 
-    def set_leverage(self, leverage: int, is_cross: bool = True) -> None:
+    def resolve_leverage_is_cross(self, is_cross: bool | None = None) -> bool:
+        """Isolated-only markets must use isolated leverage; else default cross."""
+        if bool(getattr(self, "only_isolated", False)):
+            return False
+        if is_cross is None:
+            return True
+        return bool(is_cross)
+
+    def set_leverage(self, leverage: int, is_cross: bool | None = None) -> None:
         self._ensure_sdk_asset_maps()
         if self.coin not in self.exchange.info.name_to_coin:
             raise KeyError(
@@ -404,9 +413,21 @@ class HyperliquidClient:
                 self.max_leverage,
                 effective,
             )
-        result = self.exchange.update_leverage(effective, self.coin, is_cross=is_cross)
+        cross = self.resolve_leverage_is_cross(is_cross)
+        if bool(getattr(self, "only_isolated", False)) and is_cross is True:
+            self.logger.warning(
+                "%s is isolated-only — forcing isolated leverage %sx (cross ignored)",
+                self.coin,
+                effective,
+            )
+        result = self.exchange.update_leverage(effective, self.coin, is_cross=cross)
         self.invalidate_user_state()
-        self.logger.info("Leverage update (%sx): %s", effective, result)
+        mode = "cross" if cross else "isolated"
+        self.logger.info("Leverage update (%sx %s): %s", effective, mode, result)
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            raise RuntimeError(
+                f"Leverage update failed for {self.coin} ({effective}x {mode}): {result}"
+            )
 
     def get_user_abstraction(self, *, force: bool = False) -> str:
         if not force and self._user_abstraction is not None:
