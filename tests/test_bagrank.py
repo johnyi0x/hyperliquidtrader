@@ -212,6 +212,285 @@ class BagrankBackupTests(unittest.TestCase):
                 source.close()
             self.assertEqual(got, [hours[0], hours[1], hours[3]])
 
+    def test_two_week_slices_are_latest_14_days_split_in_half(self) -> None:
+        from bagrank.panel import two_week_slices
+
+        hours = [
+            f"2026-01-{day:02d}T{hour:02d}:00:00Z"
+            for day in range(1, 16)
+            for hour in range(24)
+        ]
+        panel = panel_from_meta_rows([_meta(cycle, "AAA", 1, 10) for cycle in hours])
+        week1, week2, span = two_week_slices(panel)
+        self.assertEqual(week1.n_times + week2.n_times, span.n_times)
+        self.assertGreaterEqual(week1.n_times, 7 * 24 - 1)
+        self.assertGreaterEqual(week2.n_times, 7 * 24)
+        self.assertLessEqual(abs(week1.n_times - week2.n_times), 1)
+        self.assertEqual(int(week2.cycle_unix[0]), int(week1.cycle_unix[-1]) + 3600)
+        self.assertEqual(int(span.cycle_unix[0]), int(week1.cycle_unix[0]))
+        self.assertEqual(int(span.cycle_unix[-1]), int(week2.cycle_unix[-1]))
+
+    def test_practice_days_do_not_include_the_newest_week(self) -> None:
+        from bagrank.panel import practice_and_hidden
+
+        hours = [
+            f"2026-01-{day:02d}T{hour:02d}:00:00Z"
+            for day in range(1, 22)
+            for hour in range(24)
+        ]
+        panel = panel_from_meta_rows([_meta(cycle, "AAA", 1, 10) for cycle in hours])
+        practice, hidden = practice_and_hidden(panel)
+        self.assertEqual(practice.n_times + hidden.n_times, panel.n_times)
+        self.assertGreaterEqual(hidden.n_times, 7 * 24)
+        self.assertGreaterEqual(practice.n_times, 13 * 24)
+        self.assertEqual(int(hidden.cycle_unix[0]), int(practice.cycle_unix[-1]) + 3600)
+        self.assertEqual(int(hidden.cycle_unix[-1]), int(panel.cycle_unix[-1]))
+
+    def test_every_day_profit_requires_each_utc_day_green(self) -> None:
+        import numpy as np
+
+        from bagrank.search import every_day_profit
+
+        # Two days: day0 up, day1 down -> fail
+        unix = np.asarray([0, 3600, 86400, 90000], dtype=np.int64)
+        eq_bad = np.asarray([100.0, 110.0, 110.0, 105.0], dtype=np.float64)
+        self.assertFalse(every_day_profit(eq_bad, unix))
+        eq_good = np.asarray([100.0, 110.0, 110.0, 120.0], dtype=np.float64)
+        self.assertTrue(every_day_profit(eq_good, unix))
+
+    def test_hidden_week_loss_stays_out_of_future_file(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from bagrank.search import ResultStore
+
+        span = {
+            "data_from": "2026-01-01T00:00:00Z",
+            "data_until": "2026-01-14T00:00:00Z",
+            "data_from_unix": 1,
+            "data_until_unix": 2,
+            "n_hours": 336,
+            "n_bars": 336,
+            "n_coins": 2,
+        }
+        practice = {
+            "fit_week1": 40.0,
+            "fit_week2": 40.0,
+            "fit_span": 40.0,
+            "dd_week1": 10.0,
+            "dd_week2": 10.0,
+            "dd_span": 10.0,
+            "ret_week1": 20.0,
+            "ret_week2": 20.0,
+            "ret_span": 40.0,
+            "sh_week1": 2.0,
+            "sh_week2": 2.0,
+            "sh_span": 2.0,
+            "daily_week1": 0,
+            "daily_week2": 0,
+            "daily_span": 1,
+            "span": {
+                "family": "oi_thrust",
+                "engine": "score",
+                "name": "oi_thrust",
+                "board": "pnl",
+                "spec": {"family": "oi_thrust", "engine": "score", "board": "pnl", "weights": []},
+            },
+        }
+        lucky = dict(practice)
+        lucky["fit_week1"] = 10.0
+        lucky["fit_week2"] = 10.0
+        lucky["fit_span"] = 10.0
+        lucky["span"] = {
+            "family": "giveback",
+            "engine": "score",
+            "name": "giveback",
+            "board": "pnl",
+            "spec": {"family": "giveback", "engine": "score", "board": "pnl", "weights": []},
+        }
+
+        def hidden(*, ret: float, daily: int = 1) -> dict:
+            return {
+                "board": "pnl",
+                "use_lev": 0,
+                "lev_x": 3,
+                "slots": 1,
+                "return_pct": ret,
+                "max_dd_pct": 8,
+                "sharpe": 1.0,
+                "n_bars": 40,
+                "win_rate_pct": 55,
+                "trips_per_day": 4.2,
+                "min_hold_h": 4,
+                "exec_lag": 1,
+                "round_trips": 28,
+                "daily_all_green": daily,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ResultStore(Path(tmp), span)
+            store.add_future(practice, hidden(ret=-5))
+            self.assertEqual(store.future_entries, [])
+            store.add_future(lucky, hidden(ret=80))
+            store.add_future(practice, hidden(ret=3))
+            ranked = store.future_ranked()
+            self.assertEqual(ranked[0]["span"]["family"], "oi_thrust")
+            self.assertGreater(float(ranked[1]["fut_ret"]), float(ranked[0]["fut_ret"]))
+            # red day on hidden week stays out of all-rounder
+            store2 = ResultStore(Path(tmp) / "rounder", span)
+            store2.add_future(practice, hidden(ret=3, daily=0))
+            self.assertEqual(len(store2.future_entries), 1)
+            self.assertEqual(store2.future_all_rounder_entries, [])
+            # practice span must also be every-day green
+            no_span = dict(practice)
+            no_span["daily_span"] = 0
+            store2.add_future(no_span, hidden(ret=3, daily=1))
+            self.assertEqual(store2.future_all_rounder_entries, [])
+            store2.add_future(practice, hidden(ret=3, daily=1))
+            self.assertEqual(len(store2.future_all_rounder_entries), 1)
+            store2.write_csvs()
+            self.assertTrue(store2.csv_future_all_rounder.exists())
+            text = store2.csv_future_all_rounder.read_text(encoding="utf-8").splitlines()
+            self.assertGreaterEqual(len(text), 2)
+
+    def test_rank_overall_puts_consistent_recipe_first(self) -> None:
+        from bagrank.search import rank_overall
+
+        hero = {
+            "fit_week1": 1.0,
+            "fit_week2": 100.0,
+            "fit_span": 50.0,
+            "dd_week1": 10.0,
+            "dd_week2": 10.0,
+            "dd_span": 10.0,
+            "span": {"family": "hero"},
+        }
+        steady = {
+            "fit_week1": 40.0,
+            "fit_week2": 40.0,
+            "fit_span": 40.0,
+            "dd_week1": 10.0,
+            "dd_week2": 10.0,
+            "dd_span": 10.0,
+            "span": {"family": "steady"},
+        }
+        fillers = [
+            {
+                "fit_week1": fit,
+                "fit_week2": 5.0 + i,
+                "fit_span": 5.0 + i,
+                "dd_week1": 10.0,
+                "dd_week2": 10.0,
+                "dd_span": 10.0,
+                "span": {"family": f"fill{i}"},
+            }
+            for i, fit in enumerate((30.0, 20.0, 15.0))
+        ]
+        ranked = rank_overall([hero, steady, *fillers])
+        self.assertEqual(ranked[0]["span"]["family"], "steady")
+        self.assertLess(ranked[0]["rank_sum"], ranked[1]["rank_sum"])
+
+    def test_equal_rank_sum_prefers_the_week_that_improved(self) -> None:
+        from bagrank.search import rank_overall
+
+        def row(name: str, fits: tuple[float, float, float], rets: tuple[float, float]) -> dict:
+            return {
+                "fit_week1": fits[0],
+                "fit_week2": fits[1],
+                "fit_span": fits[2],
+                "dd_week1": 10.0,
+                "dd_week2": 10.0,
+                "dd_span": 10.0,
+                "ret_week1": rets[0],
+                "ret_week2": rets[1],
+                "span": {"family": name},
+            }
+
+        tied = [
+            row("faded", (100.0, 10.0, 50.0), (40.0, 10.0)),
+            row("improved", (50.0, 100.0, 10.0), (10.0, 40.0)),
+            row("flat", (10.0, 50.0, 100.0), (20.0, 20.0)),
+        ]
+        ranked = rank_overall(tied)
+        self.assertEqual({item["rank_sum"] for item in ranked}, {6})
+        self.assertEqual(
+            [item["span"]["family"] for item in ranked],
+            ["improved", "flat", "faded"],
+        )
+
+        still_first = rank_overall(
+            [
+                row("leader", (80.0, 80.0, 80.0), (50.0, 10.0)),
+                row("climber", (10.0, 10.0, 10.0), (5.0, 90.0)),
+            ]
+        )
+        self.assertEqual(still_first[0]["span"]["family"], "leader")
+        self.assertLess(still_first[0]["rank_sum"], still_first[1]["rank_sum"])
+
+    def test_search_breeds_overall_and_skips_impossible_live_specs(self) -> None:
+        import random
+
+        from bagrank.kernels import N_FEAT
+        from bagrank.search import _next_spec, max_trips_per_day, sample_spec, spec_can_pass_live
+
+        self.assertLess(max_trips_per_day(336, 1, 24), 4.0)
+        self.assertLess(max_trips_per_day(336, 12, 0), 4.0)
+        self.assertGreaterEqual(max_trips_per_day(336, 1, 6), 4.0)
+        self.assertGreaterEqual(max_trips_per_day(336, 6, 0), 4.0)
+        blocked = {
+            "use_lev": 0,
+            "lev_x": 3,
+            "slots": 1,
+            "exec_lag": 1,
+            "step_h": 1,
+            "min_hold_h": 24,
+        }
+        self.assertFalse(spec_can_pass_live(blocked, "pnl", 336))
+        self.assertFalse(spec_can_pass_live(dict(blocked, slots=5, min_hold_h=0), "pnl", 336))
+        self.assertFalse(spec_can_pass_live(dict(blocked, use_lev=1, min_hold_h=0), "pnl", 336))
+        rng = random.Random(1)
+        for _ in range(40):
+            spec = sample_spec(rng, board="pnl", live_focus=True)
+            self.assertEqual(int(spec["slots"]), 1)
+            self.assertEqual(int(spec["use_lev"]), 0)
+            self.assertIn(int(spec["step_h"]), (1, 2, 3, 4, 6))
+            self.assertIn(int(spec["min_hold_h"]), (0, 2, 4, 6))
+            self.assertNotEqual(spec["family"], "spray")
+        parent = {
+            "family": "rank_mom",
+            "engine": "score",
+            "name": "rank_mom",
+            "board": "pnl",
+            "step_h": 2,
+            "min_hold_h": 4,
+            "slots": 1,
+            "use_lev": 0,
+            "lev_x": 3,
+            "exec_lag": 1,
+            "gross_pct": 140,
+            "max_pair_share": 0.8,
+            "weights": [0.1] * N_FEAT,
+            "mode": 0,
+            "enter_th": 0.2,
+            "exit_th": 0.1,
+        }
+        other = dict(parent)
+        other["family"] = "giveback"
+        other["name"] = "giveback"
+        for _ in range(20):
+            drawn = _next_spec(
+                rng,
+                elite_live=[{"spec": other}],
+                elite_overall=[{"spec": parent}],
+                explore_p=0.0,
+                mut_scale=0.2,
+                board="pnl",
+                live_focus=True,
+            )
+            self.assertEqual(drawn["family"], "rank_mom")
+            self.assertEqual(int(drawn["slots"]), 1)
+            self.assertEqual(int(drawn["use_lev"]), 0)
+
     def test_late_price_backfill_updates_old_hour(self) -> None:
         import tempfile
 
@@ -1033,13 +1312,13 @@ class UniverseAndDsnTests(unittest.TestCase):
             return_pct=4.0,
             sharpe=0.8,
             win_rate_pct=40.0,
-            trips_per_day=1.2,
+            trips_per_day=4.0,
             min_hold_h=0,
             exec_lag=1,
         )
         self.assertTrue(live_ok(pnl))
         self.assertFalse(live_ok(dict(pnl, board="roi")))
-        self.assertFalse(live_ok(dict(pnl, trips_per_day=0.4)))
+        self.assertFalse(live_ok(dict(pnl, trips_per_day=1.2)))
         self.assertFalse(live_ok(dict(pnl, lev_x=1)))
 
     def test_by_live_csv_keeps_only_strict_1x_rows(self) -> None:
@@ -1709,24 +1988,27 @@ class FollowRank1Tests(unittest.TestCase):
         self.assertEqual(_maker_wait_s(), 20.0)
 
     def test_fit_open_size_caps_to_margin(self) -> None:
+        from bagrank.lev import ORDER_MARGIN_BUFFER
         from bagrank.live import _fit_open_size, _weight_targets
 
         class _Client:
             sz_decimals = 4
 
-            def get_account_value(self, force=False):
+            def get_available_margin(self, force=False):
                 return 54.0
 
-        # CSV gross 140% at 25x would ask ~$1890 notional / ~0.022 BTC @ 87k.
+            def get_account_value(self, force=False):
+                return 60.0
+
+        # CSV gross 140% at 25x would ask oversized BTC size; fit to available margin.
         oversized = 0.0224
         fitted = _fit_open_size(_Client(), oversized, 87000.0, 25)
         self.assertLess(fitted, oversized)
-        # 90% equity * lev / px, floored to sz decimals
-        max_sz = (54.0 * 0.90 * 25) / 87000.0
+        max_sz = (54.0 * ORDER_MARGIN_BUFFER * 25) / 87000.0
         self.assertLessEqual(fitted, max_sz + 1e-12)
         self.assertGreater(fitted, max_sz * 0.9)
-        # Same gross as the backtest kernel: 140% is kept (cap is 200%, not 100%).
-        w = _weight_targets(
+        # Margin clamp: gross 140% sizes like 100% of capital.
+        w140 = _weight_targets(
             [{"coin": "BTC", "wallets": 1, "px": 87000.0, "side": "long", "lev": 25}],
             equity=54.0,
             gross_pct=140.0,
@@ -1734,8 +2016,54 @@ class FollowRank1Tests(unittest.TestCase):
             use_lev=1,
             slots=1,
         )
-        self.assertEqual(len(w), 1)
-        self.assertAlmostEqual(w[0]["notional"] / 25.0, 54.0 * 1.4, places=4)
+        w100 = _weight_targets(
+            [{"coin": "BTC", "wallets": 1, "px": 87000.0, "side": "long", "lev": 25}],
+            equity=54.0,
+            gross_pct=100.0,
+            max_pair_share=1.0,
+            use_lev=1,
+            slots=1,
+        )
+        self.assertEqual(len(w140), 1)
+        self.assertAlmostEqual(w140[0]["notional"], w100[0]["notional"], places=4)
+        self.assertAlmostEqual(w140[0]["notional"] / 25.0, 54.0 * 1.0, places=4)
+
+    def test_target_notional_clamps_gross_above_100(self) -> None:
+        from bagrank.lev import clamp_gross_frac, target_notional
+
+        self.assertEqual(clamp_gross_frac(1.4), 1.0)
+        self.assertEqual(clamp_gross_frac(0.95), 0.95)
+        self.assertAlmostEqual(target_notional(100.0, 1.4, 1.0, 6.0), 600.0)
+        self.assertAlmostEqual(target_notional(100.0, 1.0, 1.0, 6.0), 600.0)
+        self.assertAlmostEqual(target_notional(100.0, 0.5, 1.0, 6.0), 300.0)
+
+    def test_simulate_margin_clamps_gross_above_100(self) -> None:
+        import numpy as np
+        from bagrank.kernels import simulate
+
+        marks = np.array([[100.0], [101.0], [102.0]], dtype=np.float64)
+        tc = np.array([[0], [0], [-1]], dtype=np.int32)
+        ts = np.array([[1], [1], [0]], dtype=np.int8)
+        tw = np.ones_like(tc, dtype=np.float64)
+        tl = np.full_like(tc, 5.0, dtype=np.float64)
+        max_lev = np.array([50.0], dtype=np.float64)
+        kw = dict(
+            fee_rate=0.0,
+            initial_equity=100.0,
+            max_slots=1,
+            max_pair_share=1.0,
+            exec_lag=0,
+            min_hold=0,
+            use_lev=0,
+            bar_hours=1.0,
+            exposure_mode=0,
+            max_lev=max_lev,
+            lev_x=5.0,
+        )
+        # lev_x=5, maxLev=50 → size lev 10. Gross 140% and 100% → same path cash.
+        a = simulate(marks, tc, ts, tw, tl, gross_frac=1.4, **kw)
+        b = simulate(marks, tc, ts, tw, tl, gross_frac=1.0, **kw)
+        self.assertAlmostEqual(float(a[0]), float(b[0]), places=6)
 
     def test_shortlist_pnl_ranks_by_pnl_not_roi(self) -> None:
         from bagrank.hlcycle import shortlist_top_pnl, shortlist_top_roi

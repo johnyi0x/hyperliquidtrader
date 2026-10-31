@@ -489,6 +489,8 @@ def simulate_nb(
             g_use = 0.05
         if g_use > 2.0:
             g_use = 2.0
+        # Margin realism: cannot use more than 100% of capital as margin.
+        g_eff = g_use if g_use < 1.0 else 1.0
         for j in range(d):
             c = desired_c[j]
             sd = desired_s[j]
@@ -512,7 +514,7 @@ def simulate_nb(
             weight = desired_w[j] / wsum
             if max_pair_share > 0.0 and weight > max_pair_share:
                 weight = max_pair_share
-            notional = cash * g_use * weight * desired_l[j]
+            notional = cash * g_eff * weight * desired_l[j]
             if notional <= 0.0:
                 continue
             fee = notional * fee_rate

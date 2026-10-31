@@ -15,7 +15,17 @@ from .dsn import default_live_sqlite_path, default_pnl_sqlite_path, load_env
 from .engine import hourly_board_rank1, lagged_holdings
 from .hlcycle import LiveBoard
 from .kernels import NAME_TO_ID
-from .lev import DEFAULT_LEV_X, DEFAULT_MAX_LEV, apply_exchange_max_lev, fetch_exchange_max_lev, pair_size_lev
+from .lev import (
+    DEFAULT_LEV_X,
+    DEFAULT_MAX_LEV,
+    ORDER_MARGIN_BUFFER,
+    TOP_UP_RATIO,
+    apply_exchange_max_lev,
+    clamp_gross_frac,
+    fetch_exchange_max_lev,
+    pair_size_lev,
+    target_notional,
+)
 from .panel import panel_from_sqlite
 from .prices import fill_panel_from_collector
 from .specio import default_live_csv, load_strategy, require_strategy_row, spec_from_row
@@ -222,13 +232,13 @@ def _weight_targets(
         return []
     n = len(holds)
     slot_n = max(int(slots or n), 1)
-    # Same gross clamp as search.run_one / simulate_nb (0.05 .. 2.0).
+    # Same gross band as simulate_nb (0.05 .. 2.0), then margin-clamp to ≤100%.
     gross = max(0.05, min(2.0, float(gross_pct) / 100.0))
     if int(exposure_mode) == 1:
         gross *= n / float(slot_n)
     elif int(exposure_mode) == 2:
         gross *= (n / float(slot_n)) ** 0.5
-    gross = max(0.05, min(2.0, gross))
+    gross = clamp_gross_frac(gross)
     out: list[dict[str, Any]] = []
     for h in holds:
         px = float(h.get("px") or 0)
@@ -250,7 +260,7 @@ def _weight_targets(
             if mx <= 0:
                 mx = DEFAULT_MAX_LEV
             lev = float(int(pair_size_lev(mx, lev_x)))
-        notional = equity * gross * weight * lev
+        notional = target_notional(equity, gross, weight, lev)
         if notional <= 0:
             continue
         size = notional / px
@@ -288,6 +298,24 @@ class PaperBook:
         self.cash -= fee
         self.positions[coin] = {"side": side, "size": size, "entry": px}
         log.info("PAPER open %s %s sz=%.6f @ %.6f", coin, side, size, px)
+
+    def add(self, coin: str, side: str, size: float, px: float) -> None:
+        """Increase an existing same-side position (soft top-up)."""
+        pos = self.positions.get(coin)
+        if not pos or pos.get("side") != side:
+            self.open(coin, side, size, px)
+            return
+        old = float(pos["size"])
+        add_sz = float(size)
+        if add_sz <= 0:
+            return
+        fee = abs(add_sz * px) * FEE
+        self.cash -= fee
+        new_sz = old + add_sz
+        entry = float(pos.get("entry") or px)
+        pos["entry"] = (old * entry + add_sz * px) / new_sz if new_sz > 0 else px
+        pos["size"] = new_sz
+        log.info("PAPER top-up %s %s +%.6f -> %.6f @ %.6f", coin, side, add_sz, new_sz, px)
 
 
 def _load_state(path: Path) -> dict[str, Any]:
@@ -327,6 +355,20 @@ def strategy_fingerprint(spec: dict[str, Any]) -> str:
         str(float(spec.get("exit_th") or 0)),
         str(int(spec.get("zscore") or 0)),
         str(int(spec.get("reverse") or 0)),
+        str(int(spec.get("use_lev") or 0)),
+        str(float(spec.get("lev_x") if spec.get("lev_x") not in (None, "") else DEFAULT_LEV_X)),
+        str(spec.get("board") or "roi"),
+        str(int(spec.get("size_mode") or 0)),
+        str(int(spec.get("exposure_mode") or 0)),
+        str(float(spec.get("max_pair_share") or 0)),
+        str(int(spec.get("enter_top") or 0)),
+        str(int(spec.get("k") or 0)),
+        str(float(spec.get("a") or 0)),
+        str(float(spec.get("b") or 0)),
+        str(float(spec.get("min_agree") or 0)),
+        str(float(spec.get("min_wallets") or 0)),
+        str(float(spec.get("max_abs_funding") or 0)),
+        str(int(spec.get("require_improve") or 0)),
         "|".join(weight_bits),
     ]
     return "\n".join(parts)
@@ -433,6 +475,12 @@ def _pos_side(pos: Any) -> str:
     return str(getattr(pos, "side", "") or "")
 
 
+def _pos_size(pos: Any) -> float:
+    if isinstance(pos, dict):
+        return abs(float(pos.get("size") or 0))
+    return abs(float(getattr(pos, "size", 0) or 0))
+
+
 def _occupied_slots(
     have: dict[str, Any],
     want: dict[str, dict[str, Any]],
@@ -524,15 +572,28 @@ def _live_maker_close(client, coin: str) -> bool:
 
 
 def _fit_open_size(client, size: float, px: float, lev: int) -> float:
-    """Cap size so isolated margin (notional/lev) fits ~90% of free equity."""
+    """Cap size so margin (notional/lev) fits ORDER_MARGIN_BUFFER of free collateral."""
     from src.pricing import floor_size
 
-    equity = float(client.get_account_value(force=True) or 0)
     lev_i = max(1, int(lev))
     px_f = float(px or 0)
-    if equity <= 0 or px_f <= 0:
+    if px_f <= 0:
         return 0.0
-    max_ntl = equity * 0.90 * float(lev_i)
+    available = 0.0
+    try:
+        getter = getattr(client, "get_available_margin", None)
+        if callable(getter):
+            available = float(getter(force=True) or 0)
+    except Exception as exc:
+        log.warning("get_available_margin failed: %s", exc)
+    if available <= 0:
+        try:
+            available = float(client.get_account_value(force=True) or 0)
+        except Exception:
+            available = 0.0
+    if available <= 0:
+        return 0.0
+    max_ntl = available * ORDER_MARGIN_BUFFER * float(lev_i)
     fitted = min(float(size), max_ntl / px_f)
     out = floor_size(fitted, client.sz_decimals)
     if out <= 0:
@@ -541,8 +602,9 @@ def _fit_open_size(client, size: float, px: float, lev: int) -> float:
         out = round_size(fitted, client.sz_decimals)
     if fitted + 1e-12 < float(size):
         log.info(
-            "Size capped to margin: equity=$%.2f lev=%sx max_ntl=$%.1f sz %.6f -> %.6f",
-            equity,
+            "Size capped to margin: available=$%.2f buffer=%.2f lev=%sx max_ntl=$%.1f sz %.6f -> %.6f",
+            available,
+            ORDER_MARGIN_BUFFER,
             lev_i,
             max_ntl,
             size,
@@ -690,7 +752,7 @@ def _apply_live(
     for coin, pos in list(have.items()):
         keep = (not rotating) and coin in want and want[coin]["side"] == _pos_side(pos)
         if keep:
-            # Soft: matching target — do not resize, cancel, or re-enter.
+            # Soft: matching side — top-up handled after flat/rotate checks.
             continue
         if not force_flip and not _can_exit(state, coin, min_hold_h, now):
             log.info("Min-hold: keep %s", coin)
@@ -727,6 +789,43 @@ def _apply_live(
         log.info("Strategy rotate complete — book flat, next cycle may open the new target")
         return
 
+    # Soft top-up: same coin+side but held size materially below target.
+    mids = _mids(client)
+    for coin, d in want.items():
+        if coin not in have or _pos_side(have[coin]) != d["side"]:
+            continue
+        target = float(d["size"]) if d.get("size") else 0.0
+        if target <= 0 and d.get("notional"):
+            px0 = mids.get(coin) or float(d.get("px") or 0)
+            if px0 > 0:
+                target = float(d["notional"]) / px0
+        have_sz = _pos_size(have[coin])
+        if target <= 0 or have_sz >= target * TOP_UP_RATIO:
+            continue
+        delta = target - have_sz
+        lev = max(1, int(d.get("lev") or 1))
+        log.info(
+            "LIVE top-up %s %s have=%.6f target=%.6f delta=%.6f",
+            coin,
+            d["side"],
+            have_sz,
+            target,
+            delta,
+        )
+        try:
+            if _live_maker_open(client, coin, str(d["side"]), delta, lev):
+                state.setdefault("opened", {})[coin] = now
+                log.info("LIVE top-up %s done", coin)
+            else:
+                log.warning("Top-up %s incomplete — retry next cycle", coin)
+        except Exception as exc:
+            log.warning("Top-up %s failed: %s", coin, exc)
+
+    ok, have = _positions_by_coin(client)
+    if not ok:
+        log.warning("Position query failed after top-up — skip opens")
+        return
+
     occupied = _occupied_slots(
         have,
         want,
@@ -753,7 +852,6 @@ def _apply_live(
         state["rotate_flat"] = True
         return
     free = max(0, slot_n - len(occupied))
-    mids = _mids(client)
     for coin, d in want.items():
         if coin in have and _pos_side(have[coin]) == d["side"]:
             continue
@@ -833,6 +931,19 @@ def _apply_paper(
             return
         state["rotate_flat"] = False
         return
+    for coin, d in want.items():
+        if coin not in book.positions or book.positions[coin]["side"] != d["side"]:
+            continue
+        px = marks.get(coin) or float(d.get("px") or 0)
+        target = float(d.get("size") or 0)
+        if target <= 0 and d.get("notional") and px > 0:
+            target = float(d["notional"]) / px
+        have_sz = float(book.positions[coin]["size"])
+        if target <= 0 or have_sz >= target * TOP_UP_RATIO or px <= 0:
+            continue
+        delta = target - have_sz
+        book.add(coin, d["side"], delta, px)
+        state.setdefault("opened", {})[coin] = now
     occupied = _occupied_slots(
         book.positions,
         want,
@@ -919,6 +1030,8 @@ def run_live(
     spec["lev_x"] = lev_x
     spec["board"] = board_kind
     max_lev_map = fetch_exchange_max_lev()
+    max_lev_fetched_at = time.time()
+    max_lev_refresh_s = 3600.0
     if board_kind == "pnl":
         try:
             from .backup import seed_local_hours, seed_recent_board
@@ -974,6 +1087,12 @@ def run_live(
     logged_wait = False
     while not _STOP:
         try:
+            if time.time() - max_lev_fetched_at >= max_lev_refresh_s:
+                refreshed = fetch_exchange_max_lev()
+                if refreshed:
+                    max_lev_map = refreshed
+                    log.info("Refreshed HL maxLev map (%s coins)", len(max_lev_map))
+                max_lev_fetched_at = time.time()
             panel = load_panel(sqlite_path) if sqlite_path.exists() else None
             if panel is not None:
                 apply_exchange_max_lev(panel, max_lev_map)

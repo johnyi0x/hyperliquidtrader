@@ -17,6 +17,33 @@ log = logging.getLogger("bagrank.lev")
 DEFAULT_LEV_X = 3.0
 DEFAULT_MAX_LEV = 50.0
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+# Live open / estimate buffer: use this fraction of free collateral as margin.
+ORDER_MARGIN_BUFFER = 0.95
+# Soft-keep: top up when held size is below this fraction of target.
+TOP_UP_RATIO = 0.90
+
+
+def clamp_gross_frac(gross_frac: float) -> float:
+    """Search may store up to 200%; execution margin uses at most 100% of capital."""
+    g = max(0.05, min(2.0, float(gross_frac or 0)))
+    if g > 1.0:
+        return 1.0
+    return g
+
+
+def target_notional(
+    capital: float,
+    gross_frac: float,
+    weight: float,
+    lev: float,
+) -> float:
+    """Shared live/backtest notional: capital * min(gross,1) * weight * lev."""
+    cap = float(capital or 0)
+    w = float(weight or 0)
+    lv = float(lev or 0)
+    if cap <= 0 or w <= 0 or lv < 1.0:
+        return 0.0
+    return cap * clamp_gross_frac(gross_frac) * w * lv
 
 
 def pair_size_lev(max_lev: float, lev_x: float) -> float:

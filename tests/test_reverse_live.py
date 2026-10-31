@@ -35,6 +35,8 @@ class ReverseLiveTests(unittest.TestCase):
             "min_hold_h": 2,
             "run_id": "run_old",
             "weights": [0.1, 0.2],
+            "use_lev": 0,
+            "lev_x": 3,
         }
         new = dict(old)
         new["family"] = "anti_rank"
@@ -46,6 +48,36 @@ class ReverseLiveTests(unittest.TestCase):
         self.assertTrue(state["rotate_flat"])
         self.assertEqual(state["strategy_fp"], strategy_fingerprint(new))
         self.assertFalse(mark_strategy_rotation({"opened": {}, "strategy_fp": strategy_fingerprint(new)}, new))
+
+    def test_lev_x_change_marks_rotate_flat(self) -> None:
+        from bagrank.live import mark_strategy_rotation, strategy_fingerprint
+
+        old = {
+            "family": "composite",
+            "name": "composite",
+            "engine": "score",
+            "mode": 9,
+            "use_lev": 0,
+            "lev_x": 3,
+            "run_id": "run_a",
+        }
+        new = dict(old)
+        new["lev_x"] = 5
+        state = {"opened": {}, "strategy_fp": strategy_fingerprint(old)}
+        self.assertTrue(mark_strategy_rotation(state, new))
+        self.assertTrue(state["rotate_flat"])
+
+    def test_paper_top_up_when_undersized(self) -> None:
+        from bagrank.live import PaperBook, _apply_paper
+
+        book = PaperBook(1000.0)
+        book.positions["ETH"] = {"side": "long", "size": 0.5, "entry": 2000.0}
+        state = {"opened": {"ETH": 1.0}, "rotate_flat": False}
+        desired = [
+            {"coin": "ETH", "side": "long", "size": 1.0, "px": 2000.0, "notional": 2000.0}
+        ]
+        _apply_paper(book, desired, state, min_hold_h=0, marks={"ETH": 2000.0}, slots=1)
+        self.assertAlmostEqual(book.positions["ETH"]["size"], 1.0, places=6)
 
     def test_rotate_flat_closes_old_before_new_open(self) -> None:
         from bagrank.live import PaperBook, _apply_paper
