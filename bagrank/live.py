@@ -394,8 +394,8 @@ def _can_exit(state: dict[str, Any], coin: str, min_hold_h: int, now: float) -> 
     return (now - float(opened)) >= min_hold_h * 3600.0
 
 
-def _positions_by_coin(client) -> tuple[bool, dict[str, Any]]:
-    ok, positions = client.fetch_open_positions(force=True)
+def _positions_by_coin(client, *, all_dexes: bool = False) -> tuple[bool, dict[str, Any]]:
+    ok, positions = client.fetch_open_positions(force=True, all_dexes=all_dexes)
     if not ok:
         return False, {}
     return True, {str(coin): pos for coin, pos in positions}
@@ -540,7 +540,7 @@ def _close_open_for_rotation(client, state: dict[str, Any]) -> None:
     """Close whatever is open before a new script's first target. Min-hold does not apply."""
     if not state.get("rotate_flat"):
         return
-    ok, have = _positions_by_coin(client)
+    ok, have = _positions_by_coin(client, all_dexes=True)
     if not ok:
         log.warning("Startup close skipped — position query failed, will retry on the next cycle")
         return
@@ -742,7 +742,7 @@ def _apply_live(
     if rotating:
         force_flip = True
         desired = []
-    ok, have = _positions_by_coin(client)
+    ok, have = _positions_by_coin(client, all_dexes=rotating)
     if not ok:
         log.warning("Position query failed — skip this cycle")
         return
@@ -785,7 +785,7 @@ def _apply_live(
         except Exception as exc:
             log.warning("Close %s failed: %s", coin, exc)
 
-    ok, have = _positions_by_coin(client)
+    ok, have = _positions_by_coin(client, all_dexes=rotating)
     if not ok:
         log.warning("Position query failed after closes — skip opens")
         return

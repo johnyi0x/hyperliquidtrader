@@ -23,6 +23,7 @@ from .hl_rate_limit import (
 from .market_resolver import (
     MarketSpec,
     find_perp_asset_location,
+    list_perp_dex_names,
     parse_coin_input,
     perp_dexs_for_sdk,
     resolve_market,
@@ -538,10 +539,45 @@ class HyperliquidClient:
         add("")
         return dexes
 
-    def _iter_tagged_clearinghouse_states(self) -> list[tuple[str, dict[str, Any]]]:
+    def _states_have_open_size(self, tagged: list[tuple[str, dict[str, Any]]]) -> bool:
+        for _dex, state in tagged:
+            for ap in state.get("assetPositions", []):
+                pos = ap.get("position", ap)
+                try:
+                    if abs(float(pos.get("szi", 0) or 0)) > 1e-12:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        return False
+
+    def _query_dex_states(self, dexes: list[str]) -> list[tuple[str, dict[str, Any]]]:
+        found: list[tuple[str, dict[str, Any]]] = []
+        seen: set[int] = set()
+        for dex in dexes:
+            try:
+                raw = self.info.user_state(self.address, dex=dex)
+            except Exception as exc:
+                self.logger.debug("clearinghouseState dex=%r failed: %s", dex, exc)
+                continue
+            extra = iter_clearinghouse_states(raw, default_dex=dex)
+            batch = extra
+            if not batch and isinstance(raw, dict) and "assetPositions" in raw:
+                batch = [(dex, raw)]
+            for tagged_dex, state in batch:
+                sid = id(state)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                found.append((tagged_dex, state))
+        return found
+
+    def _iter_tagged_clearinghouse_states(self, *, all_dexes: bool = False) -> list[tuple[str, dict[str, Any]]]:
         """
         HIP-3 positions live on the builder dex. ALL_DEXES plus a per-dex
         fill-in so a native-active client still sees xyz:NVDA.
+
+        all_dexes=True asks every builder book. The live client starts on BTC,
+        so a startup close otherwise never sees an open xyz position.
         """
         tagged: list[tuple[str, dict[str, Any]]] = []
         tagged_dexes: set[str] = set()
@@ -560,40 +596,35 @@ class HyperliquidClient:
         except Exception as exc:
             self.logger.debug("ALL_DEXES clearinghouseState failed: %s", exc)
 
-        def _dex_has_open_size(dex: str) -> bool:
-            for tagged_dex, state in tagged:
-                if tagged_dex != dex:
-                    continue
-                for ap in state.get("assetPositions", []):
-                    pos = ap.get("position", ap)
-                    try:
-                        if abs(float(pos.get("szi", 0) or 0)) > 1e-12:
-                            return True
-                    except (TypeError, ValueError):
-                        continue
-            return False
+        if self._states_have_open_size(tagged) and not all_dexes:
+            return tagged
 
-        # ALL_DEXES can return an empty native book while a clip is still open.
-        # Always re-query native + the active dex when they listed zero size.
-        active = self.perp_dex or ""
-        for dex in self._position_dexes_to_query():
-            if _dex_has_open_size(dex):
-                continue
-            if dex in tagged_dexes and dex not in ("", active):
-                continue
+        dexes = list(self._position_dexes_to_query())
+        if all_dexes:
             try:
-                raw = self.info.user_state(self.address, dex=dex)
+                for name in list_perp_dex_names(self.info):
+                    if name and name not in dexes:
+                        dexes.append(name)
             except Exception as exc:
-                self.logger.debug("clearinghouseState dex=%r failed: %s", dex, exc)
+                self.logger.debug("perpDexs list failed: %s", exc)
+
+        # ALL_DEXES can list a book with zero size while that book still has a clip.
+        # Re-query native, the active dex, and (on a startup close) every builder dex.
+        active = self.perp_dex or ""
+        refill = [dex for dex in dexes if dex not in tagged_dexes or dex in ("", active) or all_dexes]
+        found = self._query_dex_states(refill)
+        if not found:
+            return tagged
+        if all_dexes and self._states_have_open_size(found) and not self._states_have_open_size(tagged):
+            self.logger.info("Open size was missing from ALL_DEXES; a direct dex query found it")
+        merged = list(tagged)
+        seen = {id(state) for _dex, state in tagged}
+        for dex, state in found:
+            if id(state) in seen:
                 continue
-            extra = iter_clearinghouse_states(raw, default_dex=dex)
-            if extra:
-                tagged.extend(extra)
-                tagged_dexes.add(dex)
-            elif isinstance(raw, dict) and "assetPositions" in raw:
-                tagged.append((dex, raw))
-                tagged_dexes.add(dex)
-        return tagged
+            seen.add(id(state))
+            merged.append((dex, state))
+        return merged
 
     def _iter_clearinghouse_states(self) -> list[dict[str, Any]]:
         return [state for _dex, state in self._iter_tagged_clearinghouse_states()]
@@ -919,7 +950,7 @@ class HyperliquidClient:
         return bool(positions)
 
     def fetch_open_positions(
-        self, *, force: bool = False
+        self, *, force: bool = False, all_dexes: bool = False
     ) -> tuple[bool, list[tuple[str, "Position"]]]:
         """
         Return (ok, positions) for every open perp on the account.
@@ -930,7 +961,7 @@ class HyperliquidClient:
         if force:
             self.invalidate_user_state()
 
-        tagged = self._iter_tagged_clearinghouse_states()
+        tagged = self._iter_tagged_clearinghouse_states(all_dexes=all_dexes)
         if not tagged:
             self.logger.warning(
                 "Position query failed — treating as NOT flat: empty clearinghouse response"
