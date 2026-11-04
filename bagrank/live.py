@@ -19,9 +19,9 @@ from .lev import (
     DEFAULT_LEV_X,
     DEFAULT_MAX_LEV,
     ORDER_MARGIN_BUFFER,
+    LIVE_GROSS_PCT,
     TOP_UP_RATIO,
     apply_exchange_max_lev,
-    clamp_gross_frac,
     fetch_exchange_max_lev,
     pair_size_lev,
     target_notional,
@@ -230,23 +230,15 @@ def _weight_targets(
     wsum = sum(max(float(h["wallets"]), 1e-9) for h in holds)
     if wsum <= 0:
         return []
-    n = len(holds)
-    slot_n = max(int(slots or n), 1)
-    # Same gross band as simulate_nb (0.05 .. 2.0), then margin-clamp to ≤100%.
-    gross = max(0.05, min(2.0, float(gross_pct) / 100.0))
-    if int(exposure_mode) == 1:
-        gross *= n / float(slot_n)
-    elif int(exposure_mode) == 2:
-        gross *= (n / float(slot_n)) ** 0.5
-    gross = clamp_gross_frac(gross)
+    # One size: balance * 95% * leverage, split by weight when more than one coin.
+    # gross_pct, exposure_mode, and max_pair_share are ignored.
+    _ = (gross_pct, slots, exposure_mode, max_pair_share)
     out: list[dict[str, Any]] = []
     for h in holds:
         px = float(h.get("px") or 0)
         if px <= 0:
             continue
         weight = float(h["wallets"]) / wsum
-        if max_pair_share > 0:
-            weight = min(weight, float(max_pair_share))
         if use_lev:
             lev = float(h["lev"]) if h.get("lev") else 1.0
             if lev < 1.0:
@@ -260,7 +252,7 @@ def _weight_targets(
             if mx <= 0:
                 mx = DEFAULT_MAX_LEV
             lev = float(int(pair_size_lev(mx, lev_x)))
-        notional = target_notional(equity, gross, weight, lev)
+        notional = target_notional(equity, 0.95, weight, lev)
         if notional <= 0:
             continue
         size = notional / px
@@ -375,18 +367,19 @@ def strategy_fingerprint(spec: dict[str, Any]) -> str:
 
 
 def mark_strategy_rotation(state: dict[str, Any], spec: dict[str, Any]) -> bool:
-    """If the CSV row changed, require a flat book before any new open."""
+    """Flat the book before the first target of a new script start or a new CSV row."""
     fp = strategy_fingerprint(spec)
     prev = str(state.get("strategy_fp") or "")
-    if prev and prev != fp:
+    if prev != fp:
         state["rotate_flat"] = True
         state["strategy_fp"] = fp
-        log.info(
-            "Strategy row changed — close every open coin before the new target (old hold ignored)"
-        )
+        if prev:
+            log.info(
+                "Strategy row changed — close every open coin before the new target (old hold ignored)"
+            )
+        else:
+            log.info("Script start — close every open coin before the first target")
         return True
-    if not prev:
-        state["strategy_fp"] = fp
     return bool(state.get("rotate_flat"))
 
 
@@ -541,6 +534,28 @@ def _order_executor(client):
         mid_limit_wait_seconds=wait_s,
         mid_limit_attempts=attempts,
     )
+
+
+def _close_open_for_rotation(client, state: dict[str, Any]) -> None:
+    """Close whatever is open before a new script's first target. Min-hold does not apply."""
+    if not state.get("rotate_flat"):
+        return
+    ok, have = _positions_by_coin(client)
+    if not ok:
+        log.warning("Startup close skipped — position query failed, will retry on the next cycle")
+        return
+    if not have:
+        log.info("Startup close: position list is empty")
+        return
+    for coin in list(have):
+        try:
+            if _live_maker_close(client, coin):
+                (state.setdefault("opened", {})).pop(coin, None)
+                log.info("Startup close %s done", coin)
+            else:
+                log.warning("Startup close %s not flat yet — retry on the next cycle", coin)
+        except Exception as exc:
+            log.warning("Startup close %s failed: %s", coin, exc)
 
 
 def _live_maker_close(client, coin: str) -> bool:
@@ -1016,6 +1031,12 @@ def run_live(
     book = None
     if mode == "live":
         client = _make_client()
+        if state.get("rotate_flat"):
+            _close_open_for_rotation(client, state)
+            try:
+                _save_state(state_path, state)
+            except Exception as exc:
+                log.warning("State save failed after startup close: %s", exc)
     else:
         book = PaperBook(float(spec.get("equity") or 1000.0))
     info = client.info if client is not None else None
@@ -1028,6 +1049,7 @@ def run_live(
     need_hours, keep_hours = live_hour_windows(spec)
     lev_x = float(spec.get("lev_x") if spec.get("lev_x") not in (None, "") else DEFAULT_LEV_X)
     spec["lev_x"] = lev_x
+    spec["gross_pct"] = float(LIVE_GROSS_PCT)
     spec["board"] = board_kind
     max_lev_map = fetch_exchange_max_lev()
     max_lev_fetched_at = time.time()

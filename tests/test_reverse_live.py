@@ -48,6 +48,9 @@ class ReverseLiveTests(unittest.TestCase):
         self.assertTrue(state["rotate_flat"])
         self.assertEqual(state["strategy_fp"], strategy_fingerprint(new))
         self.assertFalse(mark_strategy_rotation({"opened": {}, "strategy_fp": strategy_fingerprint(new)}, new))
+        fresh: dict = {"opened": {}}
+        self.assertTrue(mark_strategy_rotation(fresh, new))
+        self.assertTrue(fresh["rotate_flat"])
 
     def test_lev_x_change_marks_rotate_flat(self) -> None:
         from bagrank.live import mark_strategy_rotation, strategy_fingerprint
