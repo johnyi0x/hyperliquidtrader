@@ -17,19 +17,38 @@ log = logging.getLogger("bagrank.lev")
 DEFAULT_LEV_X = 3.0
 DEFAULT_MAX_LEV = 50.0
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
-# Only margin fraction. Position notional = balance * this * leverage.
-# Gross is not a second knob and is never above this.
-MARGIN_FRAC = 0.95
-ORDER_MARGIN_BUFFER = MARGIN_FRAC
-LIVE_GROSS_PCT = MARGIN_FRAC * 100.0
+# Edit these two numbers when you want a different size.
+# TRADE_MARGIN_USD is the dollars of margin posted on every trade.
+# It does not grow after a win. Notional = this * leverage.
+# Example: 100 at 6x is a $600 position, every time.
+TRADE_MARGIN_USD = 100.0
+# Starting cash for a backtest or paper run. Raised to the trade margin if smaller,
+# so the first trade always fits. Raise it to leave room for a string of losses.
+BACKTEST_EQUITY = 10000.0
+# Live orders still leave 5% of free collateral unused so the exchange does not reject the size.
+ORDER_MARGIN_BUFFER = 0.95
+LIVE_GROSS_PCT = 95.0
+MARGIN_FRAC = ORDER_MARGIN_BUFFER
 # Soft-keep: top up when held size is below this fraction of target.
 TOP_UP_RATIO = 0.90
 
 
+def starting_equity(requested: float | None = None) -> float:
+    """Backtest/paper cash. Never below the fixed trade margin."""
+    if requested is None:
+        eq = float(BACKTEST_EQUITY)
+    else:
+        eq = float(requested)
+    floor = float(TRADE_MARGIN_USD)
+    if eq < floor:
+        return floor
+    return eq
+
+
 def clamp_gross_frac(gross_frac: float = 0.0) -> float:
-    """Sizing always uses 95% of balance as margin. The argument is ignored."""
+    """Kept so older callers import. Size no longer uses a percent of balance."""
     _ = gross_frac
-    return MARGIN_FRAC
+    return 1.0
 
 
 def target_notional(
@@ -38,14 +57,13 @@ def target_notional(
     weight: float,
     lev: float,
 ) -> float:
-    """Position notional = balance * 0.95 * weight * leverage. gross_frac is ignored."""
-    _ = gross_frac
-    cap = float(capital or 0)
+    """Position notional = TRADE_MARGIN_USD * weight * leverage. Balance is ignored."""
+    _ = (capital, gross_frac)
     w = float(weight or 0)
     lv = float(lev or 0)
-    if cap <= 0 or w <= 0 or lv < 1.0:
+    if w <= 0 or lv < 1.0:
         return 0.0
-    return cap * MARGIN_FRAC * w * lv
+    return float(TRADE_MARGIN_USD) * w * lv
 
 
 def pair_size_lev(max_lev: float, lev_x: float) -> float:

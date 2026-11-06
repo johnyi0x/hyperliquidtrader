@@ -230,9 +230,9 @@ def _weight_targets(
     wsum = sum(max(float(h["wallets"]), 1e-9) for h in holds)
     if wsum <= 0:
         return []
-    # One size: balance * 95% * leverage, split by weight when more than one coin.
-    # gross_pct, exposure_mode, and max_pair_share are ignored.
-    _ = (gross_pct, slots, exposure_mode, max_pair_share)
+    # One size: TRADE_MARGIN_USD * leverage, split by weight when more than one coin.
+    # equity, gross_pct, exposure_mode, and max_pair_share do not change the size.
+    _ = (equity, gross_pct, slots, exposure_mode, max_pair_share)
     out: list[dict[str, Any]] = []
     for h in holds:
         px = float(h.get("px") or 0)
@@ -662,7 +662,16 @@ def _live_maker_open(client, coin: str, side: str, size: float, lev: int) -> boo
         )
         return False
 
+    asked = float(size)
     size = _fit_open_size(client, size, px, lev_i)
+    if asked > 0 and size < asked * 0.98:
+        log.warning(
+            "Open %s fixed margin does not fit free collateral — size %.6f cut to %.6f. "
+            "Lower TRADE_MARGIN_USD in bagrank/lev.py",
+            coin,
+            asked,
+            size,
+        )
     if size <= 0:
         log.warning("Open %s size rounds to zero after margin fit — skip", coin)
         return False
@@ -1038,7 +1047,9 @@ def run_live(
             except Exception as exc:
                 log.warning("State save failed after startup close: %s", exc)
     else:
-        book = PaperBook(float(spec.get("equity") or 1000.0))
+        from bagrank.lev import starting_equity
+
+        book = PaperBook(starting_equity(float(spec.get("equity") or 0) or None))
     info = client.info if client is not None else None
     if info is None:
         try:

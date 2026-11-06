@@ -373,6 +373,7 @@ def simulate_nb(
     exposure_mode: int,
     max_lev: np.ndarray,
     lev_x: float,
+    trade_margin: float,
 ) -> tuple:
     n_ticks = marks.shape[0]
     n_coins = marks.shape[1]
@@ -479,18 +480,11 @@ def simulate_nb(
 
         if wsum <= 0.0:
             continue
-        n_des = d
-        g_use = gross_frac
-        if exposure_mode == 1 and max_slots > 0:
-            g_use = gross_frac * (float(n_des) / float(max_slots))
-        elif exposure_mode == 2 and max_slots > 0:
-            g_use = gross_frac * np.sqrt(float(n_des) / float(max_slots))
-        if g_use < 0.05:
-            g_use = 0.05
-        if g_use > 2.0:
-            g_use = 2.0
-        # Margin realism: cannot use more than 100% of capital as margin.
-        g_eff = g_use if g_use < 1.0 else 1.0
+        # Fixed dollars of margin on every fill. Cash is only the bankroll.
+        # gross_frac / exposure_mode / max_pair_share are not used.
+        margin = trade_margin
+        if margin <= 0.0:
+            continue
         for j in range(d):
             c = desired_c[j]
             sd = desired_s[j]
@@ -512,9 +506,10 @@ def simulate_nb(
             if not (px > 0.0):
                 continue
             weight = desired_w[j] / wsum
-            if max_pair_share > 0.0 and weight > max_pair_share:
-                weight = max_pair_share
-            notional = cash * g_eff * weight * desired_l[j]
+            need = margin * weight
+            if cash < need:
+                continue
+            notional = need * desired_l[j]
             if notional <= 0.0:
                 continue
             fee = notional * fee_rate
@@ -569,6 +564,7 @@ def simulate(
     exposure_mode: int = 0,
     max_lev: np.ndarray | None = None,
     lev_x: float = 0.0,
+    trade_margin: float | None = None,
 ) -> tuple:
     n_coins = int(marks.shape[1]) if marks.ndim == 2 else 0
     if max_lev is None or int(getattr(max_lev, "size", 0) or 0) < n_coins:
@@ -579,6 +575,10 @@ def simulate(
         max_lev = filled
     else:
         max_lev = np.asarray(max_lev, dtype=np.float64)
+    if trade_margin is None or float(trade_margin) <= 0.0:
+        from bagrank.lev import TRADE_MARGIN_USD
+
+        trade_margin = float(TRADE_MARGIN_USD)
     return simulate_nb(
         marks,
         target_coin,
@@ -597,6 +597,7 @@ def simulate(
         int(exposure_mode),
         max_lev,
         float(lev_x),
+        float(trade_margin),
     )
 
 
